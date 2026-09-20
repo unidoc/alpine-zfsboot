@@ -148,7 +148,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: alpine-zfsboot ${{ github.ref_name }}
-          body: "Built on Alpine 3.24. The Rolls Royce of ZFS boot for Alpine: a kexec-based UEFI bootstrapper for Alpine on ZFS root. .EFI (UKI), .iso, and loose vmlinuz/initramfs.img/cmdline.txt (GRUB chainload) for each of x86_64/aarch64 (both consoles active, switch live from the menu), plus the legacy-BIOS/GPT boot code (x86_64 only) and alpine-zfsboot-x86_64/alpine-zfsboot-aarch64 (cmd/tool - the install-time version/update helper). SHA256SUMS covers every asset here."
+          body: "Built on Alpine 3.24. A self-contained Alpine Linux ZFS bootloader, installer, and remote recovery environment for BIOS and UEFI systems. For each of x86_64/aarch64: .EFI, .iso, and loose vmlinuz/initramfs.img/cmdline.txt (GRUB chainload) - both consoles active, switch live from the menu. Also included: the legacy BIOS boot code (x86_64 only, GPT and MBR partition tables both supported by the same stage1/stage2/bootblob files) and alpine-zfsboot-x86_64/alpine-zfsboot-aarch64 (cmd/tool - the install-time version/update helper). SHA256SUMS covers every asset here."
           generate_release_notes: true
           files: |
             out/*
