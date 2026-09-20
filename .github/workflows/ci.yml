@@ -61,7 +61,12 @@ jobs:
           # kernel that will never actually be booted here - `apt-get
           # download` + `dpkg -x` gets just the vmlinuz file, nothing
           # else touched on the runner.
-          real_pkg="$(apt-cache depends linux-image-amd64 | awk '/Depends:/{print $2; exit}')"
+          real_pkg="$(apt-cache depends linux-image-generic | awk '/Depends: linux-image-[0-9]/{print $2; exit}')"
+          if [ -z "$real_pkg" ]; then
+              echo "ERROR: could not resolve linux-image-generic to a real versioned kernel-image package - apt-cache depends output:" >&2
+              apt-cache depends linux-image-generic >&2
+              exit 1
+          fi
           apt-get download "$real_pkg"
           mkdir -p /tmp/kernel-extract
           dpkg -x "${real_pkg}"_*.deb /tmp/kernel-extract
