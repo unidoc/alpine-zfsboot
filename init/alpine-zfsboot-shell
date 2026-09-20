@@ -1,0 +1,69 @@
+#!/bin/sh
+# root's login shell over dropbear (set in /etc/passwd by /init).
+#
+# Interactive session (plain `ssh host`, no command - dropbear/OpenSSH
+# both invoke the login shell with no args in that case) -> menu.py,
+# same experience as the local console.
+#
+# Non-interactive (`ssh host "some command"` - the login shell gets
+# invoked as `shell -c "some command"`) -> ONLY a `zfs send ...`/
+# `zfs recv ...`/`zfs receive ...` invocation is ever actually run;
+# anything else is refused outright. This is deliberately narrower
+# than "whatever the client asked for": rescue-ssh.sh's own
+# authorized_keys already forces
+# `no-port-forwarding,no-agent-forwarding,no-X11-forwarding` on every
+# accepted key - but those are SSH-*feature* restrictions, not a
+# command restriction, and a forced `command=` in authorized_keys
+# would silently replace ANY client-requested command with menu.py,
+# breaking the one real remote workflow this project needs
+# (`zfs send ... | ssh host zfs recv poolname/ROOT/new`, and its
+# reverse, `ssh host zfs send ... | zfs recv ...`) outright. Without
+# an allowlist HERE, those options would give a false sense of a
+# hardened rescue key while every accepted key still had unrestricted
+# root command execution in this pre-boot environment - confirmed as a
+# real gap by a from-scratch security review of this exact file, not a
+# hypothetical. If a real need for some other remote command ever
+# shows up, it gets added here explicitly - never a general escape
+# hatch back to arbitrary `bash -c`.
+if [ "$1" = "-c" ]; then
+    # dropbear/OpenSSH both pass the client's whole requested command
+    # as a single argument here ($2, the SSH "exec" request itself
+    # carries it as one string) - "$1" after the shift, not "$*"/"$@",
+    # so a multi-word `zfs recv 'some/name with a quote'` from the
+    # client survives exactly as sent rather than being rejoined and
+    # re-split by this script.
+    shift
+    cmd="$1"
+    case "$cmd" in
+        "zfs send "*|"zfs recv "*|"zfs receive "*)
+            # Prefix-allowlisted above, but a prefix match alone proves
+            # nothing once this string reaches a real shell - `zfs recv
+            # foo; rm -rf /` also starts with "zfs recv ". Reject the
+            # WHOLE command outright if it contains anything outside a
+            # deliberately small, shell-metacharacter-free charset (no
+            # `;|&$` backticks, parens, newlines, ...) - real ZFS
+            # dataset/snapshot names never need any of those, so this
+            # costs nothing for the one legitimate workflow while
+            # closing the actual injection route.
+            case "$cmd" in
+                *[!A-Za-z0-9/@_.:=\ -]*)
+                    echo "alpine-zfsboot-shell: refusing '$cmd' - contains a character outside the safe zfs send/recv set" >&2
+                    exit 1
+                    ;;
+            esac
+            exec /bin/bash -c "$cmd"
+            ;;
+        *)
+            echo "alpine-zfsboot-shell: refusing '$cmd' - only 'zfs send ...'/'zfs recv ...'/'zfs receive ...' may be run over rescue SSH" >&2
+            exit 1
+            ;;
+    esac
+else
+    # Bare `python3`, not an absolute path - dropbear sets its own PATH
+    # per session (DEFAULT_ROOT_PATH for uid 0, which every rescue SSH
+    # session is: /usr/sbin:/usr/bin:/sbin:/bin - confirmed against the
+    # real bundled binary, NOT inherited from /init's own exported PATH
+    # the way an earlier version of this comment assumed), which
+    # already covers both /usr/bin/python3 and /usr/sbin/zfs above.
+    exec python3 /menu.py
+fi

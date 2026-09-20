@@ -1,0 +1,42 @@
+#!/bin/sh
+# zfs-unlock ACTION ENCRYPTIONROOT - the CLI entry point menu.py shells
+# out to for its "Unlock encrypted root"/"Lock encrypted root" actions,
+# so there is exactly one real implementation of the secret-acquisition/
+# staging/locking logic (zfs-unlock.sh, sourced below), not a second one
+# reimplemented in Python - see that file's own header comment for the
+# full reasoning (a real, reported gap: menu.py's own bare `zfs
+# load-key` used to unlock a dataset without ever staging a kexec
+# handoff secret).
+#
+# boot-dataset.sh sources zfs-unlock.sh directly instead of exec'ing
+# THIS file - it already has its own encryptionroot/DATASET/ROOTFS
+# context and calls zfs_unlock()/zfs_lock() in-process, same reasoning
+# as it already sources rescue-ssh.sh/net-config.sh directly rather
+# than shelling out to them.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+ACTION="${1:?usage: zfs-unlock (unlock|lock) ENCRYPTIONROOT}"
+ENCRYPTIONROOT="${2:?usage: zfs-unlock (unlock|lock) ENCRYPTIONROOT}"
+
+# Same real-boot-vs-test-harness path resolution as every other file in
+# this project that needs to find its own siblings (see /init's own
+# RESCUE_LIB_DIR comment for the full reasoning).
+_src="${BASH_SOURCE:-$0}"
+case "$_src" in
+    */*) _dir="${_src%/*}"; _dir="${_dir:-/}" ;;
+    *)   _dir="." ;;
+esac
+LIB_DIR="$(cd "$_dir" && pwd)"
+
+. "$LIB_DIR/zfs-unlock.sh"
+
+case "$ACTION" in
+    unlock) zfs_unlock "$ENCRYPTIONROOT" ;;
+    lock)   zfs_lock "$ENCRYPTIONROOT" ;;
+    *)
+        echo "zfs-unlock: unknown action '$ACTION' (expected unlock|lock)" >&2
+        exit 2
+        ;;
+esac

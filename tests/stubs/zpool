@@ -1,0 +1,11 @@
+#!/bin/sh
+echo "zpool $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        echo "${STUB_BOOTFS:--}"
+        ;;
+    status)
+        echo "${STUB_POOL_HEALTH:-pool is healthy}"
+        ;;
+esac
+exit 0

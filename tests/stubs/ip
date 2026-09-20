@@ -1,0 +1,91 @@
+#!/bin/sh
+# Stateful fake `ip`, not a passthrough logger - needed for two real
+# things a fire-and-forget stub can't exercise: (1) idempotency - a
+# second `addr add`/`route add` of something already present must
+# behave like the real `ip` (fail with "File exists"), so net-config.sh's
+# own idempotency pre-checks (grep the real state before adding) are
+# exercised for real, not just trusted; (2) failure injection
+# (STUB_IP_FAIL_* env vars) for testing net-config.sh's own failure
+# handling and onlink-fallback retry logic without a real interface or
+# root. State lives in $STUB_IP_STATE (one fact per line); callers set
+# it to a fresh path per test the same way they set STUB_LOG.
+echo "ip $*" >> "${STUB_LOG:-/dev/null}"
+state="${STUB_IP_STATE:-/dev/null}"
+# Never truncated here - state persists across every `ip` invocation
+# within (and across, if the caller reuses the same STUB_IP_STATE path)
+# a test, exactly like a real interface's configuration would. A test
+# wanting fresh state uses a fresh path (a new scratch dir), not this
+# stub resetting itself.
+[ -f "$state" ] || touch "$state" 2>/dev/null
+
+family=4
+case "$1" in
+    -6) family=6; shift ;;
+esac
+
+case "$1" in
+    link)
+        # link set IFACE up
+        [ "${STUB_IP_FAIL_LINK:-}" = "1" ] && { echo "stub: forced link failure" >&2; exit 1; }
+        exit 0
+        ;;
+    addr)
+        case "$2" in
+            add)
+                cidr="$3" iface="$5"
+                eval "failval=\${STUB_IP_FAIL_V${family}ADDR:-}"
+                [ "$failval" = "1" ] && { echo "stub: forced v$family addr failure" >&2; exit 1; }
+                key="ADDR$family $cidr $iface"
+                grep -qxF "$key" "$state" 2>/dev/null && { echo "RTNETLINK answers: File exists" >&2; exit 2; }
+                echo "$key" >> "$state"
+                exit 0
+                ;;
+        esac
+        ;;
+    -o)
+        # -o addr show dev IFACE (the -6 prefix, if any, is already shifted off)
+        iface="$5"
+        grep "^ADDR$family " "$state" 2>/dev/null | while read -r _ cidr a_iface; do
+            [ "$a_iface" = "$iface" ] && printf 'inet%s %s dev %s\n' "$([ "$family" = 6 ] && echo 6)" "$cidr" "$a_iface"
+        done
+        exit 0
+        ;;
+    route)
+        case "$2" in
+            add)
+                if [ "$3" = "default" ]; then
+                    gw="$5" iface="$7"
+                    eval "failmode=\${STUB_IP_FAIL_V${family}ROUTE:-}"
+                    if [ "$failmode" = "always" ]; then
+                        echo "stub: forced v$family route failure" >&2; exit 1
+                    fi
+                    if [ "$failmode" = "once" ]; then
+                        onceflag="${state}.once-v${family}"
+                        if [ ! -f "$onceflag" ]; then
+                            touch "$onceflag"
+                            echo "stub: forced v$family route failure (once - onlink fallback should retry)" >&2
+                            exit 1
+                        fi
+                    fi
+                    key="ROUTE$family $gw $iface"
+                    grep -qxF "$key" "$state" 2>/dev/null && { echo "RTNETLINK answers: File exists" >&2; exit 2; }
+                    echo "$key" >> "$state"
+                    exit 0
+                else
+                    # onlink fallback's own host route: route add GW dev IFACE -
+                    # always succeeds, nothing under test depends on its own
+                    # idempotency (it's only ever attempted right after the
+                    # default-route attempt already failed).
+                    exit 0
+                fi
+                ;;
+            show)
+                grep "^ROUTE$family " "$state" 2>/dev/null | while read -r _ gw iface; do
+                    printf 'default via %s dev %s\n' "$gw" "$iface"
+                done
+                exit 0
+                ;;
+        esac
+        ;;
+esac
+exit 0

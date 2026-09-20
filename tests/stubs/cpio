@@ -1,0 +1,35 @@
+#!/bin/sh
+# Real round-trip fidelity for tests, without depending on a real cpio
+# binary being installed on the dev/CI host (confirmed missing on at
+# least one real dev host this project's own author used - `cpio:
+# command not found`) - backed by `tar` (which every real dev/CI host
+# already has) instead of hand-rolling a newc reader/writer, or faking
+# fixed marker content that can't actually prove the round-trip logic
+# in boot-dataset.sh's own handoff-verification block works correctly.
+# This does NOT validate the real newc wire format or the kernel's own
+# concatenated-archive unpacking semantics - that gap is real and is
+# exactly what a real hardware boot is for; this stub exists so the
+# SURROUNDING shell logic (does verification correctly detect a good
+# archive as good, does cleanup happen on every path) has real,
+# meaningful test coverage instead of a vacuously-always-failing stub
+# silently making every "success path" test exercise only the
+# fallback/failure branch instead.
+echo "cpio $*" >> "${STUB_LOG:-/dev/null}"
+case "$1 $2" in
+    "-o -H")
+        # write mode: stdin is a `find .`-style path list (relative to
+        # the caller's own cwd) - archive exactly those paths.
+        tar -cf - -T -
+        ;;
+    "-i --to-stdout")
+        # extract-one-member-to-stdout mode: stdin is the archive,
+        # $3 is the (cpio-style, no leading ./) pattern to extract.
+        pattern="$3"
+        tar -xO -f - "./$pattern" 2>/dev/null
+        ;;
+    "-idm --quiet")
+        # full extract mode: stdin is the archive, extract into cwd.
+        tar -xf - 2>/dev/null
+        ;;
+esac
+exit 0

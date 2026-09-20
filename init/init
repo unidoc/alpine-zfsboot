@@ -1,0 +1,1089 @@
+#!/bin/sh
+# alpine-zfsboot /init - PID 1 inside the boot initramfs.
+#
+# UEFI firmware -> this .EFI (busybox + zfs + kexec-tools + python3 +
+# this script, bundled with a kernel via objcopy - see build.sh) ->
+# this script -> zpool import -> read the pool's bootfs property ->
+# menu.py: a dialog TUI, FreeBSD-loader-style - always shown, own
+# countdown with the default entry pre-highlighted, auto-boots that
+# entry if left alone, fully interactive if touched (boot-environment/
+# kernel selection, BE lifecycle management, chroot, guided zfs-recv
+# deployment, recovery shell, console switching - see that file).
+#
+# An earlier version of this project had a separate fast, Python-free
+# automatic path for when no key was held, and only showed the menu on
+# a keypress - a deliberate later choice moved to always showing the
+# menu instead, matching FreeBSD's own loader more closely: one
+# consistent first frame every boot, not two different experiences
+# depending on whether a key happened to get pressed in time. The
+# safety net this gave up (automatic boots never depending on Python)
+# is covered instead by menu.py's own crash handling: any exception
+# there falls back to running boot-dataset.sh directly, the exact same
+# script the old automatic path called (see the bottom of this file).
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+# BusyBox's `reboot`/`halt`/`poweroff`, called WITHOUT their own -f
+# flag, don't touch the kernel themselves at all - they signal PID 1
+# (SIGTERM/SIGUSR1/SIGUSR2 respectively, the same convention real
+# sysvinit's own init(8) documents) and expect PID 1 to run an orderly
+# shutdown sequence and perform the actual reboot(2)/poweroff itself.
+# This script - PID 1 for this entire initramfs - never had a handler
+# for any of those signals, so a bare `reboot` here was a real,
+# reported no-op: the signal arrived, nothing was listening for it,
+# nothing happened. `poweroff -f` "worked" only because -f bypasses
+# PID 1 entirely and calls the reboot(2) syscall directly.
+#
+# Forcing here (the exact same reboot(2)/poweroff -f these signals
+# would otherwise expect PID 1 to eventually call anyway) is correct
+# for this specific environment, not a shortcut: there is no orderly
+# shutdown sequence to run first (no services, no OpenRC runlevels, no
+# mounted filesystems beyond what this script itself manages) - "force"
+# is the only real shutdown this PID 1 was ever going to perform.
+trap 'reboot -f' TERM
+trap 'halt -f' USR1
+trap 'poweroff -f' USR2
+
+# ROOTFS is empty at real boot (this script IS pid 1 in a fresh
+# initramfs - /etc, /root, /proc are really at those absolute paths,
+# nothing else could be mounted over them yet) - so every "$ROOTFS/..."
+# below is byte-identical to the bare path there. It only becomes
+# non-empty under tests/run-tests.sh, which sets STUB_ROOT to a scratch
+# directory so tests can never write into this dev machine's real
+# /etc/passwd or /root/.ssh.
+ROOTFS="${STUB_ROOT:-}"
+
+# Where net-config.sh/rescue-ssh.sh actually live: `/` at a real boot
+# (build.sh copies them there, alongside this file itself, /menu.py,
+# /boot-dataset.sh) - but under tests/run-tests.sh, this file is
+# dot-sourced from its OWN repo path ($REPO_ROOT/init/init), not run as
+# a standalone /init, so its sibling scripts live next to IT, not at a
+# real `/`. ${BASH_SOURCE[0]:-$0} resolves correctly either way: bash
+# (the test harness's own interpreter) keeps BASH_SOURCE[0] as the
+# actual sourced file's real path regardless of $0; a real boot's own
+# /bin/sh has no BASH_SOURCE array at all, where $0 is already exactly
+# right (this script genuinely IS /init, run directly as pid 1, not
+# sourced from anywhere).
+# dirname(1) isn't in this initramfs's busybox applet set (confirmed on
+# a real boot: "dirname: not found") - pure shell parameter expansion
+# instead, with no external-binary dependency at all. A real boot's own
+# $0 is exactly "/init" (single leading slash, no subdirectory) - the
+# case "${_src%/*}" alone gets wrong ("" instead of "/") - handled
+# explicitly below rather than assumed away.
+_src="${BASH_SOURCE:-$0}"
+case "$_src" in
+    */*) _dir="${_src%/*}"; _dir="${_dir:-/}" ;;
+    *)   _dir="." ;;
+esac
+RESCUE_LIB_DIR="$(cd "$_dir" && pwd)"
+
+POOL="zroot"
+MENU_TIMEOUT=2
+
+msg() {
+    echo "alpine-zfsboot: $*" > /dev/kmsg 2>/dev/null
+    echo "$*"
+}
+
+# Never `set -e` here: a failed step must explain itself and drop to a
+# shell, not panic the kernel or silently reboot-loop.
+die() {
+    msg "FATAL: $*"
+    # One of this project's three rescue-ssh trigger points (see
+    # rescue-ssh.sh's own header comment) - a bare recovery shell with
+    # no menu.py/UI running is exactly the "no local recourse short of
+    # already knowing the right incantations" case remote SSH access
+    # exists for. No-ops cleanly if no authorized_keys/host key were
+    # ever staged for this boot (start_rescue_ssh's own first guard).
+    start_rescue_ssh
+    msg "dropping to a recovery shell (bash)"
+    _recovery_shell
+}
+
+# _recovery_shell/_recovery_shell_child - give the operator a real,
+# working emergency shell. Same design, same reasoning, as
+# boot-dataset.sh's OWN identical pair of functions (this file has no
+# way to share code with a separate process's own script, so it's
+# duplicated rather than sourced - see that file's own header comment
+# for the full story, including why `cttyhack` was removed and replaced
+# with a directly-verified `setsid -c` instead, and why PID 1 never
+# execs straight into either of these).
+#
+# This file (unlike boot-dataset.sh) genuinely IS always PID 1 at the
+# point die() is ever called on a real boot - it is /init's own
+# function, called only before /init has exec'd into anything else.
+# The `[ "$$" -eq 1 ]` check below is still needed anyway, purely so
+# tests/run-tests.sh (which dot-sources this file under its OWN,
+# never-1 pid - see run_stubbed()) can exercise the not-PID-1 branch
+# instead of hanging this test suite forever in a real fork+wait loop.
+_recovery_shell() {
+    export PS1='\[\e[1;32m\]alpine-zfsboot\[\e[0m\] \w # '
+    if [ -n "$ROOTFS" ]; then
+        if [ "$$" -eq 1 ]; then
+            msg "TEST STUB: would fork a recovery shell and wait forever (pid 1)"
+        elif ( : < /dev/tty ) 2>/dev/null; then
+            msg "TEST STUB: would exec /bin/bash directly (already has a controlling terminal)"
+        else
+            msg "TEST STUB: would exec setsid -c /bin/bash (no controlling terminal yet)"
+        fi
+        # `exit`, not `return` - every real call site below this point
+        # is an `exec` that never returns to its own caller (the whole
+        # point of a recovery/emergency shell). A plain `return` here
+        # would instead let the REST of this script's top-level code
+        # keep running right past whatever called this - a real,
+        # confirmed regression the first version of this test stub
+        # caused (a test staged for "encryption key never loads" ended
+        # up mounting and kexec'ing an unrelated kernel anyway, because
+        # returning from here just fell through to unrelated code
+        # further down the script).
+        exit 0
+    fi
+    if [ "$$" -eq 1 ]; then
+        # PID 1 must NEVER exit - see _recovery_shell_child's own
+        # comment for exactly why `exec`-ing straight into this (as the
+        # old `exec setsid cttyhack /bin/bash` did) is a real kernel-
+        # panic hazard specifically for PID 1. Forking instead means
+        # PID 1 keeps running as the loop below for as long as this
+        # whole initramfs lives, regardless of what the recovery shell
+        # itself ever does - reboot/halt/poweroff still work from
+        # inside it (the trap handlers at the top of this file fire on
+        # PID 1 regardless of what PID 1 is currently blocked on).
+        #
+        # A fresh child every time around, not one child forked once
+        # outside the loop - `wait` with no pid argument, once no
+        # children remain to reap, returns immediately rather than
+        # blocking (POSIX), which would otherwise turn this into a
+        # tight, permanent 100%-CPU busy-loop the instant the operator
+        # exits that first shell. Waiting for a SPECIFIC pid blocks
+        # correctly, and re-forking on every iteration means exiting
+        # the shell (accidentally or on purpose) hands the operator a
+        # brand new one instead of leaving PID 1 alive but permanently
+        # stuck with no usable shell for the rest of this boot.
+        while true; do
+            ( _recovery_shell_child ) &
+            wait "$!"
+        done
+    fi
+    _recovery_shell_child
+}
+
+_recovery_shell_child() {
+    if ( : < /dev/tty ) 2>/dev/null; then
+        # Already has a controlling terminal - nothing to establish,
+        # just use it (see menu.py's own _establish_controlling_terminal()
+        # for the identical capability test and the same reasoning).
+        exec /bin/bash
+    fi
+    # No controlling terminal yet - the real fresh-initramfs-PID1 case.
+    # `cttyhack` (a standard busybox applet built for exactly this) is
+    # NOT compiled into this project's busybox - confirmed via
+    # `strings`/applet-table inspection, not a PATH issue - meaning
+    # this emergency shell had NEVER actually worked, locally or over
+    # SSH, since it was first written (the visible symptom was always
+    # "cttyhack: applet not found", silently swallowed by the shell
+    # exiting). `setsid -c` (bare `setsid`, which resolves to the
+    # busybox applet via this file's own `busybox --install` above, not
+    # a coreutils binary) is used instead - confirmed by direct,
+    # hands-on reproduction against this exact busybox version to
+    # correctly claim an available-but-unclaimed pty as the new
+    # child's own controlling terminal, and to never touch the calling
+    # process's own session/tty state either way, in every scenario
+    # tested.
+    exec setsid -c /bin/bash
+}
+
+# mkinitfs's own stock /init (replaced entirely by ours via `mkinitfs
+# -i`) normally does this - busybox ships in this image as a single
+# multi-call binary with no per-applet symlinks baked into the cpio
+# archive itself (confirmed against a real build: only /usr/bin/sh
+# existed - no cat, mount, mdev, ls, anything else). Without this,
+# every external command below except shell builtins silently fails
+# to even be found - which is exactly what made zpool import look
+# like it failed for a ZFS reason, when the real cause was `mount`/
+# `mdev`/`cat` all being missing and /tmp never getting created.
+/usr/bin/busybox --install -s /usr/bin
+
+mkdir -p /tmp
+
+mount -t proc     proc     /proc     2>/dev/null
+mount -t sysfs    sysfs    /sys      2>/dev/null
+mount -t devtmpfs devtmpfs /dev      2>/dev/null || mdev -s
+
+# Last Boot Diagnostics, kernel-crash evidence - efi-pstore only, NOT
+# ramoops (see temp/alpine-install-zfs.sh's own comment for the real-
+# kernel-source research on why ramoops was rejected for this project:
+# no stock-kernel, no-magic-address way to guarantee the writer and
+# reader kernels agree on a physical RAM region, and its fixed-address
+# fallback is x86-only, useless on the validated aarch64 Hetzner CAX
+# hardware anyway).
+#
+# UEFI only: /sys/firmware/efi is the kernel's own authoritative,
+# runtime-observable signal for "was this boot UEFI or legacy BIOS" -
+# not something inferred from how this image was built, since the same
+# shared kernel+initramfs boots either way. modprobe here loads THIS
+# (rescue) kernel's own copy of the module - a separate boot/module
+# state entirely from whatever the target kernel that may have panicked
+# did; nothing here ever WRITES evidence, only reads what's already
+# sitting in NVRAM from before.
+#
+# Capability is read from /sys/module/pstore/parameters/backend, not
+# from mount success - CONFIG_PSTORE=y alone (Alpine's own kernel has
+# this, built in) lets the pstore filesystem mount successfully with
+# ZERO backend registered, so "did the mount succeed" proves nothing
+# about whether real evidence could ever exist here. This was a real,
+# adversarially-found bug in an earlier version of this feature: an
+# operator would have been told "no evidence (clean boot)" on hardware
+# where evidence could never have been captured in the first place -
+# indistinguishable from an actually clean boot, which is exactly the
+# kind of claim-from-silence this subsystem's "never claim a cause we
+# didn't observe" rule also forbids.
+#
+# menu.py reads that sysfs file itself, live, at the point it's needed -
+# NOT via an env var exported here. An earlier version did export one
+# (ALPINE_ZFSBOOT_PSTORE_BACKEND), which was a SECOND real bug: dropbear's
+# own clearenv() wipes every variable this file exports for a rescue-SSH
+# session (see the ESP-persisted-material comment block above, and
+# menu.py's own ACTIVE_TTY comment, for the same already-known problem) -
+# a remote operator, the primary audience this whole feature exists for,
+# would always have seen "unsupported" regardless of the real hardware
+# state. Backend registration is a kernel-global fact, not something
+# specific to this process - menu.py can just read it fresh, correctly,
+# from any session, with no inheritance involved at all.
+#
+# Best-effort/fail-open like every other optional step in this file:
+# legacy BIOS, a kernel that doesn't have the module bundled, or a
+# mount failure all just leave that sysfs file empty/missing, which
+# menu.py already renders as an honest "unavailable/unsupported" rather
+# than an error.
+if [ -d /sys/firmware/efi ]; then
+    modprobe efi_pstore pstore_disable=0 2>/dev/null
+fi
+mkdir -p /sys/fs/pstore
+mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+
+# `apk` is bundled here (see build.sh's own base.files reasoning) for
+# real rescue-shell use, and `apk add openssh` is a real thing an
+# operator does from there - confirmed the hard way: openssh refuses to
+# start with "Privilege separation user sshd does not exist" until this
+# exists. The installed system's own chroot script (alpine-install-
+# zfs.sh) checks this the same way in spirit, via `getent passwd sshd`
+# - not used here, since getent isn't a busybox applet at all (a real
+# install needed `apk add musl-utils` for it - confirmed the hard way,
+# same session) and this minimal initramfs has no such package manager
+# step to fall back on. `grep` against /etc/passwd directly instead -
+# already relied on elsewhere in this same file, no new dependency.
+# Idempotent - safe unconditionally, costs nothing when nobody ever
+# installs sshd.
+grep -q '^sshd:' /etc/passwd 2>/dev/null || adduser -h / -s /sbin/nologin -S sshd 2>/dev/null
+# devpts - confirmed missing the hard way on a real boot: menu.py's
+# own countdown-activity relay (see its _run_dialog_with_activity())
+# calls os.openpty() to give `dialog` a pty it fully controls, and
+# without a real devpts filesystem mounted, that fails outright
+# ("out of pty devices") - /dev/pts existing as a plain directory
+# (from devtmpfs above) is not the same thing as a mounted devpts
+# that can actually ALLOCATE a new pty pair through /dev/ptmx. menu.py
+# survives this (falls back to automatic boot rather than a kernel
+# panic - see its own top-level exception handler), but the menu never
+# comes up at all without this.
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null
+# efivarfs - real UEFI NVRAM, the same mechanism systemd-boot's
+# LoaderEntryDefault / GRUB's grubenv use to remember a choice across
+# reboots. Needed here (not just something menu.py could do) because
+# select_console()'s own console preference has to be known before the
+# pool is even imported, well before anything else on this fresh-
+# every-boot initramfs could persist state anywhere else. Plain POSIX
+# `mount`/read/write against /sys/firmware/efi/efivars/<name>-<guid> -
+# no new C code, and harmless to attempt even on firmware/kernel
+# combinations that don't support it: the mount just fails silently,
+# and every read/write below already tolerates that (see
+# read_console_pref/write_console_pref).
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+
+# Confirmed the hard way on real Proxmox/virtio-scsi hardware: a
+# storage HBA module (virtio_scsi) loading successfully is NOT enough
+# on its own to make a disk show up as /dev/sdX - that translation is
+# a SEPARATE module (sd_mod, the generic SCSI disk class driver), and
+# it normally only loads automatically via udev/mdev reacting to the
+# new-device uevent the HBA driver's own probe raises. `mdev -s` two
+# lines up is a one-shot STATIC scan of whatever /sys already looked
+# like at that moment - it ran before any of these drivers had loaded
+# a single device, so nothing was there yet to find, and nothing is
+# listening for the later uevents that would normally trigger this.
+# Loading everything explicitly sidesteps hotplug entirely rather
+# than depending on infrastructure this minimal initramfs doesn't run.
+# ata_piix/ahci cover real and virtualized SATA, nvme real/virtual
+# NVMe, virtio_scsi/virtio_blk the two Proxmox VirtIO disk attachment
+# choices, sd_mod/sr_mod the actual /dev/sd*|sr* node creation both
+# SCSI-class paths (ata, virtio_scsi) depend on. virtio_net - confirmed
+# missing the hard way on a real boot: the .ko is bundled (see
+# build.sh's own alpine-zfsboot.modules list) but was never actually loaded
+# here, so /dev/eth0 never existed at all and neither the automatic
+# (rescue-ssh-triggered) nor the on-demand (menu.py's own Network item)
+# DHCP bring-up had any interface to operate on - same class of gap as
+# the storage modules above, just never hit until something actually
+# needed the network.
+#
+# virtio_mmio - same class of gap again, confirmed the hard way on a
+# real Hetzner Cloud ARM64 (CAX) boot: virtio_pci (below) only covers
+# PCI-transport virtio devices, but QEMU's aarch64 "virt" machine type
+# (what Hetzner Cloud's ARM64 line uses) exposes virtio devices over
+# MMIO instead of PCI by default. Without virtio_mmio loaded first,
+# virtio_blk/virtio_scsi/virtio_net/virtio_gpu have no actual bus to
+# probe against and never attach to anything, silently - a working
+# reference Alpine install on the exact same platform force-loads this
+# via its own GRUB `modules=virtio_mmio,...` cmdline for exactly this
+# reason. Listed first (alongside virtio_pci), before anything that
+# binds to a device the transport exposes, same ordering reasoning as
+# the rest of this list. virtio_gpu - the actual display device on
+# this same platform (the "Display output is not active" symptom this
+# was chasing): bundled via build.sh's own "virtio" mkinitfs feature
+# (features.d/virtio.modules upstream ships kernel/drivers/gpu/drm/
+# virtio) but - same historical mistake as virtio_net above - bundling
+# the .ko is not the same as loading it, and nothing here ever did.
+# xhci_hcd/xhci_pci/ehci_hcd/ehci_pci/usbhid/hid_generic/usbkbd/
+# virtio_input - the other half of the real "display output not active"
+# root cause on Hetzner CAX (build.sh's own CONSOLE_CMDLINE comment has
+# the full story): confirmed via a real boot's own /proc/bus/input/
+# devices that no driver had bound the emulated USB keyboard at all.
+for mod in virtio_mmio virtio_pci virtio_gpu virtio_net virtio_blk virtio_scsi ahci ata_piix nvme sd_mod sr_mod \
+           xhci_hcd xhci_pci ehci_hcd ehci_pci usbhid hid_generic usbkbd virtio_input; do
+    modprobe "$mod" 2>/dev/null
+done
+
+# alpine-zfsboot.pool=/alpine-zfsboot.timeout= and this same boot's
+# network/rescue-ssh options are this project's own cmdline options,
+# baked into the .cmdline section build.sh writes into the EFI bundle
+# (or, for the network/ssh.* ones below, just as plausibly supplied
+# per-boot by whatever's actually booting this - a hosting provider's
+# own kernel-cmdline override, GRUB menu edit, etc) - not Alpine's
+# KOPT_* convention (that belongs to mkinitfs's own stock init, which
+# this script replaces entirely via `mkinitfs -i`, so there's no
+# KOPT_* parser left to piggyback on).
+#
+# Rescue SSH itself has no cmdline option at all anymore - who may
+# connect (authorized_keys) and this machine's own persistent identity
+# (ssh_host_ed25519_key) are ordinary files on the ESP, found by the
+# same discovery pass as the config file below, not another key=value
+# grammar - see rescue-ssh.sh's own header comment for the full
+# reasoning (an earlier alpine-zfsboot.ssh_key=<base64 pubkey> cmdline
+# key existed here; removed rather than kept alongside the ESP files as
+# a second mechanism for the same thing).
+ALPINE_ZFSBOOT_NET=""
+ALPINE_ZFSBOOT_IPV4=""
+ALPINE_ZFSBOOT_IPV4_ADDRESS=""
+ALPINE_ZFSBOOT_IPV4_GATEWAY=""
+ALPINE_ZFSBOOT_IPV6=""
+ALPINE_ZFSBOOT_IPV6_ADDRESS=""
+ALPINE_ZFSBOOT_IPV6_GATEWAY=""
+ALPINE_ZFSBOOT_SSH_LISTEN=""
+ALPINE_ZFSBOOT_SSH_PORT=""
+ALPINE_ZFSBOOT_SSH_ALLOW=""
+# bootcheck (failed-boot detection - see boot-dataset.sh's own
+# "content-derived arming" comment for the full design) and
+# panic_timeout (general boot policy, deliberately independent of
+# bootcheck - see its own case arm below for why) - both empty by
+# default, meaning "no override", not "off"/"0": an empty
+# ALPINE_ZFSBOOT_BOOTCHECK does not disable the per-BE ZFS property
+# gate, and an empty ALPINE_ZFSBOOT_PANIC_TIMEOUT falls back to this
+# project's own conservative default rather than 0 - see boot-
+# dataset.sh's own handling for why "unset" and "explicitly 0" must
+# stay distinguishable.
+ALPINE_ZFSBOOT_BOOTCHECK=""
+ALPINE_ZFSBOOT_BOOTCHECK_MAX=""
+ALPINE_ZFSBOOT_PANIC_TIMEOUT=""
+
+# Single source of truth for the alpine-zfsboot.* cmdline vocabulary -
+# fed both by the ESP-persisted config below and by /proc/cmdline
+# itself, in that order, so a single case statement (not two
+# copy-pasted ones that could drift) defines what a valid key is.
+apply_zfsboot_kv() {
+    # Strip a trailing CR - confirmed a real risk, not hypothetical: the
+    # ESP is FAT, and FAT-formatted config files get edited from
+    # Windows/from rescue tooling/from anything, any of which can leave
+    # CRLF line endings. Without this, alpine-zfsboot.ipv6.gateway=fe80::1
+    # (with a trailing \r) becomes a gateway value with a CR stuck to the
+    # end - `ip -6 route add default via $'fe80::1\r' dev eth0` then
+    # fails with a message that looks like an unrelated problem, on a
+    # machine nobody can see. Cmdline tokens are already word-split by
+    # the kernel and never carry a stray CR, so this is a no-op there -
+    # safe to apply unconditionally rather than only in the ESP-config
+    # reading loop.
+    kv="${1%$(printf '\r')}"
+    case "$kv" in
+        alpine-zfsboot.pool=*) POOL="${kv#alpine-zfsboot.pool=}" ;;
+        alpine-zfsboot.timeout=*) MENU_TIMEOUT="${kv#alpine-zfsboot.timeout=}" ;;
+        alpine-zfsboot.net=*) ALPINE_ZFSBOOT_NET="${kv#alpine-zfsboot.net=}" ;;
+        alpine-zfsboot.ipv4.address=*) ALPINE_ZFSBOOT_IPV4_ADDRESS="${kv#alpine-zfsboot.ipv4.address=}" ;;
+        alpine-zfsboot.ipv4.gateway=*) ALPINE_ZFSBOOT_IPV4_GATEWAY="${kv#alpine-zfsboot.ipv4.gateway=}" ;;
+        alpine-zfsboot.ipv4=*) ALPINE_ZFSBOOT_IPV4="${kv#alpine-zfsboot.ipv4=}" ;;
+        alpine-zfsboot.ipv6.address=*) ALPINE_ZFSBOOT_IPV6_ADDRESS="${kv#alpine-zfsboot.ipv6.address=}" ;;
+        alpine-zfsboot.ipv6.gateway=*) ALPINE_ZFSBOOT_IPV6_GATEWAY="${kv#alpine-zfsboot.ipv6.gateway=}" ;;
+        alpine-zfsboot.ipv6=*) ALPINE_ZFSBOOT_IPV6="${kv#alpine-zfsboot.ipv6=}" ;;
+        alpine-zfsboot.ssh.listen=*) ALPINE_ZFSBOOT_SSH_LISTEN="${kv#alpine-zfsboot.ssh.listen=}" ;;
+        alpine-zfsboot.ssh.port=*) ALPINE_ZFSBOOT_SSH_PORT="${kv#alpine-zfsboot.ssh.port=}" ;;
+        alpine-zfsboot.ssh.allow=*) ALPINE_ZFSBOOT_SSH_ALLOW="${kv#alpine-zfsboot.ssh.allow=}" ;;
+        # off: disable bootcheck gating/accounting entirely for this ONE
+        # boot (no read, no increment, no gate) - a supervised
+        # diagnostic boot. force: NOT "force-enable bootcheck" - it
+        # means "once the attempt threshold is hit, stay in rescue even
+        # if start_rescue_ssh itself fails to actually come up" (an
+        # operator with local/IPMI console who deliberately wants the
+        # machine to stop rather than keep silently retrying
+        # unreachably). Documented here, not just in the design doc,
+        # because this exact ambiguity was flagged during design review
+        # as the one part of this API most likely to be misread.
+        alpine-zfsboot.bootcheck=*) ALPINE_ZFSBOOT_BOOTCHECK="${kv#alpine-zfsboot.bootcheck=}" ;;
+        alpine-zfsboot.bootcheck.max=*) ALPINE_ZFSBOOT_BOOTCHECK_MAX="${kv#alpine-zfsboot.bootcheck.max=}" ;;
+        # Deliberately a SEPARATE key from bootcheck.* - general boot
+        # policy (a headless physical machine sitting at a panic screen
+        # forever is bad regardless of whether bootcheck is even in
+        # use), not an implementation detail of the counter feature.
+        # See boot-dataset.sh's own panic= injection for the "0 is a
+        # legal, meaningful value" handling this needs downstream.
+        alpine-zfsboot.panic_timeout=*) ALPINE_ZFSBOOT_PANIC_TIMEOUT="${kv#alpine-zfsboot.panic_timeout=}" ;;
+        # cmd/tool-only build metadata (internal/cmdline/cmdline.go reads
+        # these straight from the .cmdline PE section, offline, so it never
+        # has to unpack an initramfs just to answer "what version is
+        # this"). build.sh's own cmdline-assembly printf bakes BOTH of
+        # these onto every single build's cmdline unconditionally -
+        # confirmed a real, 100%-of-boots warning on real CAX hardware,
+        # not a rare misconfiguration: `apply_zfsboot_kv()` had no case
+        # arm for either, so both fell into the catch-all below and
+        # printed "unrecognized option" on every normal boot. Neither is
+        # operator config and neither is read by anything INSIDE the
+        # booted environment (menu.py's own version/build-stamp display
+        # reads separate flat files baked into the initramfs instead -
+        # see build.sh's own /etc/alpine-zfsboot-version handling) - so
+        # these are recognized, intentional no-ops here, not exclusions
+        # from parsing: the whole cmdline is one opaque token stream to
+        # this function, there is no other place to special-case them.
+        alpine-zfsboot.version=*) : ;;
+        alpine-zfsboot.buildstamp=*) : ;;
+        # Catches anything starting with the alpine-zfsboot. prefix that
+        # didn't match one of the specific keys above (a typo, a
+        # removed/renamed key, ipv6.gw instead of ipv6.gateway, ...) -
+        # scoped to the prefix specifically so this does NOT fire for
+        # every ordinary, unrelated cmdline token (root=, console=,
+        # quiet, ...) that also flows through this same function from
+        # the /proc/cmdline loop further down. The only signal this
+        # feature has when something's wrong is "the box never came
+        # up" - a loud warning here is near-zero risk and real value.
+        alpine-zfsboot.*) msg "WARNING: unrecognized option $kv - ignored" ;;
+    esac
+}
+
+# ESP-persisted material (/EFI/alpine-zfsboot/ on the EFI System
+# Partition) - install-time, per-machine settings/material that must
+# survive without baking anything per-machine into the shared .EFI
+# binary (EXTRA_CMDLINE is build-time only, one shared artifact for the
+# whole fleet - see build.sh). Three separate files with three separate
+# jobs, deliberately not one grammar for all of it:
+#   config                 - policy: network/bootcheck/ssh.* settings,
+#                             read BEFORE /proc/cmdline below so cmdline
+#                             always wins (a bad persisted config must
+#                             stay overridable for one boot, never a
+#                             permanent lock-out)
+#   authorized_keys        - trust: who may connect - one BARE public
+#                             key per line (blank lines/comments OK),
+#                             NOT full OpenSSH authorized_keys syntax:
+#                             operator-supplied options (from=,
+#                             restrict, expiry-time=, ...) are
+#                             deliberately rejected outright below, not
+#                             silently stripped, so alpine-zfsboot
+#                             remains the sole owner of what
+#                             restrictions actually apply (see the
+#                             unconditional option-injection in
+#                             rescue-ssh.sh - deliberately NOT the bare
+#                             `restrict` keyword itself, since that
+#                             also denies pty allocation and would
+#                             break interactive rescue sessions).
+#                             Deliberately NOT another
+#                             alpine-zfsboot.* config key either (an
+#                             earlier alpine-zfsboot.ssh_key=<base64
+#                             pubkey> cmdline key existed here; removed,
+#                             not kept alongside this as a second
+#                             mechanism)
+#   ssh_host_ed25519_key   - identity: this one machine's persistent
+#                             rescue SSH host key (see rescue-ssh.sh's
+#                             own header comment for why a fresh host
+#                             key every boot was actively undesirable)
+# authorized_keys/ssh_host_ed25519_key are staged into fixed tmpfs
+# paths here (validated/CR-stripped for the former, copied verbatim for
+# the latter - it's dropbear's own binary key format, machine-generated,
+# never hand-edited, so no text-file CR hazard applies) for rescue-
+# ssh.sh to pick up later, regardless of which of its three trigger
+# points ends up calling start_rescue_ssh this boot - same reasoning as
+# config's own cmdline-independent staging, just for file-shaped data
+# instead of key=value pairs.
+#
+# Found by FAT volume label, not GPT partition-type GUID: the installer
+# already gives the ESP a fixed label (`mkfs.vfat -F32 -n EFI`, see
+# alpine-install-zfs.sh) - reusing that existing, working convention
+# instead of a new dependency on partition-table introspection busybox's
+# blkid may not actually have (it does real filesystem-label detection;
+# whether it parses GPT partition-type GUIDs at all is unverified).
+# Every matching device is tried in turn, not just the first - if more
+# than one disk is labeled EFI, the one actually carrying this
+# project's own material wins, not whichever blkid happened to list
+# first.
+#
+# config is pure data even though it's whitelist-parsed the same way
+# /proc/cmdline is (apply_zfsboot_kv() only ever matches alpine-
+# zfsboot.* keys) - deliberately NOT sourced as a shell script, so its
+# content can never run as code regardless of what it contains.
+# authorized_keys is validated line-by-line against known SSH key-type
+# prefixes (anything else is dropped with a warning, never passed
+# through). Real boot only ($ROOTFS-prefixed test runs have no real
+# block devices to scan) - unverified against a real ESP/boot, same as
+# everything else added today; needs a real-hardware test before this
+# is trusted the way the rest of this file is.
+#
+# Disambiguation is deliberate, not first-match-wins: a candidate must
+# carry this project's own EFI binary (either arch's fallback name -
+# checking for either rather than the build's own arch specifically,
+# since that's not tracked at runtime here and a filesystem carrying
+# either one is equally a real alpine-zfsboot ESP, never a coincidental
+# match) AND at least one of the three files above - broadened from
+# "config specifically" (an earlier version of this check) so a machine
+# that only wants rescue SSH, with no other network/bootcheck override,
+# doesn't need an empty config file just to be recognized as a real
+# alpine-zfsboot ESP. Exactly one such candidate -> use it. Two cloned
+# disks both carrying a real ESP is a genuine ambiguity, not a "pick
+# one" situation - silently taking whichever blkid happened to list
+# first would make selection depend on enumeration order, which can
+# change between boots on the same hardware. Loud warning and NONE of
+# the three applied instead - defaults/cmdline-only that boot, rescue
+# SSH unconfigured, same as if none of this had ever existed, rather
+# than a guess nobody asked for.
+if [ -z "$ROOTFS" ]; then
+    mkdir -p /tmp/esp-config /tmp/alpine-zfsboot
+    esp_candidate=""
+    esp_candidate_count=0
+    for esp_dev in $(blkid 2>/dev/null | grep 'LABEL="EFI"' | cut -d: -f1); do
+        mount -t vfat -o ro "$esp_dev" /tmp/esp-config 2>/dev/null || continue
+        esp_marker=0
+        [ -r "/tmp/esp-config/EFI/alpine-zfsboot/config" ] && esp_marker=1
+        [ -r "/tmp/esp-config/EFI/alpine-zfsboot/authorized_keys" ] && esp_marker=1
+        [ -r "/tmp/esp-config/EFI/alpine-zfsboot/ssh_host_ed25519_key" ] && esp_marker=1
+        if [ "$esp_marker" = 1 ] && \
+           { [ -f "/tmp/esp-config/EFI/BOOT/BOOTX64.EFI" ] || [ -f "/tmp/esp-config/EFI/BOOT/BOOTAA64.EFI" ]; }; then
+            esp_candidate_count=$((esp_candidate_count + 1))
+            esp_candidate="$esp_dev"
+        fi
+        umount /tmp/esp-config 2>/dev/null
+    done
+    if [ "$esp_candidate_count" -eq 1 ]; then
+        msg "alpine-zfsboot ESP found on $esp_candidate"
+        if mount -t vfat -o ro "$esp_candidate" /tmp/esp-config 2>/dev/null; then
+            if [ -r "/tmp/esp-config/EFI/alpine-zfsboot/config" ]; then
+                msg "applying persisted config (cmdline still overrides)"
+                while IFS= read -r line || [ -n "$line" ]; do
+                    case "$line" in
+                        ''|'#'*) : ;;
+                        alpine-zfsboot.*) apply_zfsboot_kv "$line" ;;
+                    esac
+                done < "/tmp/esp-config/EFI/alpine-zfsboot/config"
+            fi
+
+            # Staged as the validated, CR-stripped raw key lines only -
+            # no options injected here. That's rescue-ssh.sh's own
+            # job (the same mandatory-hardening call it already made for
+            # the old single-key mechanism), applied uniformly regardless
+            # of what the operator's own file looks like - keeping
+            # "find and validate what's on the ESP" here, "how dropbear
+            # actually gets invoked" in rescue-ssh.sh, the same split
+            # already used for config vs net_config/start_rescue_ssh.
+            if [ -r "/tmp/esp-config/EFI/alpine-zfsboot/authorized_keys" ]; then
+                zfsboot_keys_found=0
+                while IFS= read -r ak_line || [ -n "$ak_line" ]; do
+                    # Strip a trailing CR - identical hazard/fix as
+                    # config's own CR-stripping in apply_zfsboot_kv():
+                    # this file lives on the same FAT partition and is
+                    # just as likely to be hand-edited from Windows/
+                    # rescue tooling.
+                    ak_line="${ak_line%$(printf '\r')}"
+                    case "$ak_line" in
+                        ''|'#'*) continue ;;
+                    esac
+                    case "$ak_line" in
+                        ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ecdsa-sha2-*\ *|sk-ssh-ed25519\ *)
+                            printf '%s\n' "$ak_line" >> /tmp/alpine-zfsboot/authorized_keys
+                            zfsboot_keys_found=$((zfsboot_keys_found + 1))
+                            ;;
+                        *)
+                            msg "WARNING: ignoring authorized_keys line that doesn't look like a public key: $ak_line"
+                            ;;
+                    esac
+                done < "/tmp/esp-config/EFI/alpine-zfsboot/authorized_keys"
+                msg "authorized_keys: $zfsboot_keys_found usable key(s) found"
+            fi
+
+            # Copied verbatim - dropbear's own native key format,
+            # machine-generated once by the installer, never hand-
+            # edited, so no CR-stripping concern the way config/
+            # authorized_keys have. Validity is rescue-ssh.sh's own job
+            # (dropbearkey -y), matching where the old ssh_key='s own
+            # decode/validity check used to live.
+            if [ -r "/tmp/esp-config/EFI/alpine-zfsboot/ssh_host_ed25519_key" ]; then
+                cp "/tmp/esp-config/EFI/alpine-zfsboot/ssh_host_ed25519_key" /tmp/alpine-zfsboot/ssh_host_ed25519_key
+                chmod 600 /tmp/alpine-zfsboot/ssh_host_ed25519_key
+                msg "persistent ssh_host_ed25519_key found"
+            else
+                msg "no persistent ssh_host_ed25519_key found on the ESP"
+            fi
+
+            umount /tmp/esp-config 2>/dev/null
+        else
+            msg "WARNING: found an alpine-zfsboot ESP candidate ($esp_candidate) but failed to re-mount it - defaults/cmdline only, rescue SSH unconfigured"
+        fi
+    elif [ "$esp_candidate_count" -gt 1 ]; then
+        msg "WARNING: $esp_candidate_count devices carry both an alpine-zfsboot boot binary and config/authorized_keys/host-key material - ambiguous, applying NONE of it. This boot uses defaults/cmdline only, rescue SSH unconfigured."
+    else
+        # Deliberately logged even in the ordinary "nothing found" case,
+        # not just the ambiguous one above - this whole mechanism has
+        # never run on real hardware (see this block's own header
+        # comment), so "zero candidates found" and "material found and
+        # applied cleanly" must be distinguishable from the console
+        # alone the first time this is actually tested, rather than
+        # both being silent and indistinguishable from each other.
+        msg "no alpine-zfsboot ESP found (checked every LABEL=EFI device) - defaults/cmdline only, rescue SSH unconfigured"
+    fi
+fi
+
+for arg in $(cat "$ROOTFS/proc/cmdline" 2>/dev/null); do
+    apply_zfsboot_kv "$arg"
+done
+export ALPINE_ZFSBOOT_POOL="$POOL"
+export ALPINE_ZFSBOOT_NET \
+    ALPINE_ZFSBOOT_IPV4 ALPINE_ZFSBOOT_IPV4_ADDRESS ALPINE_ZFSBOOT_IPV4_GATEWAY \
+    ALPINE_ZFSBOOT_IPV6 ALPINE_ZFSBOOT_IPV6_ADDRESS ALPINE_ZFSBOOT_IPV6_GATEWAY \
+    ALPINE_ZFSBOOT_SSH_LISTEN ALPINE_ZFSBOOT_SSH_PORT ALPINE_ZFSBOOT_SSH_ALLOW \
+    ALPINE_ZFSBOOT_BOOTCHECK ALPINE_ZFSBOOT_BOOTCHECK_MAX ALPINE_ZFSBOOT_PANIC_TIMEOUT
+# Sourced (not exec'd) so its start_rescue_ssh/stop_rescue_ssh
+# functions are available to die() below, and to boot-dataset.sh
+# separately (it sources this same file itself - one implementation,
+# not two). Safe to source unconditionally even when no authorized_keys/
+# host key were ever staged above: every function in it no-ops cleanly
+# in that case (see its own start_rescue_ssh - the missing-material
+# check is its very first guard, reading the same /tmp/alpine-zfsboot/
+# staging paths this file just populated, or left empty).
+. "$RESCUE_LIB_DIR/rescue-ssh.sh"
+
+# CONSOLE_NAME=auto builds (see build.sh) put BOTH console=tty0 and
+# console=ttyS0/ttyAMA0 on the kernel cmdline - real hardware/VGA and
+# serial both get every kernel message from boot onward (which is
+# also just genuinely useful on its own: this project's entire EFI
+# loader debugging saga depended on switching between vga and serial
+# builds to get a scrollable log at all - a dual-console build never
+# has to make that choice). Only one of them can be /dev/console
+# though (the kernel picks the LAST console= listed), so without this,
+# whichever one someone is actually looking at might not be the one
+# menu.py actually renders to.
+#
+# select_console() picks which real tty menu.py renders to this boot,
+# honoring a persisted preference if one exists and this boot actually
+# has that candidate - no race, no countdown here: the menu is ALWAYS
+# shown immediately now (see the loop further down), with its own
+# live-ticking countdown built INTO the real interactive widget itself
+# (see menu.py's _countdown_menu()), FreeBSD-loader-style, rather than
+# a separate pre-menu prompt that would just be a second, redundant
+# screen in front of the real one. Switching consoles happens from
+# WITHIN the menu itself (see menu.py's switch_console()) rather than
+# during a race here - that needs a live re-attach (close and reopen
+# stdin/stdout/stderr against a different tty), which only makes sense
+# once something is actually running to ask for it, not during a
+# fire-and-forget shell loop with nothing to redraw.
+#
+# EFIVAR_GUID/EFIVAR_NAME/EFIVAR_PATH and read_console_pref implement
+# "remembers the last choice" via a real UEFI NVRAM variable (see the
+# efivarfs mount above) - the same mechanism systemd-boot's
+# LoaderEntryDefault / GRUB's grubenv use to persist a choice across
+# reboots, since nothing else survives this fresh-every-boot
+# initramfs before the pool is even imported. GUID is a real, freshly
+# generated random UUID (ce0e7d88-f5ad-45e9-a195-680f5140efa5),
+# specific to this project, not reused from anywhere else. Read-only
+# here on purpose - menu.py's own switch_console() writes this same
+# variable directly in Python (simpler and safer than a shell printf
+# trying to embed a NUL byte correctly in one write() call).
+EFIVAR_GUID="ce0e7d88-f5ad-45e9-a195-680f5140efa5"
+EFIVAR_NAME="AlpineZfsBootConsole"
+EFIVAR_PATH="/sys/firmware/efi/efivars/${EFIVAR_NAME}-${EFIVAR_GUID}"
+
+# An efivarfs file's first 4 bytes are the variable's own UEFI
+# attributes (EFI_VARIABLE_* flags), not part of the stored value -
+# `tail -c +5` strips exactly those, the same convention every real
+# efivarfs reader (efibootmgr, systemd's bootctl, ...) follows. Silent
+# empty result if the variable was never set, or this isn't real UEFI
+# hardware/firmware with efivarfs support - callers already treat "no
+# preference" and "unsupported" identically.
+read_console_pref() {
+    [ -r "$EFIVAR_PATH" ] || return
+    tail -c +5 "$EFIVAR_PATH" 2>/dev/null | tr -d '\0'
+}
+
+ACTIVE_TTY=tty0
+select_console() {
+    candidates=""
+    # ttyS1/ttyS2 alongside ttyS0/ttyAMA0 - confirmed a real need on
+    # physical OVH hardware, whose remote-console redirection doesn't
+    # always land on ttyS0. Listed here too (not just left to
+    # EXTRA_CMDLINE) since this loop is what decides which /dev nodes
+    # switch_console() even offers as candidates in the first place.
+    for tty in tty0 ttyS0 ttyS1 ttyS2 ttyAMA0; do
+        [ -e "$ROOTFS/dev/$tty" ] && candidates="$candidates $tty"
+    done
+    set -- $candidates
+    if [ "$#" -eq 0 ]; then
+        return
+    fi
+
+    # Default to whichever console the KERNEL ITSELF already treats as
+    # primary - not a fixed, arbitrary "first candidate found" guess.
+    # /sys/class/tty/console/active lists every registered console in
+    # cmdline order (a standard kernel-exposed file); the LAST one is
+    # the one the kernel actually uses as /dev/console, per its own
+    # "last console= wins" convention - the exact same convention this
+    # project's own `auto` cmdline already relies on. Confirmed the
+    # hard way on real hardware: an earlier version always defaulted
+    # to tty0 first-found regardless of which console pid 1 itself was
+    # ALREADY writing to before this function ever ran - /init's own
+    # earlier msg() calls (e.g. "importing pool: zroot") had already
+    # been appearing on THAT console the whole boot, and blindly
+    # switching to a different one here, on a first boot with no
+    # persisted preference yet, made the console someone was actually
+    # watching go silent with no warning while the menu kept running
+    # invisibly on the other one.
+    ACTIVE_TTY="$1"
+    for tty in $(cat "$ROOTFS/sys/class/tty/console/active" 2>/dev/null); do
+        for candidate in $candidates; do
+            [ "$tty" = "$candidate" ] && ACTIVE_TTY="$candidate"
+        done
+    done
+
+    # An explicit, persisted preference (see read_console_pref above)
+    # always wins over the kernel's own default - it represents a real
+    # past choice (switch_console(), see menu.py), not a guess.
+    pref="$(read_console_pref)"
+    for tty in $candidates; do
+        [ "$tty" = "$pref" ] && ACTIVE_TTY="$pref"
+    done
+}
+
+# Remote rescue access is NOT started here unconditionally anymore -
+# see rescue-ssh.sh's own header comment for the full lifecycle
+# rationale. die() below is one of this project's three real trigger
+# points (the other two are boot-dataset.sh's fail() and its
+# encryption-key wait) - each calls start_rescue_ssh ITSELF, at the
+# exact moment its own specific problem is detected, not from a single
+# early guess up here. A healthy boot that never calls die() never
+# starts dropbear at all: no open port, nothing to scan, nothing to
+# harden, because it isn't there - even when authorized_keys/host key
+# ARE staged for break-glass use.
+
+modprobe zfs 2>/dev/null
+# Not fatal here if this fails - `zpool import` below fails with a real,
+# specific error message either way, which is more useful than dying on
+# a modprobe warning that might just mean the module was built in.
+
+# -f: confirmed necessary for this project to boot AT ALL, not just
+# to recover from an earlier crash - this initramfs is fresh every
+# boot (no persisted /etc/hostid across reboots), so the pool's own
+# recorded hostid essentially never matches this boot's, and zpool
+# import refuses ("pool was previously in use from another system")
+# without -f on every normal reboot, not just an unclean one. The
+# real protection -f bypasses (the SAME pool imported live on two
+# hosts at once, e.g. shared SAN/iSCSI storage) doesn't apply here:
+# $POOL lives on this machine's own local disk, one importer, one
+# machine, by construction - not the scenario that check exists for.
+# A missing/unbootable pool used to `die` straight to a bare recovery
+# shell here, before menu.py ever got a chance to run at all - a real,
+# reported usability problem: a bare bash prompt gives no indication
+# of WHAT went wrong or WHAT ELSE is available (Diagnostics, Network,
+# a properly job-control-capable Recovery shell, retrying a different
+# pool via Deploy) short of already knowing the right zfs/zpool
+# incantations by heart. This is exactly the scenario menu.py's own
+# rich UI exists for - it and boot-dataset.sh's own fail() are the two
+# places actually meant to be someone's first real look at a broken
+# boot, not this script's own bare-bash fallback (still kept below,
+# but only as the last resort if python3/menu.py itself is what's
+# broken). ALPINE_ZFSBOOT_POOL_IMPORT_ERROR, once set, is what tells menu.py
+# to show that state instead of assuming a normal, bootable pool.
+POOL_IMPORT_ERROR=""
+
+msg "importing pool: $POOL"
+if ! zpool import -f -N -d /dev "$POOL" 2>/tmp/zpool-import.log; then
+    cat /tmp/zpool-import.log
+    POOL_IMPORT_ERROR="zpool import -f -N -d /dev $POOL failed: $(cat /tmp/zpool-import.log | tr '\n' ' ')"
+    msg "WARNING: $POOL_IMPORT_ERROR"
+fi
+
+if [ -z "$POOL_IMPORT_ERROR" ]; then
+    BOOTFS="$(zpool get -H -o value bootfs "$POOL" 2>/dev/null)"
+    if [ -z "$BOOTFS" ] || [ "$BOOTFS" = "-" ]; then
+        POOL_IMPORT_ERROR="pool $POOL has no bootfs property set (zpool get bootfs $POOL)"
+        msg "WARNING: $POOL_IMPORT_ERROR"
+    else
+        export ALPINE_ZFSBOOT_BOOTFS="$BOOTFS"
+        # `zpool status -x POOL` prints "pool 'POOL' is healthy" when
+        # everything is fine, or a real problem description (DEGRADED,
+        # FAULTED, a resilver in progress, ...) otherwise. menu.py's own
+        # Diagnostics screen surfaces this too, but a WARNING here means
+        # it's visible immediately, before anyone even has to think to
+        # go looking for it.
+        health="$(zpool status -x "$POOL" 2>/dev/null)"
+        case "$health" in
+            *healthy*) ;;
+            *) msg "WARNING: $POOL is not healthy: $health" ;;
+        esac
+    fi
+fi
+export ALPINE_ZFSBOOT_POOL_IMPORT_ERROR="$POOL_IMPORT_ERROR"
+
+# A real, confirmed gap: this project's own header comment above
+# already documents "three real trigger points" for start_rescue_ssh -
+# die()'s own call, boot-dataset.sh's fail(), and the encryption-key
+# wait - but a pool-import failure specifically, the single most
+# catastrophic failure this project can hit, was NOT one of them. On
+# the actual COMMON path (menu.py itself runs fine and just renders the
+# POOL_IMPORT_ERROR state instead of a normal countdown - see menu.py's
+# own POOL_IMPORT_ERROR handling in main()), die() below is NEVER
+# reached at all (it's the last-resort fallback for when python3/
+# menu.py itself is ALSO broken) - meaning nothing ever called
+# start_rescue_ssh, and a headless machine with real authorized_keys/
+# host key staged and a real NIC sat there with menu.py rendering a nice
+# error screen to a console nobody could see, and nothing listening on
+# port 22. Fixed here, proactively, the moment the failure is known -
+# not reactively inside menu.py (which has no direct way to call this
+# shell function at all) and not left to die()'s own fallback-only path.
+if [ -n "$POOL_IMPORT_ERROR" ]; then
+    start_rescue_ssh
+fi
+
+# Failed-boot detection ("bootcheck") - see boot-dataset.sh's own
+# header comment on the property grammar and content-derived-arming
+# design for the full why. This is the ONE authoritative decision
+# point: read the per-BE state, decide, and set a single exported flag
+# that every auto-boot path (this script's own fallback further down,
+# and menu.py's countdown/exception-handler fallback) checks - not
+# three separate copies of the same decision drifting apart.
+#
+# Skipped entirely if the pool itself never imported (POOL_IMPORT_ERROR
+# already set above - a wholly separate, already-handled failure class
+# with its own immediate, counter-free rescue trigger) or if
+# alpine-zfsboot.bootcheck=off was configured for this one boot.
+ALPINE_ZFSBOOT_FORCED_RESCUE=""
+if [ -z "$POOL_IMPORT_ERROR" ] && [ "$ALPINE_ZFSBOOT_BOOTCHECK" != "off" ]; then
+    bootcheck_raw="$(zfs get -H -o value,source org.alpinezfsboot:bootcheck "$BOOTFS" 2>/dev/null)"
+    bootcheck_value="${bootcheck_raw%%	*}"
+    bootcheck_source="${bootcheck_raw#*	}"
+    bootcheck_k=""
+    case "$bootcheck_value" in
+        armed:*)
+            bootcheck_k="${bootcheck_value#armed:}"
+            case "$bootcheck_k" in
+                ''|*[!0-9]*) bootcheck_k="" ;;
+            esac
+            ;;
+    esac
+    # Only a LOCAL, numeric armed:K counts as a real per-BE attempt
+    # count - a real, confirmed ZFS behavior: user properties are
+    # ALWAYS inherited, so a value set higher in the pool hierarchy
+    # (e.g. on the ROOT container dataset) would otherwise silently
+    # apply the exact same stale count to every BE and every future
+    # clone. Anything else (absent, off, unparseable, inherited,
+    # received) is simply not counted here - fail open, matching this
+    # project's own established posture for every other malformed-
+    # input case.
+    if [ -n "$bootcheck_k" ] && [ "$bootcheck_source" = "local" ]; then
+        bootcheck_max="$ALPINE_ZFSBOOT_BOOTCHECK_MAX"
+        case "$bootcheck_max" in
+            ''|*[!0-9]*|0)
+                [ -n "$bootcheck_max" ] && msg "WARNING: invalid alpine-zfsboot.bootcheck.max=$bootcheck_max, using the default (3)"
+                bootcheck_max=3
+                ;;
+            *)
+                if [ "$bootcheck_max" -gt 99 ]; then
+                    msg "WARNING: alpine-zfsboot.bootcheck.max=$bootcheck_max out of range (1-99), using the default (3)"
+                    bootcheck_max=3
+                fi
+                ;;
+        esac
+        if [ "$bootcheck_k" -ge "$bootcheck_max" ]; then
+            msg "WARNING: $BOOTFS has $bootcheck_k consecutive un-confirmed boot attempts (threshold $bootcheck_max) - attempting rescue SSH before deciding"
+            # Gated on whether rescue SSH ACTUALLY started, not merely
+            # on whether authorized_keys/host key are staged -
+            # start_rescue_ssh can still fail after both are present
+            # (host key fails to validate, net_config itself failing, a
+            # malformed ssh.allow= CIDR) - see rescue-ssh.sh's own
+            # return-status contract. Deciding "material staged
+            # therefore safe to stop auto-booting"
+            # would strand exactly the headless machine this feature
+            # exists to protect, in exactly the scenario where it
+            # matters most.
+            if start_rescue_ssh; then
+                ALPINE_ZFSBOOT_FORCED_RESCUE="$BOOTFS has $bootcheck_k consecutive un-confirmed boot attempts (threshold $bootcheck_max)"
+            elif [ "$ALPINE_ZFSBOOT_BOOTCHECK" = "force" ]; then
+                msg "WARNING: rescue SSH did not start, but alpine-zfsboot.bootcheck=force is set - staying in rescue anyway"
+                ALPINE_ZFSBOOT_FORCED_RESCUE="$BOOTFS has $bootcheck_k consecutive un-confirmed boot attempts (threshold $bootcheck_max) - rescue SSH unreachable, forced anyway"
+            else
+                msg "WARNING: rescue SSH did not start and no force override - auto-booting $BOOTFS anyway rather than stranding this machine unreachably"
+            fi
+        elif [ "$bootcheck_k" -gt 0 ]; then
+            msg "WARNING: $BOOTFS has $bootcheck_k consecutive un-confirmed boot attempt(s) (threshold $bootcheck_max) - auto-booting anyway"
+        fi
+    fi
+fi
+export ALPINE_ZFSBOOT_FORCED_RESCUE
+
+# Worth importing any OTHER pool that's reachable right now too (e.g.
+# a second disk plugged in for a rescue, or a golden-image source
+# pool) - best-effort, so menu.py's boot-environment listing/deploy
+# flows can see it. `zpool import -d /dev` with no pool name lists
+# every importable pool as "   pool: NAME" blocks. Once, here, not
+# inside the loop below - console switches don't change what pools are
+# reachable.
+for extra in $(zpool import -d /dev 2>/dev/null | sed -n 's/^   pool: //p'); do
+    [ "$extra" = "$POOL" ] && continue
+    zpool import -f -N -d /dev "$extra" 2>/dev/null
+done
+
+export ALPINE_ZFSBOOT_MENU_TIMEOUT="$MENU_TIMEOUT"
+
+# menu.py always runs now (see this file's own header comment) - the
+# loop, not a single run, is what makes menu.py's own switch_console()
+# a REAL, live switch rather than "takes effect next reboot": exit
+# code 42 is a deliberate, specific signal from there ("restart me
+# attached to a different console" - the preference itself was already
+# persisted via the efivarfs write in switch_console() by the time
+# this exits), not a crash - select_console() re-reads that
+# (just-updated) preference on the next iteration, and re-running the
+# exec redirect below re-attaches stdin/stdout/stderr to whichever tty
+# that now is. Any OTHER exit (0, or nonzero from a real crash) breaks
+# out and falls through to automatic boot below, exactly as a crash
+# always has.
+while :; do
+    select_console
+    # Real boot only (bare /dev, no $ROOTFS prefix) - under
+    # tests/run-tests.sh, ROOTFS is set and this exec would hijack the
+    # test harness's own output-capturing redirect instead of anything
+    # meaningful, so it's skipped there; the test only needs
+    # ACTIVE_TTY itself, not the physical redirect.
+    if [ -z "$ROOTFS" ]; then
+        exec < "/dev/$ACTIVE_TTY" > "/dev/$ACTIVE_TTY" 2>&1
+    fi
+
+    # dialog (menu.py's own rendering - see its header comment) needs
+    # $TERM to resolve to a real terminfo entry - confirmed missing
+    # the hard way (`setupterm: could not find terminfo database`,
+    # TERM unset falls back to "unknown", which no terminfo database
+    # has an entry for either way). tty0 is a real Linux virtual
+    # console - "linux" is its own terminfo entry, baked into every
+    # real Linux install for exactly this device, and does declare
+    # color support. ttyS0/ttyAMA0 are real serial lines - NOT "vt100"
+    # (an earlier version used that - confirmed for real via `infocmp
+    # vt100` that its terminfo entry declares no colors/pairs/setaf
+    # capability at all: real DEC VT100 hardware was monochrome, and
+    # the terminfo database reflects that literally, which is exactly
+    # why this project's own green-on-black dialog theme - see
+    # init/dialogrc - never showed any color over serial at all).
+    # "ansi" instead: confirmed via `infocmp ansi` to declare real
+    # color support (colors#8, setaf) AND proper cursor/arrow-key
+    # capabilities dialog's own menu navigation needs, while still
+    # being about as conservatively-compatible a choice as "vt100" was
+    # for an unknown real serial terminal on the other end.
+    case "$ACTIVE_TTY" in
+        tty0)
+            TERM=linux
+            ;;
+        *)
+            TERM=ansi
+            # A raw serial line carries NO terminal-geometry
+            # negotiation of its own, at any layer - confirmed the
+            # hard way on a real, reported "the TUI is corrupted"
+            # boot, over a real multi-hop connection (a wide local
+            # terminal emulator, through tmux, through ssh, through
+            # `qm terminal`, to this exact serial line): none of those
+            # hops carries real window-size information through to
+            # this guest, so TIOCGWINSZ against this tty can report
+            # 0x0, a stale leftover value, or anything else, with
+            # nothing (no getty, no window-size negotiation the serial
+            # protocol itself has no mechanism for at all) ever having
+            # set a real one. dialog/ncurses computes its own cursor-
+            # positioning escapes straight from whatever that ioctl
+            # reports - a wrong size there is exactly what produced
+            # the reported symptom (box-drawing running together,
+            # lines starting at the wrong column, content overlapping
+            # itself).
+            #
+            # The first fix attempt patched this per dialog call
+            # instead (menu.py detecting TIOCGWINSZ itself, falling
+            # back to 80x24, and forcing COLUMNS/LINES on each dialog
+            # subprocess) - working, but the wrong layer: every single
+            # caller had to remember to do it, and menu.py still had
+            # no way to make a plain interactive shell (recovery_shell(),
+            # chroot_be()) agree with dialog's own idea of the
+            # terminal's size either. Fixing it ONCE here instead,
+            # before ANYTHING (menu.py, dialog, an interactive shell)
+            # ever queries this tty, means every single program
+            # downstream sees the SAME correct answer from a plain,
+            # unpatched TIOCGWINSZ - one authoritative console-init-
+            # time decision instead of N per-caller guesses.
+            #
+            # Not an attempt to learn the REAL remote terminal's real
+            # size (there is no way to, over a raw serial line - see
+            # above) - a fixed, deterministic contract instead, the
+            # same one a real serial getty's own default would
+            # normally establish. tty0 (the branch above) needs no
+            # equivalent: a real Linux virtual console's geometry
+            # comes from the kernel's own vt/fbcon layer, which
+            # genuinely knows its real size already.
+            stty rows 24 cols 80 2>/dev/null
+            ;;
+    esac
+    export TERM ALPINE_ZFSBOOT_ACTIVE_TTY="$ACTIVE_TTY"
+
+    # Deliberately NOT `exec`: menu.py itself execs straight into
+    # boot-dataset.sh on every path that actually boots something (see
+    # menu.py's boot()), so running this in the foreground and letting
+    # that happen costs nothing on the success path. The reason to
+    # avoid exec here is the failure path: if python3/menu.py is
+    # missing, OR python3 starts fine but then dies from an uncaught
+    # exception (a real, repeated failure this project hit several
+    # times in a row - missing stdlib modules under this deliberately
+    # stripped-down interpreter), `exec` would already have replaced
+    # init (PID 1) before that exception ever fires - and PID 1 exiting
+    # for ANY reason, success or crash, is an unrecoverable kernel
+    # panic ("Attempted to kill init!"), not a survivable error.
+    # Running it as a plain child means a python-level crash just exits
+    # that child with a nonzero status, PID 1 stays alive, and this
+    # script falls through to the exact same automatic-boot safety net
+    # already in place for the "not found" case - a menu.py bug now
+    # costs a fallback to automatic boot, never a full reboot cycle.
+    python3 /menu.py
+    [ "$?" = 42 ] || break
+done
+msg "menu.py exited (python3/menu.py missing or crashed) - falling back to automatic boot"
+
+# menu.py itself is the normal way this situation surfaces now (see
+# ALPINE_ZFSBOOT_POOL_IMPORT_ERROR above) - reaching this line at all with a
+# real import error set means menu.py ALSO failed to even run (missing
+# python3, an uncaught exception) with nothing left to boot anyway.
+# The bare recovery shell here is the last resort, not the first
+# thing anyone sees for an ordinary missing/broken pool anymore.
+if [ -n "$ALPINE_ZFSBOOT_POOL_IMPORT_ERROR" ]; then
+    die "$ALPINE_ZFSBOOT_POOL_IMPORT_ERROR"
+fi
+
+# Same reasoning as the POOL_IMPORT_ERROR check just above - if
+# bootcheck's own decision point (see its own comment further up)
+# determined this BE has exceeded its failed-boot threshold and rescue
+# SSH is either up or explicitly forced, this fallback must never
+# auto-boot it anyway just because menu.py happened to also crash.
+if [ -n "$ALPINE_ZFSBOOT_FORCED_RESCUE" ]; then
+    die "$ALPINE_ZFSBOOT_FORCED_RESCUE"
+fi
+
+exec /boot-dataset.sh "$BOOTFS" "$POOL"
+die "unreachable - /boot-dataset.sh should never return"

@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "kexec $*" >> "${STUB_LOG:-/dev/null}"
+exit 0

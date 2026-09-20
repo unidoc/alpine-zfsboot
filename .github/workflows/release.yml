@@ -1,0 +1,155 @@
+name: Build and release .EFI images
+
+# Triggered by pushing a version tag (v0.1.0, v0.2.0, ...) - same
+# pattern alpine-rescue's own release.yml uses. That tag versions this
+# PROJECT (init/menu.py/build.sh - whatever changed since the last
+# release), not the Alpine base it's built against - bump it on any
+# change worth shipping, or whenever a new Alpine version needs
+# supporting, entirely on our own schedule, no dependency on any other
+# repo. Pushing a tag is a deliberate act, not automatic on every merge
+# to main - these images get baked directly into installed systems'
+# boot process with no PR/review gate in between. Asset filenames stay
+# arch-based (unversioned) - only the release itself carries the tag -
+# so `.../releases/latest/download/...` links never need to change
+# when a new version ships.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-x86_64:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # No job-level `container:` - GitHub only bundles a Node runtime
+      # for x64 Alpine containers, not arm64 (confirmed the hard way in
+      # unidoc-aports' own CI), so this repo runs the Alpine side
+      # inside a throwaway `docker run` container on both arches
+      # uniformly instead of relying on that x64-only exception - one
+      # pattern, not two.
+      - name: Build EFI image (x86_64)
+        run: |
+          set -e
+          mkdir -p out
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e OUT_DIR=/work/out \
+            alpine:3.24 sh -c '
+              set -eu
+              apk update
+              apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
+              ./build.sh
+            '
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: efi-images-x86_64
+          path: out/*
+          if-no-files-found: error
+
+  build-aarch64:
+    # Native runner, not QEMU - this repo's own build doesn't compile
+    # anything (zfs-lts ships prebuilt kernel modules, objcopy/mkinitfs
+    # just move bytes around), so QEMU emulation would probably be
+    # tolerable here - but a native runner is simpler and removes the
+    # question entirely rather than assuming it would be fine.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build EFI image (aarch64)
+        run: |
+          set -e
+          mkdir -p out
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e OUT_DIR=/work/out \
+            alpine:3.24 sh -c '
+              set -eu
+              apk update
+              apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
+              ./build.sh
+            '
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: efi-images-aarch64
+          path: out/*
+          if-no-files-found: error
+
+  build-tool:
+    # cmd/tool - the install-time version/update helper (see its own
+    # header comment), entirely separate from the .EFI build above:
+    # plain Go cross-compilation, no docker/Alpine container needed,
+    # since it never touches mkinitfs/zfs/kexec-tools at all. One
+    # runner builds both arches - Go's own cross-compilation (just
+    # GOARCH=) needs neither QEMU nor a second native runner the way
+    # the .EFI builds above do.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build alpine-zfsboot for x86_64 + aarch64
+        run: |
+          set -e
+          mkdir -p out
+          # -X main.version=... bakes the pushed tag into the binary's
+          # own `--version` flag (see cmd/tool/main.go) - a local
+          # `go build`/`just build-tool` has no tag to attribute
+          # itself to, so it keeps the "dev" default instead.
+          GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=${{ github.ref_name }}" -o out/alpine-zfsboot-x86_64 ./cmd/tool
+          GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version=${{ github.ref_name }}" -o out/alpine-zfsboot-aarch64 ./cmd/tool
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alpine-zfsboot-tool
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    needs: [build-x86_64, build-aarch64, build-tool]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          pattern: "*"
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd out
+          sha256sum * | tee SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: alpine-zfsboot ${{ github.ref_name }}
+          body: "Built on Alpine 3.24. The Rolls Royce of ZFS boot for Alpine: a kexec-based UEFI bootstrapper for Alpine on ZFS root. .EFI (UKI), .iso, and loose vmlinuz/initramfs.img/cmdline.txt (GRUB chainload) for each of x86_64/aarch64 (both consoles active, switch live from the menu), plus the legacy-BIOS/GPT boot code (x86_64 only) and alpine-zfsboot-x86_64/alpine-zfsboot-aarch64 (cmd/tool - the install-time version/update helper). SHA256SUMS covers every asset here."
+          generate_release_notes: true
+          files: |
+            out/*
+          fail_on_unmatched_files: true

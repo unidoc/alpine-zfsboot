@@ -1,0 +1,18 @@
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    list)
+        [ -n "${STUB_ZFS_LIST_OUTPUT:-}" ] && printf '%s\n' "$STUB_ZFS_LIST_OUTPUT"
+        ;;
+    get)
+        # Real zfs always prints something for `get` (never empty
+        # output) - "-" is its own convention for "unset", which is
+        # what an ordinary unencrypted/no-custom-property dataset
+        # reports for encryptionroot/keystatus/keylocation and
+        # org.alpinezfsboot:commandline alike. Matching that here
+        # (rather than just printing nothing) keeps the stub honest
+        # about what real zfs actually returns.
+        echo "-"
+        ;;
+esac
+exit 0

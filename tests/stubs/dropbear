@@ -1,0 +1,25 @@
+#!/bin/sh
+# Real dropbear -F runs in the foreground until killed - start_rescue_ssh
+# backgrounds it (`dropbear ... &`) and then, after a short sleep, checks
+# the backgrounded job is still alive (kill -0) before reporting success.
+# This stub has to actually stay alive past that check by default, or
+# EVERY test exercising a successful rescue-SSH start would spuriously
+# fail (the backgrounded shell function call only stays "running", from
+# kill -0's point of view, for as long as this script itself runs).
+# STUB_DROPBEAR_DIES_IMMEDIATELY=1 flips that, for the one test that
+# needs to simulate dropbear itself failing right after backgrounding
+# (a bad bind_spec/port-in-use/etc.) - a scenario `net_config` failing
+# (the OTHER, already-covered way rescue SSH can fail to start) doesn't
+# exercise at all.
+# STUB_DROPBEAR_SLEEP overrides the default 2s - a test whose own
+# stubbed flow (mount/kexec/cpio/network setup) genuinely takes longer
+# than that needs dropbear to still be "running" (per _pid_alive()'s
+# real /proc/$pid check) by the time it checks _running(), or it sees
+# a false "already stopped" purely from test-harness timing, not a
+# real bug.
+echo "dropbear $*" >> "${STUB_LOG:-/dev/null}"
+if [ -n "${STUB_DROPBEAR_DIES_IMMEDIATELY:-}" ]; then
+    exit 1
+fi
+sleep "${STUB_DROPBEAR_SLEEP:-2}"
+exit 0

@@ -1,0 +1,114 @@
+#!/bin/sh
+# Stateful zfs stub for zfs-unlock.sh's own tests (unlock/lock state
+# transitions, secret staging/reacquisition, busy-lock refusal) -
+# same STUB_IP_STATE-style pattern as tests/stubs/ip, since these
+# scenarios genuinely need keystatus to change across multiple calls
+# within one test run, not just report a fixed value.
+#
+# STUB_ZFS_UNLOCK_STATE - path to a one-line state file holding the
+#   current keystatus ("available"/"unavailable"). Created by the
+#   calling test before first use.
+# STUB_ZFS_UNLOCK_ROOT - the encryptionroot this stub reports for any
+#   dataset queried (defaults to "zroot/ROOT/enc").
+# STUB_ZFS_UNLOCK_CORRECT - the passphrase load-key/load-key -n treat
+#   as correct (defaults to "correct-passphrase").
+# STUB_ZFS_UNLOCK_BUSY - if set, `mounted` reports "yes" for exactly
+#   this dataset name (used by the lock-refuses-when-busy test).
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+
+ROOT="${STUB_ZFS_UNLOCK_ROOT:-zroot/ROOT/enc}"
+CORRECT="${STUB_ZFS_UNLOCK_CORRECT:-correct-passphrase}"
+STATE="${STUB_ZFS_UNLOCK_STATE:?STUB_ZFS_UNLOCK_STATE must be set}"
+
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$prop" in
+            encryptionroot)
+                # Real ZFS: every dataset that shares this encryption
+                # key (descendants, and clones anywhere else in the
+                # pool) reports the SAME encryptionroot value, not just
+                # the root dataset itself - the busy-child fixture
+                # below is exactly such a dataset, so it must too.
+                if [ "$ds" = "$ROOT" ] || { [ -n "${STUB_ZFS_UNLOCK_BUSY:-}" ] && [ "$ds" = "$STUB_ZFS_UNLOCK_BUSY" ]; }; then
+                    echo "$ROOT"
+                else
+                    echo "-"
+                fi
+                ;;
+            keystatus)
+                cat "$STATE" 2>/dev/null || echo "unavailable"
+                ;;
+            keylocation)
+                echo "prompt"
+                ;;
+            mounted)
+                if [ -n "${STUB_ZFS_UNLOCK_BUSY:-}" ] && [ "$ds" = "$STUB_ZFS_UNLOCK_BUSY" ]; then
+                    echo "yes"
+                else
+                    echo "no"
+                fi
+                ;;
+            mountpoint)
+                echo "/mnt/$ds"
+                ;;
+            *)
+                echo "-"
+                ;;
+        esac
+        ;;
+    list)
+        # `zfs list -H -o name -r ARG` - real subtree scoping (ARG
+        # itself, or anything named ARG/...), NOT a fixed answer
+        # ignoring ARG. This matters: it's what lets a test actually
+        # distinguish `-r "$encryptionroot"` (real ZFS: only
+        # $encryptionroot's own descendants) from `-r "$pool"` (real
+        # ZFS: everything in the pool, including a clone that shares
+        # $encryptionroot's key from OUTSIDE its own namespace) - the
+        # exact "cryptographically authoritative, not merely hierarchy-
+        # authoritative" gap this file's own busy-check fix closes.
+        r_arg=""
+        prev=""
+        for a in "$@"; do
+            [ "$prev" = "-r" ] && r_arg="$a"
+            prev="$a"
+        done
+        _under() {
+            [ "$1" = "$2" ] && return 0
+            case "$1" in "$2"/*) return 0 ;; esac
+            return 1
+        }
+        _under "$ROOT" "$r_arg" && echo "$ROOT"
+        if [ -n "${STUB_ZFS_UNLOCK_BUSY:-}" ] && [ "$STUB_ZFS_UNLOCK_BUSY" != "$ROOT" ] \
+           && _under "$STUB_ZFS_UNLOCK_BUSY" "$r_arg"; then
+            echo "$STUB_ZFS_UNLOCK_BUSY"
+        fi
+        ;;
+    load-key)
+        case "$2" in
+            -n) ds="$3" ;;
+            *)  ds="$2" ;;
+        esac
+        [ "$ds" = "$ROOT" ] || { echo "unexpected load-key target: $ds" >&2; exit 1; }
+        typed="$(cat)"
+        if [ "$typed" != "$CORRECT" ]; then
+            echo "Key load error: Incorrect key provided for '$ROOT'." >&2
+            exit 1
+        fi
+        # -n is a dry run - never mutates keystatus, matching real
+        # OpenZFS behavior (see zfs_unlock()'s own comment on why this
+        # is the safe way to verify an already-unlocked dataset).
+        case "$1 $2" in
+            "load-key -n") : ;;
+            *) echo "available" > "$STATE" ;;
+        esac
+        exit 0
+        ;;
+    unload-key)
+        ds="$2"
+        [ "$ds" = "$ROOT" ] || { echo "unexpected unload-key target: $ds" >&2; exit 1; }
+        echo "unavailable" > "$STATE"
+        exit 0
+        ;;
+esac
+exit 0
