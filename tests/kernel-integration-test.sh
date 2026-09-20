@@ -118,10 +118,25 @@ pad=$(( (4 - orig_size % 4) % 4 ))
 cat "$W/handoff.cpio" >> "$W/combined-padded.img"
 
 # Negative control: the ORIGINAL, broken behavior (plain concatenation,
-# no padding) - this MUST fail to overwrite usr/sbin/zfs, proving this
-# test suite can actually tell a good archive from a bad one, not just
-# always agree with whatever it's given.
-cat "$W/orig.cpio.gz" "$W/handoff.cpio" > "$W/combined-unpadded.img"
+# no alignment padding) - this MUST fail to overwrite usr/sbin/zfs,
+# proving this test suite can actually tell a good archive from a bad
+# one, not just always agree with whatever it's given. Deliberately
+# forced to be non-4-byte-aligned rather than just "whatever orig_size
+# naturally is": orig.cpio.gz's own compressed size depends on the
+# exact gzip implementation/version, and has roughly a 1-in-4 chance of
+# already landing on a 4-byte boundary by pure coincidence, regardless
+# of environment - if that happens, plain concatenation is silently
+# indistinguishable from the correctly-padded case, and this negative
+# control stops proving anything at all. Real, not hypothetical: this
+# is exactly what happened switching CI from a Debian to an Ubuntu
+# kernel/toolchain - a different gzip produced a coincidentally-aligned
+# orig.cpio.gz, and the unpadded case started passing right along with
+# the padded one.
+bad_pad=0
+[ "$(($(wc -c < "$W/orig.cpio.gz") % 4))" -eq 0 ] && bad_pad=1
+cat "$W/orig.cpio.gz" > "$W/combined-unpadded.img"
+[ "$bad_pad" -gt 0 ] && dd if=/dev/zero bs=1 count="$bad_pad" >> "$W/combined-unpadded.img" 2>/dev/null
+cat "$W/handoff.cpio" >> "$W/combined-unpadded.img"
 
 kvm_args=""
 if [ -w /dev/kvm ] 2>/dev/null; then
