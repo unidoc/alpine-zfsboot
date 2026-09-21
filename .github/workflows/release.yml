@@ -18,7 +18,38 @@ on:
       - "v*"
 
 jobs:
+  # Nothing else here compares the pushed tag against version.txt - the
+  # Justfile's own release recipe does, but that guard lives only on
+  # whoever's machine ran `just release`, and a tag can reach this
+  # workflow other ways (a hand-run `git push origin vX.Y.Z`, the
+  # documented recovery from a failed release build). Without this,
+  # pushing v0.2.0 before merging its version.txt bump ships a release
+  # called v0.2.0 containing a .EFI whose boot banner and kernel cmdline
+  # still say the old version, and a cmd/tool binary reporting v0.2.0 -
+  # two different versions in the same release, in the exact artifacts
+  # an operator reads on screen. One job, so the check happens once
+  # rather than duplicated in every build job.
+  verify-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Tag must match version.txt
+        run: |
+          set -e
+          want="${GITHUB_REF_NAME#v}"
+          got="$(tr -d '[:space:]' < version.txt)"
+          [ "$got" = "$want" ] || {
+            echo "::error::tag $GITHUB_REF_NAME does not match version.txt ($got)"
+            exit 1
+          }
+
   build-x86_64:
+    needs: verify-version
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,6 +77,14 @@ jobs:
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
               ./build.sh
             '
+          # The container has no --user, so it runs as root inside
+          # (apk add needs it) - every file build.sh writes to the
+          # bind-mounted out/ comes out root-owned on the host. The
+          # runner user actions/upload-artifact runs as next can't read
+          # those, and fails with EACCES trying to zip them. Reclaim
+          # ownership here, same fix already proven in unidoc-aports'
+          # own CI for the identical container-writes-as-root pattern.
+          sudo chown -R "$(id -u):$(id -g)" out/
           ls -la out/
 
       - uses: actions/upload-artifact@v4
@@ -55,6 +94,7 @@ jobs:
           if-no-files-found: error
 
   build-aarch64:
+    needs: verify-version
     # Native runner, not QEMU - this repo's own build doesn't compile
     # anything (zfs-lts ships prebuilt kernel modules, objcopy/mkinitfs
     # just move bytes around), so QEMU emulation would probably be
@@ -81,6 +121,14 @@ jobs:
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
               ./build.sh
             '
+          # The container has no --user, so it runs as root inside
+          # (apk add needs it) - every file build.sh writes to the
+          # bind-mounted out/ comes out root-owned on the host. The
+          # runner user actions/upload-artifact runs as next can't read
+          # those, and fails with EACCES trying to zip them. Reclaim
+          # ownership here, same fix already proven in unidoc-aports'
+          # own CI for the identical container-writes-as-root pattern.
+          sudo chown -R "$(id -u):$(id -g)" out/
           ls -la out/
 
       - uses: actions/upload-artifact@v4
@@ -90,6 +138,7 @@ jobs:
           if-no-files-found: error
 
   build-tool:
+    needs: verify-version
     # cmd/tool - the install-time version/update helper (see its own
     # header comment), entirely separate from the .EFI build above:
     # plain Go cross-compilation, no docker/Alpine container needed,
