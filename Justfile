@@ -90,5 +90,53 @@ test:
 test-kernel:
     ./tests/kernel-integration-test.sh
 
+# ── Release ──────────────────────────────────────────────────────────────────
+#
+# Same two-step, PR-based flow as isms/Justfile:
+#   1. just release-pr 0.1.0   → branch + version.txt bump + PR (review, CI)
+#   2. merge the PR
+#   3. just release 0.1.0      → verifies master carries 0.1.0, signs the
+#                                 tag, pushes - release.yml builds and
+#                                 publishes everything.
+#
+# version.txt itself is not read by anything at build time - the tag
+# alone is what release.yml/cmd/tool actually version (see release.yml's
+# own comment: `-X main.version=...` reads github.ref_name directly).
+# It exists only so a release has something to bump, diff and get
+# reviewed/approved in a PR before the tag goes out, same role it plays
+# in isms.
+
+# Step 1: open the version-bump PR.
+release-pr VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "{{VERSION}}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "✗ version must be X.Y.Z (no leading v), got '{{VERSION}}'"; exit 1; }
+    [ -z "$(git status --porcelain)" ] || { echo "✗ working tree not clean"; exit 1; }
+    git fetch origin
+    git checkout -b "release/v{{VERSION}}" origin/master
+    echo "{{VERSION}}" > version.txt
+    git add version.txt
+    git commit -m "Release v{{VERSION}}"
+    git push -u origin "release/v{{VERSION}}"
+    gh pr create --title "Release v{{VERSION}}" \
+        --body "Bumps version.txt to {{VERSION}}. After merge: \`just release {{VERSION}}\` tags master and CI publishes the release."
+    echo "✓ release PR opened — merge it, then run: just release {{VERSION}}"
+
+# Step 2 (after the PR is merged): verify, tag master (signed), push.
+release VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "{{VERSION}}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "✗ version must be X.Y.Z (no leading v), got '{{VERSION}}'"; exit 1; }
+    [ -z "$(git status --porcelain)" ] || { echo "✗ working tree not clean"; exit 1; }
+    git checkout master
+    git pull --ff-only
+    git fetch --tags origin
+    [ "$(tr -d '[:space:]' < version.txt)" = "{{VERSION}}" ] || \
+        { echo "✗ version.txt is '$(cat version.txt)' — merge the release PR first"; exit 1; }
+    git rev-parse "v{{VERSION}}" >/dev/null 2>&1 && { echo "✗ tag v{{VERSION}} already exists"; exit 1; }
+    git tag -s "v{{VERSION}}" -m "v{{VERSION}}"
+    git push origin "v{{VERSION}}"
+    echo "✓ v{{VERSION}} tagged — CI builds the release: gh run watch"
+
 help:
     @just --list

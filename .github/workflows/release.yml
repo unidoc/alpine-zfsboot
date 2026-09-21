@@ -46,6 +46,14 @@ jobs:
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
               ./build.sh
             '
+          # The container has no --user, so it runs as root inside
+          # (apk add needs it) - every file build.sh writes to the
+          # bind-mounted out/ comes out root-owned on the host. The
+          # runner user actions/upload-artifact runs as next can't read
+          # those, and fails with EACCES trying to zip them. Reclaim
+          # ownership here, same fix already proven in unidoc-aports'
+          # own CI for the identical container-writes-as-root pattern.
+          sudo chown -R "$(id -u):$(id -g)" out/
           ls -la out/
 
       - uses: actions/upload-artifact@v4
@@ -81,6 +89,14 @@ jobs:
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
               ./build.sh
             '
+          # The container has no --user, so it runs as root inside
+          # (apk add needs it) - every file build.sh writes to the
+          # bind-mounted out/ comes out root-owned on the host. The
+          # runner user actions/upload-artifact runs as next can't read
+          # those, and fails with EACCES trying to zip them. Reclaim
+          # ownership here, same fix already proven in unidoc-aports'
+          # own CI for the identical container-writes-as-root pattern.
+          sudo chown -R "$(id -u):$(id -g)" out/
           ls -la out/
 
       - uses: actions/upload-artifact@v4
