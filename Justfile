@@ -92,19 +92,24 @@ test-kernel:
 
 # ── Release ──────────────────────────────────────────────────────────────────
 #
-# Same two-step, PR-based flow as isms/Justfile:
-#   1. just release-pr 0.1.0   → branch + version.txt bump + PR (review, CI)
+# Same two-step, PR-based flow as isms/Justfile, same filename too
+# (version.txt) - but unlike isms, this file is a real build input
+# here, not just a review-gate artifact: build.sh reads it straight
+# into /etc/alpine-zfsboot-version and cmdline.txt's own
+# alpine-zfsboot.version= (see internal/cmdline's own comment). The
+# pushed tag still versions the RELEASE itself (release.yml's `-X
+# main.version=...` reads github.ref_name, independently) - version.txt
+# is what ends up baked into the booted image and shown to an operator.
+#
+#   1. just release-pr 0.1.1   → branch + version.txt bump + PR (review, CI)
 #   2. merge the PR
-#   3. just release 0.1.0      → verifies master carries 0.1.0, signs the
+#   3. just release 0.1.1      → verifies master carries 0.1.1, signs the
 #                                 tag, pushes - release.yml builds and
 #                                 publishes everything.
 #
-# version.txt itself is not read by anything at build time - the tag
-# alone is what release.yml/cmd/tool actually version (see release.yml's
-# own comment: `-X main.version=...` reads github.ref_name directly).
-# It exists only so a release has something to bump, diff and get
-# reviewed/approved in a PR before the tag goes out, same role it plays
-# in isms.
+# Only needed when the version is actually changing. Re-tagging the
+# SAME version after a failed release build (nothing in the repo
+# changed) is just step 3 - there's nothing to bump or review.
 
 # Step 1: open the version-bump PR.
 release-pr VERSION:
@@ -122,7 +127,9 @@ release-pr VERSION:
         --body "Bumps version.txt to {{VERSION}}. After merge: \`just release {{VERSION}}\` tags master and CI publishes the release."
     echo "✓ release PR opened — merge it, then run: just release {{VERSION}}"
 
-# Step 2 (after the PR is merged): verify, tag master (signed), push.
+# Step 2 (after the PR is merged, or directly if version.txt already
+# matches - e.g. re-tagging after a failed release build): verify, tag
+# master (signed), push.
 release VERSION:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -132,7 +139,7 @@ release VERSION:
     git pull --ff-only
     git fetch --tags origin
     [ "$(tr -d '[:space:]' < version.txt)" = "{{VERSION}}" ] || \
-        { echo "✗ version.txt is '$(cat version.txt)' — merge the release PR first"; exit 1; }
+        { echo "✗ version.txt is '$(cat version.txt)' — bump it first (just release-pr {{VERSION}})"; exit 1; }
     git rev-parse "v{{VERSION}}" >/dev/null 2>&1 && { echo "✗ tag v{{VERSION}} already exists"; exit 1; }
     git tag -s "v{{VERSION}}" -m "v{{VERSION}}"
     git push origin "v{{VERSION}}"

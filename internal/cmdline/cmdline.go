@@ -25,7 +25,7 @@ import (
 type Info struct {
 	Arch       string // "x86_64" or "aarch64" - matches build.sh's own ARCH values
 	Console    string // "vga", "serial", or "auto" - matches build.sh's own CONSOLE_NAME values
-	Version    string // alpine-zfsboot.version= - the project's own human-facing release number (e.g. "0.1.0", from the repo's own VERSION file) - display only, never compared
+	Version    string // alpine-zfsboot.version= - the project's own human-facing release number (e.g. "0.1.0", from the repo's own version.txt file) - display only, never compared
 	BuildStamp string // alpine-zfsboot.buildstamp= - a sortable YYYYMMDDTHHMMSSZ build timestamp - what upToDate actually compares
 	Pool       string // alpine-zfsboot.pool=
 	Timeout    string // alpine-zfsboot.timeout= - seconds, as a string (never parsed as a number here)

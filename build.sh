@@ -824,9 +824,9 @@ echo "$BUILD_STAMP" > /etc/alpine-zfsboot-build-stamp
 # lexicographically sortable timestamps, "which build is newer"), this
 # is purely what a human reads on the boot screen ("alpine-zfsboot
 # version 0.1.0") and cmd/tool's own `version` output (alpine-zfsboot.version=
-# below). Read from the repo's own VERSION file, not hardcoded here,
-# so a release bump is one file edit, not a build.sh change too.
-cat "$REPO_ROOT/VERSION" > /etc/alpine-zfsboot-version
+# below). Read from the repo's own version.txt file, not hardcoded
+# here, so a release bump is one file edit, not a build.sh change too.
+cat "$REPO_ROOT/version.txt" > /etc/alpine-zfsboot-version
 
 # -C xz: back to mkinitfs's better compression after an early false
 # lead this project chased for a while. gzip was adopted earlier this
@@ -1104,7 +1104,7 @@ esac
 # before; only the kernel's own noise is quieted. Override per-build
 # with EXTRA_CMDLINE if verbose kernel output is needed again for
 # debugging (e.g. `EXTRA_CMDLINE="loglevel=7" just build ...`).
-# alpine-zfsboot.version=<repo VERSION> / alpine-zfsboot.buildstamp=$BUILD_STAMP -
+# alpine-zfsboot.version=<repo version.txt> / alpine-zfsboot.buildstamp=$BUILD_STAMP -
 # TWO separate cmdline fields, deliberately not one: confirmed real
 # confusion otherwise (a real boot's own cmdline showed
 # "alpine-zfsboot.version=20260910T211808Z" and reasonably read as "the
@@ -1115,7 +1115,7 @@ esac
 # buildstamp is what cmd/tool's Read()/upToDate comparison actually
 # uses (see internal/cmdline's own comment) - version is display-only.
 printf '%s root=ZFS=%s ro quiet kexec_load_disabled=0 alpine-zfsboot.pool=%s alpine-zfsboot.timeout=%s alpine-zfsboot.version=%s alpine-zfsboot.buildstamp=%s %s\n' \
-    "$CONSOLE_CMDLINE" "$POOL/ROOT/alpine" "$POOL" "$MENU_TIMEOUT" "$(cat "$REPO_ROOT/VERSION")" "$BUILD_STAMP" "${EXTRA_CMDLINE:-}" > cmdline.txt
+    "$CONSOLE_CMDLINE" "$POOL/ROOT/alpine" "$POOL" "$MENU_TIMEOUT" "$(cat "$REPO_ROOT/version.txt")" "$BUILD_STAMP" "${EXTRA_CMDLINE:-}" > cmdline.txt
 
 # The embedded .cmdline section needs its own, separate copy: efi/'s
 # loader (see cmdline.c) reads it as a plain NUL-terminated ASCII C
@@ -1196,14 +1196,14 @@ if [ "$ARCH" = "x86_64" ]; then
     # CD-ROM boot entry instead of a real GPT disk - see iso.sh and
     # bios/Makefile's own comment on this target.
     #
-    # ZFSBOOT_VERSION: the same repo VERSION file already read below
+    # ZFSBOOT_VERSION: the same repo version.txt file already read below
     # for /etc/alpine-zfsboot-version, passed down here too so the
     # BIOS stage2 boot banner shows the real semver instead of its own
     # Makefile's "dev" fallback - one file, one value, used everywhere
     # (see bios/Makefile's own comment on why it can't just read
-    # "../VERSION" itself).
+    # "../version.txt" itself).
     make -C "$BUILD_DIR/bios" stage1.bin stage2.bin stage-iso.bin \
-        ZFSBOOT_VERSION="$(cat "$REPO_ROOT/VERSION")"
+        ZFSBOOT_VERSION="$(cat "$REPO_ROOT/version.txt")"
 
     # The boot-blob stage2 reads (see bios/bootblob.h for the exact,
     # sector-aligned layout this must match byte for byte): a small

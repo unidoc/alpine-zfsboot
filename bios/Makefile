@@ -72,13 +72,13 @@ all: stage1.bin stage2.bin stage-iso.bin
 # actually made it into the binary being booted.
 #
 # ZFSBOOT_VERSION: the project's own human-facing semver (e.g.
-# "0.1.0", from the repo's own top-level VERSION file) - NOT read
+# "0.1.0", from the repo's own top-level version.txt file) - NOT read
 # directly here via a relative path, because build.sh copies only
 # this bios/ subdirectory into $BUILD_DIR before invoking `make`
-# (see build.sh's own comment on that cp -r), so "../VERSION"
+# (see build.sh's own comment on that cp -r), so "../version.txt"
 # wouldn't reliably resolve to the real repo root from there. Passed
 # down instead as a make variable by whoever invokes this - build.sh
-# passes the real repo's VERSION file content; a bare local `make` in
+# passes the real repo's version.txt file content; a bare local `make` in
 # this directory (a real, supported dev workflow per this Makefile's
 # own header comment) gets the "dev" fallback below instead, same
 # reasoning as menu.py's own _project_version() fallback.
