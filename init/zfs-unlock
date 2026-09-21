@@ -30,6 +30,11 @@ case "$_src" in
 esac
 LIB_DIR="$(cd "$_dir" && pwd)"
 
+# zfs_op_lock() (in zfs-unlock.sh) needs _pid_alive to reclaim a stale
+# lock - boot-dataset.sh's own call path gets it transitively by
+# sourcing rescue-ssh.sh first, but this standalone wrapper never
+# sources rescue-ssh.sh at all, so it needs this explicitly.
+. "$LIB_DIR/pid-alive.sh"
 . "$LIB_DIR/zfs-unlock.sh"
 
 case "$ACTION" in

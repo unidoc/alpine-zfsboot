@@ -157,7 +157,33 @@ func compare(path, downloadDir string) (comparison, error) {
 		os.Remove(tmp)
 		return comparison{}, fmt.Errorf("reading the downloaded build: %w", err)
 	}
+	if err := checkArchMatch(path, local, latest); err != nil {
+		os.Remove(tmp)
+		return comparison{}, err
+	}
 	return comparison{local: local, latest: latest, tmpPath: tmp, upToDate: latest.BuildStamp <= local.BuildStamp}, nil
+}
+
+// checkArchMatch is compare()'s actual guard logic, split out so it's
+// testable without a real download - a real HTTP fetch and PE fixture
+// file - the same reasoning internal/cmdline's own parse()/Read() split
+// already uses in this codebase. release.Download() already requests
+// local.Arch's own asset name (release.AssetName(local.Arch)) - this
+// isn't defense against a wrong URL, it's defense against what's
+// actually AT that URL not matching what its own filename promises: a
+// CI matrix mistake, a partial re-upload, or a hand-fixed release could
+// publish the wrong bytes under a correctly-arch-named asset.
+// latest.Arch is read from the downloaded file's own PE machine type
+// (cmdline.Read), independent of the filename that produced it, so
+// this catches that case specifically - a correctly-checksummed
+// wrong-arch asset would not be caught any other way here.
+func checkArchMatch(path string, local, latest cmdline.Info) error {
+	if latest.Arch != local.Arch {
+		return fmt.Errorf(
+			"refusing to install: %s is %s but the downloaded %s asset is %s",
+			path, local.Arch, release.AssetName(local.Arch), latest.Arch)
+	}
+	return nil
 }
 
 func runCheck(path string) {
@@ -203,6 +229,8 @@ func runUpdate(path string, yes bool) {
 		os.Remove(c.tmpPath)
 		die(fmt.Errorf("setting permissions on the downloaded build: %w", err))
 	}
+	backupPrevious(path)
+
 	// Rename, not copy-then-delete: atomic on the same filesystem
 	// (guaranteed by downloading into filepath.Dir(path) above) -
 	// there's never a moment where `path` is half-written or missing
@@ -212,7 +240,27 @@ func runUpdate(path string, yes bool) {
 		os.Remove(c.tmpPath)
 		die(fmt.Errorf("installing the new build over %s: %w", path, err))
 	}
-	fmt.Printf("%s updated to %s\n", path, cmdline.HumanVersion(c.latest.BuildStamp))
+	fmt.Printf("%s updated to %s (previous build kept at %s.previous)\n", path, cmdline.HumanVersion(c.latest.BuildStamp), path)
+}
+
+// backupPrevious hard-links path to path+".previous" before it gets
+// overwritten - not a data copy, so it's instant regardless of file
+// size, and (unlike a rename-based backup) never removes path itself
+// even momentarily, so it can't introduce a missing-file window in the
+// caller's own rename-based install. Once that rename lands, path
+// points at the new inode while path+".previous" still references the
+// old one, untouched - a build that doesn't boot can be recovered from
+// a rescue shell (`mv path.previous path`) without another machine or
+// another download.
+//
+// Best-effort, deliberately: os.Remove clears any stale link from an
+// earlier update (os.Link fails if the destination already exists); if
+// either step fails (no local build to link from yet, or a filesystem
+// without hard-link support), the caller still proceeds with the
+// update - a missing rollback copy is never a reason to block one.
+func backupPrevious(path string) {
+	os.Remove(path + ".previous")
+	_ = os.Link(path, path+".previous")
 }
 
 func confirm(prompt string) bool {

@@ -433,6 +433,11 @@ mkdir -p "$BUILD_DIR/features.d"
     # network/dropbear/lifecycle separation this exists to keep real.
     echo "/net-config.sh"
     echo "/rescue-ssh.sh"
+    # pid-alive.sh - the one _pid_alive() implementation, sourced by
+    # both rescue-ssh.sh (a stale dropbear PIDFILE) and zfs-unlock.sh
+    # (reclaiming a stale per-encryptionroot operation lock) rather than
+    # each keeping its own copy.
+    echo "/pid-alive.sh"
     # zfs-unlock.sh - the ONE implementation of "acquire a ZFS native-
     # encryption passphrase interactively and stage it for the kexec
     # handoff"/"lock it back up again", sourced by boot-dataset.sh
@@ -730,11 +735,12 @@ cp "$REPO_ROOT/init/menu.py" /menu.py
 cp "$REPO_ROOT/init/boot-dataset.sh" /boot-dataset.sh
 cp "$REPO_ROOT/init/net-config.sh" /net-config.sh
 cp "$REPO_ROOT/init/rescue-ssh.sh" /rescue-ssh.sh
+cp "$REPO_ROOT/init/pid-alive.sh" /pid-alive.sh
 cp "$REPO_ROOT/init/zfs-unlock.sh" /zfs-unlock.sh
 cp "$REPO_ROOT/init/zfs-unlock" /zfs-unlock
 cp "$REPO_ROOT/init/alpine-zfsboot-shell" /alpine-zfsboot-shell
 cp "$REPO_ROOT/init/dialogrc" /etc/dialogrc
-chmod +x /menu.py /boot-dataset.sh /net-config.sh /rescue-ssh.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
+chmod +x /menu.py /boot-dataset.sh /net-config.sh /rescue-ssh.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
 
 # /etc/shells, listing /alpine-zfsboot-shell - load-bearing for rescue SSH,
 # not documentation. dropbear's own checkusername() (confirmed against the

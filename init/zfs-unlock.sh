@@ -333,12 +333,49 @@ zfs_op_lock_path() {
 # AFTER a passphrase is already in hand - see this file's own header
 # comment on why the lock is deliberately never held during the prompt
 # itself).
+#
+# Records the holder's own $$ inside the lock dir and, on a failed
+# mkdir, checks whether that recorded holder is still actually alive
+# (_pid_alive, from pid-alive.sh) before giving up - a real gap an
+# adversarial review found: this lock had no owner tracking and nothing
+# anywhere ever cleaned up a directory left behind by a holder that
+# died mid-operation (SIGKILL, an OOM kill, or SIGHUP when a rescue-SSH
+# session drops mid-unlock). Every OTHER frontend - the local console,
+# every new SSH session, automatic boot orchestration - would then see
+# a live-looking "another encryption operation is already in progress"
+# refusal until the next real reboot wiped tmpfs, even though the
+# operator's own passphrase was correct the whole time. Reclaim moves
+# the stale directory aside with `mv` (atomic) rather than removing it
+# in place - if two frontends both observe the same dead holder, only
+# one `mv` can win, and the loser fails this attempt cleanly (falling
+# through to zfs_op_lock_retry()'s own next poll) instead of a race
+# where both believe they hold a lock that was actually re-created out
+# from under one of them.
 zfs_op_lock() {
-    mkdir "$(zfs_op_lock_path "$1")" 2>/dev/null
+    lock_dir="$(zfs_op_lock_path "$1")"
+    if mkdir "$lock_dir" 2>/dev/null; then
+        echo "$$" > "$lock_dir/pid" 2>/dev/null
+        return 0
+    fi
+    lock_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
+    if [ -n "$lock_pid" ] && ! _pid_alive "$lock_pid"; then
+        stale="$lock_dir.stale.$$"
+        if mv "$lock_dir" "$stale" 2>/dev/null; then
+            rm -rf "$stale"
+            if mkdir "$lock_dir" 2>/dev/null; then
+                echo "$$" > "$lock_dir/pid" 2>/dev/null
+                zfs_unlock_msg "reclaimed a stale encryption operation lock for $1 (holder pid $lock_pid is gone)"
+                return 0
+            fi
+        fi
+    fi
+    return 1
 }
 
 zfs_op_unlock() {
-    rmdir "$(zfs_op_lock_path "$1")" 2>/dev/null
+    lock_dir="$(zfs_op_lock_path "$1")"
+    rm -f "$lock_dir/pid" 2>/dev/null
+    rmdir "$lock_dir" 2>/dev/null
 }
 
 # zfs_op_lock_retry ENCRYPTIONROOT - like zfs_op_lock(), but polls for a

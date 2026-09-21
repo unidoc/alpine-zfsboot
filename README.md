@@ -1100,8 +1100,10 @@ commands in their place (`tests/stubs/`, logging their own invocation)
 and runs the real, unmodified scripts against them, asserting on
 control flow: does it call `kexec -l` with the *matching*
 kernel/initramfs pair, does it refuse to start `dropbear` on
-garbage input, does `alpine-zfsboot-shell -c "cmd"` run exactly that
-command rather than being forced through the menu, does the multi-pool
+garbage input, does `alpine-zfsboot-shell -c "cmd"` run an allowed
+`zfs send`/`zfs recv` command rather than being forced through the menu
+(and refuse everything else, including anything containing a shell
+metacharacter, rather than passing it through unrestricted), does the multi-pool
 scan run only when the menu is actually shown, does the
 `org.alpinezfsboot:commandline` ZFS property win over the persisted
 file when set, does a one-shot cmdline override replace (not append

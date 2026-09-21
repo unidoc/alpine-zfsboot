@@ -11,9 +11,19 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 )
 
 const baseURL = "https://github.com/unidoc/alpine-zfsboot/releases/latest/download/"
+
+// http.DefaultClient has no timeout at all - a server that accepts the
+// connection and then stalls (not a DNS/connect failure, which would
+// already return an error) leaves check/update hanging indefinitely
+// with no output. check in particular is the subcommand most likely to
+// run unattended (cron, fleet management), where a hung process is
+// worse than a failed one. Generous on purpose - this downloads a real
+// multi-MB .EFI file, not a small API response.
+var httpClient = &http.Client{Timeout: 5 * time.Minute}
 
 // AssetName is the exact filename build.sh's own OUT_FILE produces
 // for a given arch (see build.sh's own "OUT_FILE=..." line) - one
@@ -34,7 +44,7 @@ func AssetName(arch string) string {
 // after a successful download.
 func Download(arch, dir string) (string, error) {
 	url := baseURL + AssetName(arch)
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("fetching %s: %w", url, err)
 	}

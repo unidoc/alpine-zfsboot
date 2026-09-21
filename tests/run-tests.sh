@@ -3102,6 +3102,7 @@ export STUB_ZFS_UNLOCK_CORRECT
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3145,6 +3146,7 @@ export STUB_ZFS_UNLOCK_CORRECT
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3177,6 +3179,7 @@ export STUB_ZFS_UNLOCK_CORRECT
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     zfs_lock "zroot/ROOT/enc"
@@ -3213,6 +3216,7 @@ export STUB_ZFS_UNLOCK_CORRECT
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3244,6 +3248,7 @@ export STUB_ZFS_UNLOCK_CORRECT
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3273,6 +3278,7 @@ export STUB_ZFS_UNLOCK_BUSY
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_lock "zroot/ROOT/enc"
     echo "lock_status=$?"
@@ -3314,6 +3320,7 @@ export STUB_ZFS_UNLOCK_BUSY
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_lock "zroot/ROOT/enc"
     echo "lock_status=$?"
@@ -3335,6 +3342,7 @@ d="$(fresh_env)"
     set +e
     STUB_ROOT="$d/root"
     export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     stage="$(zfs_key_stage_path "zroot/ROOT/enc")"
     # Simulates a writer killed/interrupted before ever renaming: an
@@ -3372,6 +3380,7 @@ d="$(fresh_env)"
     set +e
     STUB_ROOT="$d/root"
     export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     stage="$(zfs_key_stage_path "zroot/ROOT/enc")"
     zfs_stage_secret "zroot/ROOT/enc" "old-good-secret"
@@ -3413,6 +3422,7 @@ export STUB_TTY
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3455,6 +3465,7 @@ export STUB_ZFS_UNLOCK_CORRECT
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3501,6 +3512,7 @@ mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
     STUB_LOG="$d/log"
     STUB_ZFS_OP_LOCK_RETRY_SLEEP=0
     export STUB_ROOT STUB_LOG STUB_ZFS_OP_LOCK_RETRY_SLEEP
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3542,6 +3554,7 @@ release_pid=$!
     STUB_LOG="$d/log"
     STUB_ZFS_OP_LOCK_RETRY_SLEEP=0.5
     export STUB_ROOT STUB_LOG STUB_ZFS_OP_LOCK_RETRY_SLEEP
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3553,6 +3566,122 @@ if grep -qx "unlock_status=0" "$d/out" && grep -qx "handoff=ready" "$d/out"; the
 else
     cat "$d/out"
     bad "the unlock did not recover once the held lock was released mid-wait"
+fi
+rm -rf "$d"
+
+# =============================================================================
+# unidoc-alip's PR #1 review, F2: zfs_op_lock() had no owner tracking and
+# nothing anywhere ever cleaned up a directory left behind by a holder
+# that died mid-operation (SIGKILL, OOM, SIGHUP on a dropped rescue-SSH
+# session) - every other frontend would then see a live-looking "another
+# encryption operation is already in progress" refusal until the next
+# real reboot wiped tmpfs. Real, not simulated: a genuine child process
+# takes the real lock and is actually SIGKILLed (not just cleaned up
+# with rmdir, which would prove nothing about the reclaim logic itself),
+# and a later caller must reclaim it.
+# These two tests need a genuinely SEPARATE process to hold the lock,
+# not a `( ... ) &` backgrounded subshell of this same script - bash's
+# `$$` is documented to always report the INVOKING shell's pid inside a
+# subshell, never the subshell's own real pid ($BASHPID would, $$ never
+# does), so a subshell here would make zfs_op_lock() record run-tests.sh's
+# own pid as the "holder" - very much alive, since it's this very test
+# script - instead of the actual holder process. A real, separate `sh`
+# script file backgrounded with `&` does not have this problem: it's a
+# genuine fork+exec, so its own $$ is its own real pid, exactly matching
+# how zfs_op_lock() is ever really called in production (always a
+# script's own top-level execution - boot-dataset.sh itself, or the
+# standalone zfs-unlock executable - never a backgrounded subshell
+# fragment of a larger script).
+_lock_holder_script() {
+    cat > "$1" <<EOF
+#!/bin/sh
+STUB_ROOT="$2"
+export STUB_ROOT
+. "$REPO_ROOT/init/pid-alive.sh"
+. "$REPO_ROOT/init/zfs-unlock.sh"
+zfs_op_lock "zroot/ROOT/enc"
+sleep "$3"
+EOF
+    chmod +x "$1"
+}
+
+echo "== zfs-unlock.sh: zfs_op_lock() reclaims a lock whose holder was SIGKILLed (real, separate process, real signal - not simulated) =="
+d="$(fresh_env)"
+mkdir -p "$d/root/tmp"
+_lock_holder_script "$d/holder.sh" "$d/root" 300
+sh "$d/holder.sh" &
+holder_pid=$!
+# Wait for the holder to actually record itself as the lock owner,
+# rather than a fixed sleep - avoids a flaky race against how fast the
+# background process reaches zfs_op_lock().
+lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+i=0
+while [ ! -s "$lock_dir/pid" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+recorded_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
+kill -KILL "$holder_pid" 2>/dev/null
+# Give the kernel a moment to actually reap/remove the process from
+# /proc - _pid_alive checks /proc directly, and a SIGKILL isn't
+# necessarily instantaneous from this shell's point of view. Polling
+# /proc directly rather than `wait`ing on the pid - `wait` on a
+# background job started this deep into a long-running script has shown
+# real, reproducible hangs in this same test file (a genuine bash
+# quirk around job-control tracking, not specific to this test) even
+# after the process is already confirmed gone from /proc.
+i=0
+while [ -d "/proc/$holder_pid" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+(
+    set +e
+    STUB_ROOT="$d/root"
+    export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
+    . "$REPO_ROOT/init/zfs-unlock.sh"
+    zfs_op_lock "zroot/ROOT/enc"
+    echo "reclaim_status=$?"
+) >"$d/out" 2>&1 || true
+if grep -qx "reclaim_status=0" "$d/out" \
+   && [ "$recorded_pid" = "$holder_pid" ] \
+   && grep -q "reclaimed a stale encryption operation lock for zroot/ROOT/enc (holder pid $holder_pid is gone)" "$d/out"; then
+    ok "zfs_op_lock() reclaims a lock left behind by a real, SIGKILLed holder - every other frontend is no longer stuck until the next reboot"
+else
+    cat "$d/out"; echo "recorded_pid=$recorded_pid holder_pid=$holder_pid"
+    bad "zfs_op_lock() did not reclaim a real dead holder's lock as expected"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== zfs-unlock.sh: zfs_op_lock() does NOT reclaim a lock whose holder is still genuinely alive (regression check for the F2 fix above) =="
+d="$(fresh_env)"
+mkdir -p "$d/root/tmp"
+_lock_holder_script "$d/holder.sh" "$d/root" 5
+sh "$d/holder.sh" &
+holder_pid=$!
+lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+i=0
+while [ ! -s "$lock_dir/pid" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+(
+    set +e
+    STUB_ROOT="$d/root"
+    export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
+    . "$REPO_ROOT/init/zfs-unlock.sh"
+    zfs_op_lock "zroot/ROOT/enc"
+    echo "second_lock_status=$?"
+) >"$d/out" 2>&1 || true
+kill -KILL "$holder_pid" 2>/dev/null
+if grep -qx "second_lock_status=1" "$d/out"; then
+    ok "a lock held by a genuinely live holder is correctly NOT reclaimed - the fix reclaims dead holders only, never steals a live lock"
+else
+    cat "$d/out"
+    bad "zfs_op_lock() incorrectly reclaimed a lock from a still-alive holder - this would break the lock's whole purpose"
 fi
 rm -rf "$d"
 
@@ -3580,6 +3709,7 @@ release_pid=$!
     set +e
     STUB_ROOT="$d/root"
     export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_op_lock_retry "zroot/ROOT/enc"
     echo "retry_status=$?"
@@ -3621,6 +3751,7 @@ release_pid=$!
     STUB_LOG="$d/log"
     STUB_ZFS_OP_LOCK_RETRY_SLEEP=0.5
     export STUB_ROOT STUB_LOG STUB_ZFS_OP_LOCK_RETRY_SLEEP
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3665,6 +3796,7 @@ release_pid=$!
     STUB_LOG="$d/log"
     STUB_ZFS_OP_LOCK_RETRY_SLEEP=0.5
     export STUB_ROOT STUB_LOG STUB_ZFS_OP_LOCK_RETRY_SLEEP
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3694,6 +3826,7 @@ zfs_unlock_env "$d"
     STUB_LOG="$d/log"
     STUB_ZFS_OP_LOCK_RETRY_SLEEP=0
     export STUB_ROOT STUB_LOG STUB_ZFS_OP_LOCK_RETRY_SLEEP
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
@@ -3726,6 +3859,7 @@ mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_lock "zroot/ROOT/enc"
     echo "lock_status=$?"
@@ -3758,6 +3892,7 @@ export STUB_ZFS_UNLOCK_CORRECT
     STUB_ROOT="$d/root"
     STUB_LOG="$d/log"
     export STUB_ROOT STUB_LOG
+    . "$REPO_ROOT/init/pid-alive.sh"
     . "$REPO_ROOT/init/zfs-unlock.sh"
     zfs_unlock "zroot/ROOT/enc"
     echo "unlock_status=$?"
