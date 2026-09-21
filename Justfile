@@ -107,16 +107,23 @@ test-kernel:
 #                                 tag, pushes - release.yml builds and
 #                                 publishes everything.
 #
-# Only needed when the version is actually changing. Re-tagging the
-# SAME version after a failed release build (nothing in the repo
-# changed) is just step 3 - there's nothing to bump or review.
+# `release` never moves or replaces an existing tag - re-releasing the
+# SAME version after a failed release BUILD (nothing in the repo
+# changed, the tag just never got a working artifact) is not "just step
+# 3": delete the tag first, on both sides, then step 3:
+#
+#   git push origin :refs/tags/v0.1.1 && git tag -d v0.1.1
+#   just release 0.1.1
+#
+# The tag then points at whatever master is NOW, not at the commit the
+# failed build actually ran against.
 
 # Step 1: open the version-bump PR.
 release-pr VERSION:
     #!/usr/bin/env bash
     set -euo pipefail
     [[ "{{VERSION}}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "✗ version must be X.Y.Z (no leading v), got '{{VERSION}}'"; exit 1; }
-    [ -z "$(git status --porcelain)" ] || { echo "✗ working tree not clean"; exit 1; }
+    [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "✗ uncommitted changes - commit or stash them first"; exit 1; }
     git fetch origin
     git checkout -b "release/v{{VERSION}}" origin/master
     echo "{{VERSION}}" > version.txt
@@ -125,24 +132,25 @@ release-pr VERSION:
     git push -u origin "release/v{{VERSION}}"
     gh pr create --title "Release v{{VERSION}}" \
         --body "Bumps version.txt to {{VERSION}}. After merge: \`just release {{VERSION}}\` tags master and CI publishes the release."
+    git checkout -
     echo "✓ release PR opened — merge it, then run: just release {{VERSION}}"
 
-# Step 2 (after the PR is merged, or directly if version.txt already
-# matches - e.g. re-tagging after a failed release build): verify, tag
-# master (signed), push.
+# Step 2 (after the PR is merged): verify, tag master (signed), push.
+# Refuses if the tag already exists - see the recovery sequence above
+# if you're re-releasing the same version after a failed build.
 release VERSION:
     #!/usr/bin/env bash
     set -euo pipefail
     [[ "{{VERSION}}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "✗ version must be X.Y.Z (no leading v), got '{{VERSION}}'"; exit 1; }
-    [ -z "$(git status --porcelain)" ] || { echo "✗ working tree not clean"; exit 1; }
+    [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "✗ uncommitted changes - commit or stash them first"; exit 1; }
     git checkout master
     git pull --ff-only
     git fetch --tags origin
     [ "$(tr -d '[:space:]' < version.txt)" = "{{VERSION}}" ] || \
         { echo "✗ version.txt is '$(cat version.txt)' — bump it first (just release-pr {{VERSION}})"; exit 1; }
-    git rev-parse "v{{VERSION}}" >/dev/null 2>&1 && { echo "✗ tag v{{VERSION}} already exists"; exit 1; }
+    git rev-parse -q --verify "refs/tags/v{{VERSION}}" >/dev/null && { echo "✗ tag v{{VERSION}} already exists"; exit 1; }
     git tag -s "v{{VERSION}}" -m "v{{VERSION}}"
-    git push origin "v{{VERSION}}"
+    git push origin "refs/tags/v{{VERSION}}"
     echo "✓ v{{VERSION}} tagged — CI builds the release: gh run watch"
 
 help:
