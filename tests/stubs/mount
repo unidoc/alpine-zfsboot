@@ -1,0 +1,16 @@
+#!/bin/sh
+echo "mount $*" >> "${STUB_LOG:-/dev/null}"
+is_zfs=0
+for a in "$@"; do
+    [ "$a" = "zfs" ] && is_zfs=1
+done
+if [ "$is_zfs" = 1 ]; then
+    n=$#
+    eval "dataset=\${$((n-1))}"
+    eval "target=\${$n}"
+    mkdir -p "$target"
+    if [ -n "${STUB_POOL_DATA:-}" ] && [ -d "$STUB_POOL_DATA" ]; then
+        cp -a "$STUB_POOL_DATA"/. "$target"/ 2>/dev/null
+    fi
+fi
+exit 0

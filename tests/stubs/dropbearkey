@@ -1,0 +1,29 @@
+#!/bin/sh
+# dropbearkey stub - rescue-ssh.sh's own start_rescue_ssh() calls
+# `dropbearkey -y -f <path>` once, purely to validate the persistent
+# host key staged from the ESP (a real, parseable dropbear key must be
+# there - no silent fallback to an ephemeral one, see rescue-ssh.sh's
+# own comment on why). Real dropbearkey -y prints the public key +
+# fingerprint from a private key file and fails non-zero if the file
+# isn't a real key - this stub does the same on a fixture level: any
+# non-empty file is "valid" (a real key body isn't needed for anything
+# these tests check), and STUB_DROPBEARKEY_FAIL simulates the real
+# failure case (a corrupted/wrong-format persisted key) without
+# needing an actual malformed dropbear key file as a fixture.
+echo "dropbearkey $*" >> "${STUB_LOG:-/dev/null}"
+if [ -n "${STUB_DROPBEARKEY_FAIL:-}" ]; then
+    echo "dropbearkey: failed reading key" >&2
+    exit 1
+fi
+case "$1 $2" in
+    "-y -f")
+        f="$3"
+        if [ -s "$f" ]; then
+            printf 'Public key portion is:\nssh-ed25519 AAAAFAKEHOSTKEY\nFingerprint: sha256:fake000fingerprint000fake\n'
+            exit 0
+        fi
+        echo "dropbearkey: failed to read key" >&2
+        exit 1
+        ;;
+esac
+exit 0

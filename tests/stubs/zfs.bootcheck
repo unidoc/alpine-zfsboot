@@ -1,0 +1,50 @@
+#!/bin/sh
+# A property-aware `zfs` stub, specifically for org.alpinezfsboot:bootcheck -
+# every OTHER property this project reads (encryptionroot, keystatus,
+# org.alpinezfsboot:commandline, ...) behaves exactly like the plain
+# default stub (always "-"), so this is a drop-in replacement for tests
+# that also need real get/set round-tripping for bootcheck specifically.
+# Initial state comes from STUB_BOOTCHECK_VALUE/STUB_BOOTCHECK_SOURCE
+# (defaults "-"/"-" - not participating); STUB_BOOTCHECK_STATE, if set,
+# persists whatever a `zfs set` call writes so a LATER `zfs get` in the
+# same test (or a second boot-dataset.sh/init run reusing the same
+# state file) sees the updated value - same pattern as tests/stubs/ip's
+# own statefulness.
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+state="${STUB_BOOTCHECK_STATE:-/dev/null}"
+
+case "$1 $2 $3 $4" in
+    "get -H -o value,source")
+        if [ "$5" = "org.alpinezfsboot:bootcheck" ]; then
+            if [ -s "$state" ]; then
+                cat "$state"
+            else
+                printf '%s\t%s\n' "${STUB_BOOTCHECK_VALUE:--}" "${STUB_BOOTCHECK_SOURCE:--}"
+            fi
+        else
+            printf -- '-\t-\n'
+        fi
+        exit 0
+        ;;
+esac
+
+case "$1" in
+    set)
+        case "$2" in
+            org.alpinezfsboot:bootcheck=*)
+                val="${2#org.alpinezfsboot:bootcheck=}"
+                [ "$state" != "/dev/null" ] && printf '%s\tlocal\n' "$val" > "$state"
+                ;;
+        esac
+        exit 0
+        ;;
+    inherit)
+        [ "$state" != "/dev/null" ] && : > "$state"
+        exit 0
+        ;;
+    get)
+        echo "-"
+        exit 0
+        ;;
+esac
+exit 0

@@ -1,0 +1,139 @@
+name: CI
+
+# Runs on every push and pull request - unlike release.yml (tag-push
+# only, produces the actual shipped .EFI/.iso assets), this is the
+# continuous correctness gate: does the test suite pass, does the real
+# Linux kernel unpack the encrypted-root kexec handoff's own
+# concatenated initramfs the way it's supposed to, and does build.sh
+# itself still succeed (including its own build-time assumption checks
+# - see build.sh's "verify the encrypted-root kexec handoff's own
+# assumptions" block) against a real Alpine container. All three catch
+# a different class of regression; none of them subsumes the others.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  unit-tests:
+    # tests/run-tests.sh's own header comment: runs directly on the dev
+    # host, no Alpine container, no real hardware - ubuntu-latest's own
+    # bash/python3 are enough.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run tests/run-tests.sh
+        run: ./tests/run-tests.sh
+
+  kernel-integration-test:
+    # tests/kernel-integration-test.sh's own header comment for the
+    # full why - boots a REAL Linux kernel in QEMU against a real,
+    # hand-built concatenated (compressed + padded + uncompressed)
+    # initramfs, proving the encrypted-root kexec handoff's own
+    # overwrite mechanism actually works the way the kernel unpacks it,
+    # not just that boot-dataset.sh's own shell-level round-trip check
+    # agrees with itself - that gap is exactly what let a real hardware
+    # boot fail despite every other check passing.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install qemu, cpio, busybox
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cpio busybox-static
+
+      - name: Extract a kernel image (no real install - see the script's own comment)
+        run: |
+          set -e
+          # A plain `apt-get install` of a kernel package on a CI
+          # runner triggers an initramfs-tools/bootloader update for a
+          # kernel that will never actually be booted here - `apt-get
+          # download` + `dpkg -x` gets just the vmlinuz file, nothing
+          # else touched on the runner.
+          real_pkg="$(apt-cache depends linux-image-generic | awk '/Depends: linux-image-[0-9]/{print $2; exit}')"
+          if [ -z "$real_pkg" ]; then
+              echo "ERROR: could not resolve linux-image-generic to a real versioned kernel-image package - apt-cache depends output:" >&2
+              apt-cache depends linux-image-generic >&2
+              exit 1
+          fi
+          apt-get download "$real_pkg"
+          mkdir -p /tmp/kernel-extract
+          dpkg -x "${real_pkg}"_*.deb /tmp/kernel-extract
+          find /tmp/kernel-extract/boot -maxdepth 1 -name 'vmlinuz-*'
+
+      - name: Run tests/kernel-integration-test.sh
+        run: |
+          set -e
+          kernel="$(find /tmp/kernel-extract/boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)"
+          KERNEL_IMAGE="$kernel" BUSYBOX_BIN="$(command -v busybox)" ./tests/kernel-integration-test.sh
+
+  build-x86_64:
+    # Same build.sh invocation release.yml uses for the real tag-
+    # triggered release, run here on every push/PR instead so a break
+    # in build.sh itself (or in the real Alpine container's own package
+    # set drifting under it) is caught immediately - including build.sh's
+    # own "verify the encrypted-root kexec handoff's own assumptions"
+    # block, which can ONLY be exercised inside a real Alpine container
+    # with real mkinitfs/zfs packages, not by tests/run-tests.sh at all.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build EFI image (x86_64)
+        run: |
+          set -e
+          mkdir -p out
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e OUT_DIR=/work/out \
+            alpine:3.24 sh -c '
+              set -eu
+              apk update
+              apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
+              ./build.sh
+            '
+          ls -la out/
+
+  build-aarch64:
+    # Native runner, matching release.yml's own reasoning (see that
+    # file's own comment) - run on every push/PR too, not only at
+    # release time, since aarch64-specific build.sh assumptions (the
+    # console-order/USB-HID module fixes, the arch-specific FEATURES=)
+    # are exactly the kind of thing that regresses silently otherwise.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build EFI image (aarch64)
+        run: |
+          set -e
+          mkdir -p out
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e OUT_DIR=/work/out \
+            alpine:3.24 sh -c '
+              set -eu
+              apk update
+              apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
+              ./build.sh
+            '
+          ls -la out/

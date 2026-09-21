@@ -1,0 +1,11 @@
+out/
+__pycache__
+*.EFI
+*.img
+temp/
+bios/*.o
+bios/*.elf
+bios/stage1.bin
+bios/stage2.bin
+bios/stage-iso.bin
+*.pyc
