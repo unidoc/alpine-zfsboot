@@ -14,7 +14,11 @@ import (
 	"time"
 )
 
-const baseURL = "https://github.com/unidoc/alpine-zfsboot/releases/latest/download/"
+// var, not const - overridden by TestDownloadRespectsClientTimeout to
+// point at a local httptest.Server, so that test can exercise the real
+// client-timeout behavior against a server that genuinely stalls,
+// without touching the network.
+var baseURL = "https://github.com/unidoc/alpine-zfsboot/releases/latest/download/"
 
 // http.DefaultClient has no timeout at all - a server that accepts the
 // connection and then stalls (not a DNS/connect failure, which would

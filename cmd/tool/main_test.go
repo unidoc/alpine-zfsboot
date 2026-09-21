@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,10 +39,15 @@ func TestCheckArchMatch(t *testing.T) {
 // F5 from the same review: os.Rename over the target destroyed the
 // only copy of the previous build, with no local rollback path if the
 // new one doesn't boot. backupPrevious must produce a real, readable
-// second copy of the CURRENT content under path+".previous" - and,
-// critically, must not touch path itself (the caller's own rename-based
-// install right after this call depends on path never having a
-// missing-file window).
+// second copy of the CURRENT content under path+".previous", report
+// that it did so, and - critically - must not touch path itself (the
+// caller's own rename-based install right after this call depends on
+// path never having a missing-file window).
+//
+// Exercises the hard-link path specifically (t.TempDir() supports hard
+// links). The copy fallback - the actual production path, since this
+// tool's real target is the ESP (vfat, no hard links at all) - is
+// covered separately below by TestBackupPreviousFallsBackToCopyWhenLinkFails.
 func TestBackupPrevious(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "alpine-zfsboot.EFI")
@@ -49,7 +55,9 @@ func TestBackupPrevious(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backupPrevious(path)
+	if ok := backupPrevious(path); !ok {
+		t.Fatal("backupPrevious returned false on a filesystem where the hard link should have succeeded")
+	}
 
 	got, err := os.ReadFile(path + ".previous")
 	if err != nil {
@@ -85,7 +93,9 @@ func TestBackupPrevious(t *testing.T) {
 	// make os.Link fail and silently skip the new backup - this is
 	// exactly the "os.Remove clears any stale link" case the function's
 	// own comment describes.
-	backupPrevious(path)
+	if ok := backupPrevious(path); !ok {
+		t.Fatal("second backupPrevious() call returned false")
+	}
 	if got, err := os.ReadFile(path + ".previous"); err != nil || string(got) != "build-two" {
 		t.Errorf("second backupPrevious() call: path+\".previous\" = %q, %v, want %q (a stale link from the first call must not block this one)", got, err, "build-two")
 	}
@@ -93,15 +103,71 @@ func TestBackupPrevious(t *testing.T) {
 
 // backupPrevious must never be the reason an update fails - no local
 // build to link from yet is a completely ordinary first-ever-update
-// case, not an error.
+// case, not an error - but it must honestly report that no backup
+// exists, since the caller's own success message depends on it (see
+// unidoc-alip's second-round review: this tool's runUpdate() used to
+// print "previous build kept at ...previous" unconditionally, which is
+// exactly wrong on the one case this test covers).
 func TestBackupPreviousNoExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "alpine-zfsboot.EFI")
 	// Deliberately never created - simulates the first update ever run
 	// against this path.
-	backupPrevious(path) // must not panic or block
+	if ok := backupPrevious(path); ok {
+		t.Error("backupPrevious returned true with nothing to back up from")
+	}
 
 	if _, err := os.Stat(path + ".previous"); err == nil {
 		t.Error("path+\".previous\" should not exist when there was nothing to link from")
+	}
+}
+
+// The blocker from unidoc-alip's second-round review: os.Link fails on
+// vfat (the ESP, this tool's actual real-world target - confirmed by
+// the reviewer against a real FAT32 volume), and the pre-fix
+// backupPrevious silently swallowed that error and still printed
+// "previous build kept at ...previous" - worse than not having a
+// backup at all, since it told an operator working from a rescue shell
+// on a machine that just failed to boot that a rollback existed when
+// it didn't. hardLink is swapped out here to force that failure
+// deterministically (this test's own tmp filesystem supports real hard
+// links, so there's no portable way to trigger the actual vfat
+// failure) and confirm the copy fallback produces a real, independent,
+// correctly-reported second copy instead.
+func TestBackupPreviousFallsBackToCopyWhenLinkFails(t *testing.T) {
+	orig := hardLink
+	hardLink = func(string, string) error {
+		return errors.New("simulated: no hard links on this filesystem (e.g. vfat/ESP)")
+	}
+	defer func() { hardLink = orig }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alpine-zfsboot.EFI")
+	if err := os.WriteFile(path, []byte("build-one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok := backupPrevious(path); !ok {
+		t.Fatal("backupPrevious returned false - the copy fallback should have succeeded even though the (simulated) hard link failed")
+	}
+	got, err := os.ReadFile(path + ".previous")
+	if err != nil {
+		t.Fatalf("path+\".previous\" was not created by the copy fallback: %v", err)
+	}
+	if string(got) != "build-one" {
+		t.Errorf("path+\".previous\" content = %q, want %q", got, "build-one")
+	}
+
+	// Confirm it's a genuinely independent copy, not accidentally still
+	// referencing the same inode - same check TestBackupPrevious does
+	// via os.Rename, but here an in-place overwrite is the right probe:
+	// a copy is a distinct inode, so writing over path in place must
+	// leave path+".previous" completely untouched (a hard link, by
+	// contrast, would show the overwrite through both names).
+	if err := os.WriteFile(path, []byte("build-two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path + ".previous"); string(got) != "build-one" {
+		t.Errorf("path+\".previous\" changed after overwriting path in place (%q) - the copy fallback isn't producing an independent file", got)
 	}
 }

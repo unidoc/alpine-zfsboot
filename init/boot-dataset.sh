@@ -542,6 +542,14 @@ kexec_initrd="$initrd"
 if [ -n "$encryptionroot" ] && [ "$encryptionroot" != "-" ]; then
     zfs_key_stage="$(zfs_key_stage_path "$encryptionroot")"
     if [ -r "$zfs_key_stage" ]; then
+        # This staged copy only ever gets rm'd by the ZFSWRAP wrapper
+        # below, inside its own "zfs load-key" branch, once the target
+        # actually calls it - a target init that never invokes this
+        # wrapper's load-key path at all leaves the key sitting in
+        # /run/alpine-zfsboot/zfs-key inside the TARGET's own initramfs
+        # for the rest of that boot. That's tmpfs/RAM, wiped on the
+        # next real reboot, not disk - but it is an assumption about
+        # Alpine's own init calling this, not a guarantee enforced here.
         handoff_root="$ROOTFS/tmp/zfs-handoff.$$"
         rm -rf "$handoff_root"
         mkdir -p "$handoff_root/usr/sbin" "$handoff_root/run/alpine-zfsboot"

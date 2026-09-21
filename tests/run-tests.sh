@@ -148,7 +148,7 @@ stage_rescue_ssh() {
 
 # =============================================================================
 echo "== syntax check =="
-for f in init/init init/boot-dataset.sh init/alpine-zfsboot-shell init/net-config.sh init/rescue-ssh.sh init/zfs-unlock.sh init/zfs-unlock build.sh iso.sh; do
+for f in init/init init/boot-dataset.sh init/alpine-zfsboot-shell init/net-config.sh init/rescue-ssh.sh init/pid-alive.sh init/zfs-unlock.sh init/zfs-unlock build.sh iso.sh; do
     if sh -n "$REPO_ROOT/$f"; then ok "sh -n $f"; else bad "sh -n $f"; fi
 done
 if python3 -m py_compile "$REPO_ROOT/init/menu.py" 2>/tmp/pyc.log; then

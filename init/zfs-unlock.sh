@@ -358,7 +358,18 @@ zfs_op_lock() {
         return 0
     fi
     lock_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
-    if [ -n "$lock_pid" ] && ! _pid_alive "$lock_pid"; then
+    # command -v, not a bare `! _pid_alive ...` - this file calls
+    # _pid_alive but never sources pid-alive.sh itself, relying on
+    # every caller having done so first (both real ones do -
+    # boot-dataset.sh transitively via rescue-ssh.sh, the standalone
+    # zfs-unlock wrapper explicitly). Found by unidoc-alip's review:
+    # with _pid_alive undefined, `! _pid_alive "$lock_pid"` evaluates
+    # to true (a bare `command not found` exits 127, and `!` negates
+    # that to true), so a missing dependency would silently RECLAIM -
+    # steal - a lock from a holder that is perfectly alive. This guard
+    # makes that failure mode fail closed instead: no _pid_alive means
+    # no reclaim, ever, not a false "the holder is dead."
+    if [ -n "$lock_pid" ] && command -v _pid_alive >/dev/null 2>&1 && ! _pid_alive "$lock_pid"; then
         stale="$lock_dir.stale.$$"
         if mv "$lock_dir" "$stale" 2>/dev/null; then
             rm -rf "$stale"

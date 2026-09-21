@@ -26,6 +26,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -157,6 +158,12 @@ func compare(path, downloadDir string) (comparison, error) {
 		os.Remove(tmp)
 		return comparison{}, fmt.Errorf("reading the downloaded build: %w", err)
 	}
+	// Applies to `check` too, not just `update` - deliberately. A
+	// wrong-arch asset isn't a normal "out of date" comparison result
+	// for check to report and move on from; it's the same "something
+	// at that URL doesn't match what it claims to be" condition update
+	// refuses to install, so check surfaces it as an error rather than
+	// silently reporting up-to-date/out-of-date against bogus data.
 	if err := checkArchMatch(path, local, latest); err != nil {
 		os.Remove(tmp)
 		return comparison{}, err
@@ -229,7 +236,7 @@ func runUpdate(path string, yes bool) {
 		os.Remove(c.tmpPath)
 		die(fmt.Errorf("setting permissions on the downloaded build: %w", err))
 	}
-	backupPrevious(path)
+	backedUp := backupPrevious(path)
 
 	// Rename, not copy-then-delete: atomic on the same filesystem
 	// (guaranteed by downloading into filepath.Dir(path) above) -
@@ -240,27 +247,78 @@ func runUpdate(path string, yes bool) {
 		os.Remove(c.tmpPath)
 		die(fmt.Errorf("installing the new build over %s: %w", path, err))
 	}
-	fmt.Printf("%s updated to %s (previous build kept at %s.previous)\n", path, cmdline.HumanVersion(c.latest.BuildStamp), path)
+	if backedUp {
+		fmt.Printf("%s updated to %s (previous build kept at %s.previous)\n", path, cmdline.HumanVersion(c.latest.BuildStamp), path)
+	} else {
+		fmt.Printf("%s updated to %s (no local rollback copy - could not preserve the previous build)\n", path, cmdline.HumanVersion(c.latest.BuildStamp))
+	}
 }
 
-// backupPrevious hard-links path to path+".previous" before it gets
-// overwritten - not a data copy, so it's instant regardless of file
-// size, and (unlike a rename-based backup) never removes path itself
-// even momentarily, so it can't introduce a missing-file window in the
-// caller's own rename-based install. Once that rename lands, path
-// points at the new inode while path+".previous" still references the
-// old one, untouched - a build that doesn't boot can be recovered from
-// a rescue shell (`mv path.previous path`) without another machine or
-// another download.
+// hardLink is os.Link, swappable in tests to force backupPrevious's
+// copy fallback deterministically - path's real target is the ESP
+// (vfat), which has no hard links at all, so that fallback is the
+// normal case in production, not an edge case, but nothing in this
+// codebase's own test environment (a plain tmp filesystem) can make a
+// real os.Link call fail to exercise it for real.
+var hardLink = os.Link
+
+// backupPrevious preserves the file currently at path as
+// path+".previous" before it gets overwritten, and reports whether a
+// usable rollback copy actually exists there afterward - the caller
+// must not claim a backup it doesn't have (see the git history for
+// why: a hard link silently no-ops on vfat, the ESP's own filesystem
+// and this tool's real target, and this used to unconditionally claim
+// "previous build kept" regardless of whether the link succeeded).
 //
-// Best-effort, deliberately: os.Remove clears any stale link from an
+// Tries a hard link first - not a data copy, so it's instant
+// regardless of file size, and (unlike a rename-based backup) never
+// removes path itself even momentarily, so it can't introduce a
+// missing-file window in the caller's own rename-based install. Falls
+// back to a real copy when linking fails, which is the normal case
+// here (vfat has no hard links; Linux's own fs/fat exposes no .link
+// inode operation either, same outcome).
+//
+// Best-effort either way: os.Remove clears any stale link/copy from an
 // earlier update (os.Link fails if the destination already exists); if
-// either step fails (no local build to link from yet, or a filesystem
-// without hard-link support), the caller still proceeds with the
-// update - a missing rollback copy is never a reason to block one.
-func backupPrevious(path string) {
-	os.Remove(path + ".previous")
-	_ = os.Link(path, path+".previous")
+// there's no local build to back up yet (first-ever update) or the
+// copy fallback also fails, the caller still proceeds with the update
+// - a missing rollback copy is never a reason to block one, it's just
+// something the caller must not claim.
+func backupPrevious(path string) bool {
+	dst := path + ".previous"
+	os.Remove(dst)
+
+	if err := hardLink(path, dst); err == nil {
+		return true
+	}
+	return copyFile(path, dst) == nil
+}
+
+// copyFile is backupPrevious's fallback for filesystems without hard
+// links (vfat, i.e. the ESP). Cleans up its own partial output on any
+// failure, so a failed backup never leaves a truncated ".previous"
+// file that looks usable but isn't.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
 func confirm(prompt string) bool {
