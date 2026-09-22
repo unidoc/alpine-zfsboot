@@ -9,7 +9,7 @@
  * The real protective-MBR partition entry comes from whatever GPT
  * tool actually partitions a real disk (`sgdisk`, etc. - see the
  * future disk-partitioning step this project doesn't have yet); this
- * file's own install step must only ever overwrite the first 446
+ * file's own install step must only ever overwrite the first 440
  * bytes of LBA 0 (the code portion), never the whole sector, or it
  * would erase that real entry along with the disk's own valid
  * signature.
