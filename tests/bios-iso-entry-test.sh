@@ -187,7 +187,39 @@ def snapshot():
         lines.append(line.rstrip())
     return "\n".join(lines)
 
-deadline = time.time() + 90
+# 300s, not 90s - raised after a real CI failure (both the push and
+# pull_request runs on the 0.1.0-hardening-pass branch timed out here,
+# identically) that turned out NOT to be a #cs-at-entry regression or
+# any other driver bug: this exact commit, built and booted under the
+# EXACT QEMU 8.2.2 + SeaBIOS 1.16.3 combination GitHub's ubuntu-latest
+# runner apt-installs (fetched and reproduced locally, byte-for-byte
+# matching versions), reaches "starting kernel" in well under a second
+# with the host otherwise idle - proving the code itself is correct.
+# Deliberately saturating all cores first (28 `yes` processes on 4
+# cores, load average ~29) reproduced the exact failure symptom -
+# "loading kernel" advancing one dot roughly every 5s instead of
+# instantly - and it still reached "starting kernel" and "done" every
+# time, just slowly: real, continuing forward progress, not a hang.
+# Root cause: FORCE_ATAPI's PIO transfer issues thousands of individual
+# inb/outb port operations (~1800 READ(10) commands for a 32MB
+# kernel+initrd at NATIVE_BATCH=9, each with its own wait_status_clear
+# spin-wait) - every one is a VM-exit under software emulation, and
+# wait_status_clear's own 20-million-iteration ceiling (ata_atapi.c) is
+# deliberately an ITERATION count, not a wall-clock one (see that
+# constant's own comment - a real-time budget would need interrupts
+# enabled for the WHOLE wait, which this driver can't assume). That's
+# the right call for the driver's own real hang-detection purpose, but
+# it means the REAL wall-clock cost of a full transfer scales with
+# whatever this host's own per-VM-exit cost happens to be at the
+# moment - fine on an idle dedicated machine, not fine on a CI runner
+# sharing physical cores with other tenants at the hypervisor level
+# (real, well-documented CPU steal-time noise, orthogonal to GitHub
+# Actions' own per-job VM isolation). 300s leaves over 100x this
+# project's own real, repeatedly-measured ~2.3s idle-host baseline
+# (see the hardening ledger) - generous enough to absorb realistic CI
+# noise without masking an actual hang (a genuinely wedged device would
+# still exceed it, just as before).
+deadline = time.time() + 300
 last = None
 while time.time() < deadline:
     text = snapshot()
