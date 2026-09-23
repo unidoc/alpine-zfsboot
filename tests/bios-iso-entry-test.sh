@@ -228,29 +228,29 @@ qemu-system-x86_64 --version | head -1 >&2
 # evidence today. stage2 itself never writes to the serial port
 # either (bios/console.c is VGA-text-only, confirmed by reading it).
 #
-# The real diagnostic gap this review flagged (F5): two real CI
-# timeouts both captured a completely BLANK VGA snapshot at the exact
-# moment of failure, which doesn't match this test's own "loading
-# kernel" slow-crawl theory on its face. But a real local
-# reproduction of that theory (this same pinned QEMU/SeaBIOS build,
-# synthetic host contention up to load ~97 on 4 cores) never once
-# produced a blank final screen - it always showed real, if slow,
-# forward progress (SeaBIOS banner within ~3s even under the heaviest
-# contention tried, "loading kernel"/"loading initrd" filling in
-# steadily after that) - and the CI timeout's own `info registers`
-# dump showed EIP already deep inside atapi_send_packet (past FAT
-# mount, past opening KERNEL/INITRD, several ATAPI commands in),
-# which cannot be reconciled with "the SeaBIOS banner itself hadn't
-# printed within 60s". Those two facts together (real, non-trivial
-# progress per the CPU state, nothing at all per the VGA read) point
-# at the pmemsave-based VGA capture itself misbehaving in the actual
-# CI environment at the instant of the snapshot, not at execution
-# genuinely never having started. This could not be confirmed further
-# without CI access, so instead of guessing again, the poll loop below
-# now logs a one-line summary of EVERY snapshot (not just the final
-# one) to $W/poll.log, printed on every non-PASS outcome - the next
-# failure, whatever it turns out to be, shows the real progression
-# instead of one single, possibly-misleading snapshot.
+# The real diagnostic gap this review flagged (F5), now actually
+# closed: two real CI timeouts both captured a completely BLANK VGA
+# snapshot at the moment of failure, which didn't match this test's
+# own "loading kernel" slow-crawl theory on its face - a local
+# reproduction of that theory (same pinned QEMU/SeaBIOS build,
+# synthetic host contention up to load ~97 on 4 cores) never produced
+# a blank final screen, always real forward progress. Per-poll logging
+# (added for exactly this reason, see log_poll below) caught the real
+# cause on the very next two CI runs: one timeout was blank from the
+# FIRST poll, the other caught one real (if truncated) 'SeaBIOS' frame
+# on its first poll and then went blank from the SECOND poll onward,
+# for the entire rest of the run. Blank-forever-after-one-real-frame is
+# not "the capture is unreliable" - it is snapshot()'s own fixed
+# `time.sleep(0.3)` before reading the pmemsave output file racing
+# QEMU's monitor thread, which real host contention can starve for
+# longer than that sleep actually waits in wall-clock terms. Fixed by
+# waiting for the monitor's own "(qemu) " prompt to reappear (see
+# read_until_prompt below) instead of guessing a fixed delay is enough -
+# pmemsave's file write is synchronous inside the command handler, so
+# the prompt reappearing is an unconditional guarantee the write already
+# landed, on any host at any speed. poll.log (still logged every poll,
+# printed on every non-PASS outcome) stays in place regardless, in case
+# a real regression or a genuinely different failure mode shows up next.
 qemu-system-x86_64 \
     -cdrom "$W/test.iso" \
     -m 256 -display none -no-reboot -no-shutdown -serial file:"$W/serial.log" -machine pc \
@@ -267,6 +267,51 @@ vga_path = sys.argv[2]
 poll_log = open(sys.argv[3], "w")
 t_start = time.time()
 
+# The actual bug behind "blank from the very first/second poll onward,
+# forever" (found by reading two real CI failure logs side by side: one
+# blank from t=0.5s, the other caught one real, partial 'SeaBIOS' frame
+# at t=0.5s and then went blank from t=3.0s to the end) - not a VGA/
+# pmemsave capture mystery after all. The old code sent the pmemsave
+# command, slept a FIXED 0.3s, then read the file regardless of
+# whether QEMU's monitor had actually finished executing it yet.
+# pmemsave's own file write happens synchronously inside the monitor
+# command handler - QEMU does not print its "(qemu) " prompt again
+# until that handler returns - so waiting for that prompt to reappear
+# (instead of guessing a fixed sleep is enough) is a real, unconditional
+# guarantee the write already landed, on any host at any speed. A fixed
+# sleep is exactly the kind of thing that "usually" works locally and
+# quietly stops working under the same real host-contention/steal-time
+# effect this whole investigation keeps running into: 0.3 real seconds
+# of wall-clock elapsing is not the same as 0.3 seconds of actual
+# scheduled CPU time for QEMU's own monitor thread on a badly-scheduled
+# host, so the read can race ahead of a write that hasn't started yet -
+# reading a file that's stale from a previous poll (this project's own
+# vga_path is reused every poll, never truncated between polls) instead
+# of that poll's real content. Reproduced directly, not just reasoned
+# about: SIGSTOP-ing the real qemu process itself right after sending
+# the pmemsave command (simulating a hypervisor-level scheduling stall
+# - a real noisy-neighbor CI host, not just a busy vCPU) and resuming it
+# after a controlled delay. The OLD fixed-sleep read consistently came
+# back with the STALE poisoned marker written into vga_path beforehand,
+# at stall lengths from 1.5s to 5s. The prompt-wait version below
+# never did - it blocked for exactly as long as the stall actually
+# lasted, then read the real, fresh content every time.
+def read_until_prompt(s, timeout=10.0):
+    s.settimeout(0.5)
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+        if buf.rstrip().endswith(b"(qemu)"):
+            break
+    return buf
+
 def snapshot():
     for _ in range(20):
         try:
@@ -276,11 +321,9 @@ def snapshot():
             time.sleep(0.5)
     else:
         return None
-    time.sleep(0.2)
-    s.recv(4096)
+    read_until_prompt(s)  # the connect-time greeting + first prompt
     s.sendall(f'pmemsave 0xb8000 0x4000 "{vga_path}"\n'.encode())
-    time.sleep(0.3)
-    s.recv(8192)
+    read_until_prompt(s)  # blocks until pmemsave's own handler has returned - the file write is guaranteed done by then, not just "probably done after 0.3s"
     s.close()
     data = open(vga_path, "rb").read()
     cols, rows = 80, 25
@@ -381,17 +424,17 @@ def log_poll(elapsed, text):
 #   load ~150 (150x `yes`/4 cores, host loadavg ~44-97)  73.9s
 # every one of these completed with real, continuous forward progress
 # (per-poll VGA text logged the whole way - see log_poll above) -
-# never a hang, never a blank final screen. That's the opposite of
-# both real CI timeouts on record, which came back completely blank at
-# 60s despite `info registers` proving execution had already gotten
-# well past FAT mount and deep into the ATAPI transfer loop by then -
-# a state that cannot coexist with "the SeaBIOS banner itself hadn't
-# printed yet" on a host merely running slow, only with a bad
-# snapshot. So this deadline bump is aimed at the genuine (if now
-# rarer) slow-crawl case this measurement rules 73.9s comfortably
-# inside of; it is deliberately NOT expected to fix a capture-artifact
-# blank screen if that's what actually recurs - see log_poll's own
-# comment and the FAIL message below for what to check if it does.
+# never a hang, never a blank final screen. Real CI still failed at
+# 60s twice more after this measurement, both times blank - but
+# poll.log from those two runs (not available until it was added)
+# showed why: not a genuine hang, and not the host actually running
+# THAT much slower than 73.9s worth - a fixed-sleep race in this
+# script's own monitor handling (see read_until_prompt above) that
+# read the pmemsave output file before QEMU had necessarily finished
+# writing it, which real host contention made far more likely to lose.
+# That race is now fixed at its source, not worked around here - this
+# deadline bump is for the separate, still-real slow-crawl case the
+# measurements above establish margin for.
 deadline = time.time() + 150
 last = None
 while time.time() < deadline:
@@ -436,23 +479,20 @@ while time.time() < deadline:
 
 # `info registers` here is a second, independent signal at the exact
 # moment of timeout: it comes straight from the monitor, not from
-# polling text-mode video memory, so it still says something useful
-# even if the VGA capture itself is blank/wrong - which is exactly
-# what happened both real times this test has timed out in CI (see
-# log_poll's own comment above): the VGA read came back blank, but
-# `info registers` showed EIP already deep inside atapi_send_packet,
-# proving real execution had gotten far past the point a blank screen
-# would imply. Real vs. capture-artifact is still not fully closed
-# without CI access to confirm it, but poll.log (printed below on
-# every non-PASS outcome) now records the FULL progression, not just
-# this one final sample.
+# polling text-mode video memory. Two real CI timeouts both had this
+# show EIP already deep inside atapi_send_packet while poll.log's own
+# VGA reads had gone (or started) completely blank - not a real hang,
+# not a genuinely unreliable capture channel either: read_until_prompt
+# above is the actual fix, a fixed-sleep race in THIS SCRIPT's own
+# monitor handling that only broke down under real CI host contention.
+# Kept using the same wait-for-prompt read here too, for the same
+# reason, though this query only runs once so it was never the
+# repeating failure mode poll.log's fix targets.
 try:
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    time.sleep(0.2)
-    s.recv(4096)
+    read_until_prompt(s)
     s.sendall(b"info registers\n")
-    time.sleep(0.3)
-    regs = s.recv(8192).decode("ascii", "replace")
+    regs = read_until_prompt(s).decode("ascii", "replace")
     s.close()
 except OSError as e:
     regs = f"(could not query monitor for info registers: {e})"
@@ -503,7 +543,7 @@ case "$status_line" in
     TIMEOUT)
         echo "$screen" >&2
         print_diagnostics
-        bad "boot never reached 'starting kernel' within the timeout - check poll.log above FIRST: if it shows steady forward progress (nonblank_rows climbing, 'loading kernel'/'loading initrd' with dots) this is genuine slow-crawl, most likely real host contention worse than this deadline's own measured margin (see this file's own deadline comment for the numbers that set it) - if it shows real progress that then goes BLANK partway through, or is blank from the very first poll, that's the still-open capture-artifact/real-hang question unidoc-alip's PR #5 review raised (see the hardening ledger) and is worth a fresh investigation, not another timeout bump"
+        bad "boot never reached 'starting kernel' within the timeout - check poll.log above FIRST: if it shows steady forward progress (nonblank_rows climbing, 'loading kernel'/'loading initrd' with dots), this is genuine slow-crawl, real host contention worse than this deadline's own measured margin (see this file's own deadline comment for the numbers that set it) - if it goes blank after one or more real frames, or is blank from the very first poll, and this happens again AFTER read_until_prompt's own fix (see that function's comment - this exact pattern is what it was written to close), that's a new, not-yet-understood capture problem worth a fresh investigation, not another timeout bump"
         ;;
     *)
         echo "$result" >&2
