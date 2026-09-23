@@ -12,7 +12,7 @@
 // a real bug in the upstream nvlist decoder (see checkElemCount in
 // nvlist.go) and the project's own single-maintainer, zero-tagged-release
 // status made pinning an external commit a weaker guarantee than owning
-// the code directly (see temp/hardening-ledger.md for the full audit).
+// the code directly.
 //
 // WHAT WAS KEPT: only the read-only call graph alpine-zfsboot actually
 // uses - Open/Close, PoolConfigs, PoolNames, PoolStats, and the nvlist
@@ -25,14 +25,13 @@
 // WHAT WAS MODIFIED: nvlist.go's decoder gained a bounds check
 // (checkElemCount) against a real unbounded-allocation finding from the
 // same audit - a corrupted/malformed array element count previously
-// reached make() unchecked. This fix has also been proposed upstream
-// (see temp/hardening-ledger.md); it is not upstream-dependent here.
+// reached make() unchecked. This fix has also been proposed upstream; it
+// is not upstream-dependent here.
 //
 // The ZFS_IOC_* ioctl ABI itself (not upstream's Go code) was
 // independently re-verified against real OpenZFS kernel source at 5
-// release tags spanning 2.0.0-2.4.0 as part of the same audit; see
-// temp/hardening-ledger.md for that trace. Upstream's own comments below,
-// citing the 2.2.2 headers, are retained as-is.
+// release tags spanning 2.0.0-2.4.0 as part of the same audit. Upstream's
+// own comments below, citing the 2.2.2 headers, are retained as-is.
 
 package zfsnative
 

@@ -17,12 +17,24 @@ import "fmt"
 // spa.c's spa_add_feature_stats() — that alpine-zfsboot's own boot-compat
 // verdict is built from (see cmd/tool/zfsnative.go). zc_name carries the
 // pool; the config comes back in zc_nvlist_dst.
+//
+// zc_cookie, read back after a successful ioctl (F20, unidoc-alip's PR
+// #5 review - real libzfs checks this same field the same way, e.g.
+// zpool_refresh_stats()): the ioctl itself can succeed (a config comes
+// back) while zc_cookie still carries a real, nonzero errno from
+// spa_get_stats()'s own attempt to actually open/scan the pool - a
+// degraded or otherwise-troubled pool can report a config this way
+// with no indication anything was wrong, previously silently ignored
+// here entirely.
 func (h *Handle) PoolStats(pool string) (Nvlist, error) {
-	nv, err := h.callWithDst(ZFS_IOC_POOL_STATS, func(c *zfsCmd) error {
+	nv, cookie, err := h.callWithDst(ZFS_IOC_POOL_STATS, func(c *zfsCmd) error {
 		return c.setName(pool)
 	}, 256*1024)
 	if err != nil {
 		return nil, fmt.Errorf("ZFS_IOC_POOL_STATS %q: %w", pool, err)
+	}
+	if cookie != 0 {
+		return nil, fmt.Errorf("ZFS_IOC_POOL_STATS %q: the kernel reported a config, but zc_cookie=%d (errno) - the pool itself had trouble opening/scanning, so this config should not be trusted", pool, cookie)
 	}
 	return nv, nil
 }

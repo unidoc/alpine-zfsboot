@@ -50,29 +50,41 @@
 /*
  * A plain iteration count, not a real time unit - deliberately NOT
  * the BIOS tick counter at 0040:006C this file used before: that
- * counter only advances while the timer IRQ is serviced, which
- * requires interrupts enabled (IF=1) for the ENTIRE time this code
- * might be waiting - and this whole stage runs with interrupts
- * enabled from the moment stage2_entry.S hands off to C (see that
- * file's own `sti`), for its entire remaining execution, not just
- * around this driver's own operations. That's a real, confirmed-the-
- * hard-way hazard, not a theoretical one: a real boot showed a struct
- * field (GPT header_size, written by a byte-copy loop immediately
- * before being compared) reading back as mismatched at the exact
- * comparison instruction, then reading back CORRECTLY moments later
- * from the SAME memory - with the actual compiled instruction proven
- * (via disassembly) to be a single direct memory-operand comparison,
- * not a cached register value a compiler could have hoisted. The only
- * remaining explanation is an asynchronous timer IRQ landing on this
- * stage's own stack between the two reads, since interrupts are left
- * enabled for the whole rest of this boot stage's own execution - the
- * BIOS's own default IRQ0 handler runs ON WHATEVER STACK WAS ACTIVE AT
- * THE TIME, which is this stage's own SS:SP, not a separate one. A
- * plain spin count needs no interrupts serviced at all to advance,
- * closing that whole window off entirely for every wait loop in this
- * file. Generous (tens of millions of port reads - each one taking at
- * least one full PCI/ISA bus cycle) for a PIO handshake that normally
- * completes in well under a millisecond.
+ * counter only advances while the timer IRQ is actually serviced,
+ * which requires interrupts enabled (IF=1).
+ *
+ * UPDATE (F22, unidoc-alip's PR #5 review, catching a stale claim):
+ * this comment used to say interrupts are left enabled for this
+ * stage's entire execution, citing an `sti` in stage2_entry.S - that
+ * `sti` is gone. stage2_entry.S's own current header comment states
+ * plainly: interrupts stay OFF for this stage's entire execution now
+ * (switch32.S's own brief cli/sti pair around its unreal-mode
+ * transition is the one deliberate, narrowly-scoped exception). So
+ * the tick counter is unusable here for an even more direct reason
+ * than before: with IF=0, it simply never advances at all, not just
+ * "advancing it would be hazardous."
+ *
+ * The real incident below is kept, not deleted - it's what a plain
+ * spin count was ORIGINALLY chosen to close, and it's the reason
+ * stage2_entry.S's own later "interrupts stay off" decision exists in
+ * the first place; both fixes now independently prevent the same
+ * class of hazard, and a spin count needs no interrupts serviced at
+ * all to advance regardless of what a future change to this stage's
+ * own IF policy might do. A real boot showed a struct field (GPT
+ * header_size, written by a byte-copy loop immediately before being
+ * compared) reading back as mismatched at the exact comparison
+ * instruction, then reading back CORRECTLY moments later from the
+ * SAME memory - with the actual compiled instruction proven (via
+ * disassembly) to be a single direct memory-operand comparison, not a
+ * cached register value a compiler could have hoisted. The only
+ * remaining explanation, at the time (before interrupts were turned
+ * off for the whole stage), was an asynchronous timer IRQ landing on
+ * this stage's own stack between the two reads - the BIOS's own
+ * default IRQ0 handler runs ON WHATEVER STACK WAS ACTIVE AT THE TIME,
+ * which is this stage's own SS:SP, not a separate one. Generous (tens
+ * of millions of port reads - each one taking at least one full
+ * PCI/ISA bus cycle) for a PIO handshake that normally completes in
+ * well under a millisecond.
  */
 #define ATA_TIMEOUT_SPINS 20000000UL
 

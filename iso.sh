@@ -212,7 +212,7 @@ if [ -n "$BIOS_STAGE_ISO_BIN" ]; then
     bios_boot_args="-b --interval:appended_partition_3:all:: -no-emul-boot -boot-load-size $boot_load_size"
 fi
 
-# shellcheck disable=SC2086 - bios_append_args/bios_boot_args are
+# shellcheck disable=SC2086 # bios_append_args/bios_boot_args are
 # deliberately unquoted (each expands to zero or several separate
 # xorriso arguments, never one with embedded spaces - $BIOS_STAGE_ISO_BIN
 # is this project's own build output path, not untrusted/arbitrary

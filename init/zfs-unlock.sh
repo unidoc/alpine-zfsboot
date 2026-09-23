@@ -406,6 +406,28 @@ zfs_op_lock() {
     if [ -n "$lock_pid" ] && command -v _pid_alive >/dev/null 2>&1 && ! _pid_alive "$lock_pid"; then
         stale="$lock_dir.stale.$$"
         if mv "$lock_dir" "$stale" 2>/dev/null; then
+            # F11 (unidoc-alip's PR #5 review): the staleness check
+            # above (_pid_alive "$lock_pid") and this mv are NOT
+            # atomic together - a real race: this process reads
+            # lock_pid=X (dead) here; before this mv runs, a DIFFERENT
+            # process that ALSO judged X dead finishes its own full
+            # reclaim (mv+rm+mkdir+echo its own live pid Y) and starts
+            # using the lock; THIS process's own mv then unconditionally
+            # moves whatever is CURRENTLY at $lock_dir - the other
+            # process's fresh, live lock, not the dead one this attempt
+            # actually judged - and both processes end up believing
+            # they hold it. Re-reading the pid actually captured in the
+            # moved-aside directory and comparing it against the SAME
+            # pid this attempt judged dead closes that window: a
+            # mismatch means someone else already won a real reclaim in
+            # between, so put their lock back untouched and fail this
+            # attempt (falling through to the caller's own retry/poll)
+            # instead of stealing it.
+            moved_pid="$(cat "$stale/pid" 2>/dev/null)"
+            if [ "$moved_pid" != "$lock_pid" ]; then
+                mv "$stale" "$lock_dir" 2>/dev/null
+                return 1
+            fi
             rm -rf "$stale"
             if mkdir "$lock_dir" 2>/dev/null; then
                 echo "$$" > "$lock_dir/pid" 2>/dev/null
@@ -635,6 +657,13 @@ zfs_unlock() {
             # that used to sit here on exactly this dry-run contract.
             if printf '%s\n' "$passphrase" | zfs load-key -n "$encryptionroot" >/tmp/load-key.log 2>&1; then
                 if zfs_stage_secret "$encryptionroot" "$passphrase"; then
+                    # staged_by_me - see boot-dataset.sh's own
+                    # _cleanup_secrets() comment (F2, unidoc-alip's PR
+                    # #5 review) for why this exists: the staged-secret
+                    # path is shared by every session unlocking the
+                    # SAME encryptionroot, so cleanup must only ever
+                    # remove a stage THIS process actually created.
+                    staged_by_me=1
                     unset passphrase
                     zfs_op_unlock "$encryptionroot"
                     zfs_unlock_msg "kexec handoff secret for $encryptionroot staged"
@@ -660,6 +689,9 @@ zfs_unlock() {
         # right here, with no extra re-prompt needed.
         if printf '%s\n' "$passphrase" | zfs load-key "$encryptionroot" >/tmp/load-key.log 2>&1; then
             if zfs_stage_secret "$encryptionroot" "$passphrase"; then
+                # staged_by_me - see this function's other zfs_stage_secret
+                # success site above for why (F2, unidoc-alip's PR #5 review).
+                staged_by_me=1
                 unset passphrase
                 zfs_op_unlock "$encryptionroot"
                 zfs_unlock_msg "encryption key loaded for $encryptionroot and kexec handoff secret staged"

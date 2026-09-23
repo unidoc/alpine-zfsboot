@@ -680,7 +680,17 @@ func printField(name string, err error, okMsg string) {
 // because this tool couldn't parse a version banner out of it).
 func (r report) errs() []error {
 	var out []error
-	for _, e := range []error{r.stage1Err, r.stage2Err, r.loaderErr, r.kernelErr, r.initrdErr, r.cmdlineErr, r.configErr} {
+	// metadataErr included (F22, unidoc-alip's PR #5 review) - it was
+	// missing from this list despite print()'s own "Metadata:" line
+	// already surfacing it as ERROR(...) when present-but-undecodable.
+	// verify's own real pass/fail decision currently happens not to
+	// miss this in practice (verifyMetadata() re-checks the same
+	// manifest independently and adds its own error either way), but
+	// errs() is this report's one general-purpose "everything wrong"
+	// collector - a populated error field it silently skips is a real
+	// gap in the collector itself, not something that should depend on
+	// every future caller separately re-deriving the same check.
+	for _, e := range []error{r.stage1Err, r.stage2Err, r.loaderErr, r.kernelErr, r.initrdErr, r.cmdlineErr, r.configErr, r.metadataErr} {
 		if e != nil {
 			out = append(out, e)
 		}
@@ -794,12 +804,14 @@ func verifyMetadata(t *target, deep, repair bool) []error {
 		if !repair {
 			return nil // MISSING is not itself a failure - see this function's own doc comment.
 		}
-		newManifest, err := deepMetadataFor(t.arch, info.Version, info.BuildStamp, kernelBytes, initrdBytes)
-		if err != nil {
-			return []error{fmt.Errorf("metadata --repair: deep-inspecting the real payload failed: %w", err)}
-		}
-		if err := espconfig.WriteFile(t.mountpoint, layout.MetadataFile, metadata.Encode(newManifest), 0o644); err != nil {
-			return []error{fmt.Errorf("metadata --repair: writing the reconstructed manifest failed: %w", err)}
+		// Routed through writeMetadata (not a second, separate
+		// deepMetadataFor+Encode+WriteFile here) so --repair gets the
+		// exact same round-trip-through-Decode validation the
+		// install/update path already does (F8, unidoc-alip's PR #5
+		// review) - one writer, not two independently-maintained ones
+		// that could drift.
+		if err := writeMetadata(t.mountpoint, t.arch, info.Version, info.BuildStamp, kernelBytes, initrdBytes); err != nil {
+			return []error{fmt.Errorf("metadata --repair: %w", err)}
 		}
 		fmt.Println("metadata --repair: reconstructed and wrote a new manifest from the real, current payload")
 		return nil
@@ -937,22 +949,18 @@ a later step like a partition-table reread or a reboot.`,
 						errs = append(errs, err)
 					}
 				}
-				if kernelFile != "" || initrdFile != "" || cmdlineFile != "" {
-					readOrEmpty := func(path string) []byte {
-						if path == "" {
-							return nil
-						}
-						b, err := os.ReadFile(path)
-						die(err)
-						return b
-					}
-					if err := espconfig.VerifyPayload(t.mountpoint, readOrEmpty(kernelFile), readOrEmpty(initrdFile), readOrEmpty(cmdlineFile)); err != nil && (kernelFile != "" && initrdFile != "" && cmdlineFile != "") {
-						// VerifyPayload checks all three together - only
-						// treat this as a real failure when the caller
-						// gave all three references to compare against;
-						// a partial reference set can't use this
-						// primitive meaningfully (see espconfig.
-						// VerifyPayload's own all-three-at-once shape).
+				// cmd.MarkFlagsRequiredTogether below guarantees these
+				// three are either all empty or all set by the time
+				// this runs (F12, unidoc-alip's PR #5 review) - no
+				// partial-set case to special-case here anymore.
+				if kernelFile != "" {
+					kernel, err := os.ReadFile(kernelFile)
+					die(err)
+					initrd, err := os.ReadFile(initrdFile)
+					die(err)
+					cmdlineBytes, err := os.ReadFile(cmdlineFile)
+					die(err)
+					if err := espconfig.VerifyPayload(t.mountpoint, kernel, initrd, cmdlineBytes); err != nil {
 						errs = append(errs, err)
 					}
 				}
@@ -981,6 +989,16 @@ a later step like a partition-table reread or a reboot.`,
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show the full per-feature Pool features list instead of just the active/enabled counts")
 	cmd.Flags().BoolVar(&deep, "deep", false, "re-derive kernel/OpenZFS versions from the real installed payload (full decompression) and require them to match the metadata manifest's own recorded values - the strongest check, beyond the always-on hash comparison")
 	cmd.Flags().BoolVar(&repair, "repair", false, "if the metadata manifest is simply MISSING, safely reconstruct it from the real, current payload; never touches a manifest that exists but doesn't match (that fails instead - see this command's own metadata checking)")
+	// F12 (unidoc-alip's PR #5 review): the three flags' own --help text
+	// already documented "needs all three ... together", but nothing
+	// enforced it - espconfig.VerifyPayload checks all three as one
+	// unit, and the Run closure above only ever surfaces ITS error when
+	// all three were given, so `verify --kernel-file X` alone silently
+	// compared nothing at all and still printed "verify: OK". Cobra's
+	// own flag-group validation enforces the contract the help text
+	// already promised, refusing to even start the command with a
+	// clear usage error instead of a silent no-op.
+	cmd.MarkFlagsRequiredTogether("kernel-file", "initrd-file", "cmdline-file")
 	return cmd
 }
 
@@ -1112,6 +1130,19 @@ func writeBIOSStagesWithRollback(disk string, stage1, stage2 []byte) error {
 	stage2Prev, err := biosboot.WriteStage2(disk, stage2)
 	if err != nil {
 		rollbackStage1(disk, stage1Prev)
+		// F6 (unidoc-alip's PR #5 review): WriteStage2 zeroes its
+		// entire 32KiB extent before writing the new content, so a
+		// write/sync/readback failure AFTER that point returns a
+		// non-nil `stage2Prev` - the exact real pre-write bytes this
+		// function's own doc comment says a caller should restore.
+		// This branch used to drop it, leaving a rolled-back stage1
+		// paired with a zeroed-or-partial stage2 (unbootable) while
+		// stderr still said "restored the previous stage1" - exactly
+		// the mixed-generation state this whole function exists to
+		// prevent. rollbackStage2 is already a no-op on a nil
+		// previous (the earlier, pre-zeroing failure branches), so
+		// this is safe to call unconditionally on every error here.
+		rollbackStage2(disk, stage2Prev)
 		return fmt.Errorf("writing stage2: %w", err)
 	}
 	if err := biosboot.VerifyStage2(disk, stage2); err != nil {
@@ -1228,23 +1259,36 @@ func backupPayload(mountpoint string) (payloadBackup, error) {
 // write that can fail, and swallowing that silently would be worse
 // than the original failure.
 func rollbackPayload(mountpoint string, backup payloadBackup) {
+	// ok tracks whether every restore() call actually succeeded (F22,
+	// unidoc-alip's PR #5 review) - previously the "restored the
+	// previous boot payload" success line printed UNCONDITIONALLY
+	// after all four calls, even on a run where one or more of them
+	// had just printed their own CRITICAL failure - an operator could
+	// see both "CRITICAL: ... ALSO failed ... do not reboot" and
+	// "restored the previous boot payload ... " back to back, the
+	// second directly undercutting the seriousness of the first.
+	ok := true
 	restore := func(rel string, want []byte) {
 		if want == nil {
 			path := filepath.Join(mountpoint, rel)
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				fmt.Fprintf(os.Stderr, "alpine-zfsboot: CRITICAL: removing %s while restoring the previous boot payload ALSO failed: %v - the ESP may now hold a mismatched KERNEL/INITRD/CMDLINE set, do not reboot without investigating further\n", path, err)
+				ok = false
 			}
 			return
 		}
 		if err := espconfig.WriteFile(mountpoint, rel, want, 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "alpine-zfsboot: CRITICAL: restoring the previous %s while restoring the boot payload ALSO failed: %v - the ESP may now hold a mismatched KERNEL/INITRD/CMDLINE set, do not reboot without investigating further\n", rel, err)
+			ok = false
 		}
 	}
 	restore(layout.KernelFile, backup.kernel)
 	restore(layout.InitrdFile, backup.initrd)
 	restore(layout.CmdlineFile, backup.cmdline)
 	restore(layout.MetadataFile, backup.metadata)
-	fmt.Fprintln(os.Stderr, "alpine-zfsboot: restored the previous boot payload (KERNEL/INITRD/CMDLINE/METADATA) after a failed write")
+	if ok {
+		fmt.Fprintln(os.Stderr, "alpine-zfsboot: restored the previous boot payload (KERNEL/INITRD/CMDLINE/METADATA) after a failed write")
+	}
 }
 
 // writePayloadWithRollback closes a real gap a follow-up review found:
@@ -1313,7 +1357,27 @@ func writeMetadata(mountpoint, arch, version, buildStamp string, kernelBytes, in
 	if err != nil {
 		return err
 	}
-	return espconfig.WriteFile(mountpoint, layout.MetadataFile, metadata.Encode(m), 0o644)
+	enc := metadata.Encode(m)
+	// F8 (unidoc-alip's PR #5 review): metadata.Decode requires
+	// version/buildstamp non-empty, but metadata.Encode validates
+	// nothing, and the BIOS install/update path takes both values from
+	// cmdline.ParseText, which does not require them either - a custom
+	// --cmdline-file or a hand-edited CMDLINE missing either field used
+	// to write a manifest that decoded cleanly at the moment of
+	// writing (Encode doesn't check) but that every LATER `verify`
+	// then rejected with "missing required field(s)" - and, because it
+	// EXISTS, `verify --repair` correctly refuses to touch it (see
+	// verifyMetadata's own doc comment on why a present-but-broken
+	// manifest is never auto-repaired) - leaving the installation stuck
+	// failing verify until an operator deletes the file by hand. A
+	// real round-trip through Decode before ever writing catches this
+	// at the moment it's actually preventable (install/update can
+	// still roll back the whole generation), instead of only ever
+	// being discovered by a later verify with no clean way out.
+	if _, err := metadata.Decode(enc); err != nil {
+		return fmt.Errorf("refusing to write a metadata manifest that would not decode: %w", err)
+	}
+	return espconfig.WriteFile(mountpoint, layout.MetadataFile, enc, 0o644)
 }
 
 // tryReadMetadata reads and decodes internal/layout.MetadataFile from
@@ -1326,14 +1390,34 @@ func writeMetadata(mountpoint, arch, version, buildStamp string, kernelBytes, in
 // present=false with err=nil means the file simply doesn't exist (an
 // older installation, or one from before this feature existed) - not
 // a problem, just nothing to use; present=false with err!=nil means
-// the file EXISTED but failed to decode - a real, reportable
-// corruption/mismatch a caller should surface distinctly from "simply
-// absent" (see report's own metadataErr field and print()'s own
-// "Metadata:" line).
+// the file EXISTED (or existing couldn't be ruled out) but couldn't be
+// read or decoded - a real, reportable problem a caller should
+// surface distinctly from "simply absent" (see report's own
+// metadataErr field and print()'s own "Metadata:" line).
+//
+// os.IsNotExist(readErr), NOT "any read error", is what maps to
+// present=false/err=nil (F7, unidoc-alip's PR #5 review) - EIO from a
+// bad sector, EACCES, or the file's own path being a directory
+// (ISDIR) are real problems distinct from "there was never a
+// manifest here", and collapsing them into plain "absent" broke the
+// exact property verifyMetadata's own doc comment promises for
+// --repair: "never touches one that exists and disagrees". A manifest
+// this process cannot even READ might be a mismatch it can no longer
+// prove - treating that as safely-missing let --repair silently
+// overwrite it (erasing whatever evidence a hash mismatch or
+// corruption it might have recorded) instead of hard-failing the way
+// an actually-undecodable-but-readable manifest already correctly
+// does. verifyMetadata's own existing decodeErr!=nil check (this
+// function's third return value) already hard-fails on exactly this
+// shape - no caller-side change needed beyond fixing this function's
+// own over-broad readErr handling.
 func tryReadMetadata(mountpoint string) (m metadata.Manifest, present bool, err error) {
 	raw, readErr := os.ReadFile(filepath.Join(mountpoint, layout.MetadataFile))
 	if readErr != nil {
-		return metadata.Manifest{}, false, nil
+		if os.IsNotExist(readErr) {
+			return metadata.Manifest{}, false, nil
+		}
+		return metadata.Manifest{}, false, fmt.Errorf("metadata file exists but could not be read: %w", readErr)
 	}
 	m, decodeErr := metadata.Decode(raw)
 	if decodeErr != nil {
@@ -1444,11 +1528,18 @@ func backupUEFIGeneration(mountpoint, loaderRel string) (uefiGenerationBackup, e
 // restored. Best-effort and loud on its own failure, same shape as
 // rollbackPayload/rollbackStage1/rollbackStage2.
 func rollbackUEFIGeneration(mountpoint, loaderRel string, backup uefiGenerationBackup) {
+	// ok tracks whether every restore() call actually succeeded (F22,
+	// unidoc-alip's PR #5 review) - same real gap, same fix, as
+	// rollbackPayload's own identical BIOS-side pattern: the success
+	// line used to print unconditionally even after a CRITICAL restore
+	// failure was already printed for one of the two files here.
+	ok := true
 	restore := func(rel string, want []byte, what string) {
 		path := filepath.Join(mountpoint, rel)
 		if want == nil {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				fmt.Fprintf(os.Stderr, "alpine-zfsboot: CRITICAL: removing %s while rolling back a failed UEFI update ALSO failed: %v - the ESP may now hold a mismatched loader/metadata generation, do not reboot without investigating further\n", path, err)
+				ok = false
 			}
 			return
 		}
@@ -1460,11 +1551,14 @@ func rollbackUEFIGeneration(mountpoint, loaderRel string, backup uefiGenerationB
 		// this specific restore.
 		if err := espconfig.WriteFile(mountpoint, rel, want, 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "alpine-zfsboot: CRITICAL: restoring the previous %s while rolling back a failed UEFI update ALSO failed: %v - the ESP may now hold a mismatched loader/metadata generation, do not reboot without investigating further\n", what, err)
+			ok = false
 		}
 	}
 	restore(loaderRel, backup.loader, "UEFI loader")
 	restore(layout.MetadataFile, backup.metadata, "metadata manifest")
-	fmt.Fprintln(os.Stderr, "alpine-zfsboot: restored the previous UEFI loader/metadata generation after a failed write")
+	if ok {
+		fmt.Fprintln(os.Stderr, "alpine-zfsboot: restored the previous UEFI loader/metadata generation after a failed write")
+	}
 }
 
 // writeUEFIGenerationWithRollback is UEFI's own equivalent of BIOS's
@@ -1629,6 +1723,22 @@ should use (its own USE_UEFI) and must pass it explicitly.`,
 				die(fmt.Errorf("--firmware must be \"uefi\" or \"bios\" (got %q)", firmware))
 			}
 			mountpoint := filepath.Join(root, "boot/efi")
+
+			// F17 (unidoc-alip's PR #5 review): without this, an ESP
+			// that was never actually mounted (or mounted as the wrong
+			// filesystem, or - BIOS only - mounted from a different
+			// disk than <disk>) let install write its payload
+			// somewhere that isn't the real boot filesystem at all,
+			// with nothing downstream (espconfig.VerifyPayload
+			// compares the write against itself either way) able to
+			// tell the difference. diskArg is "" for UEFI - see
+			// VerifyESPMounted's own doc comment for why that firmware
+			// has no corresponding disk-match half of this check.
+			diskArg := ""
+			if !uefi {
+				diskArg = disk
+			}
+			die(bootenv.VerifyESPMounted(mountpoint, diskArg))
 
 			workdir, err := os.MkdirTemp("", "alpine-zfsboot-install-*")
 			die(err)

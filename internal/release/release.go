@@ -7,10 +7,15 @@
 package release
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -178,30 +183,183 @@ type BIOSSources struct {
 	Stage1, Stage2, Kernel, Initrd, Cmdline Source
 }
 
+// apiLatestReleaseURL is GitHub's own REST API for this repo's latest
+// release - var, not const, same test-injection reason as baseURL.
+var apiLatestReleaseURL = "https://api.github.com/repos/unidoc/alpine-zfsboot/releases/latest"
+
+// downloadBaseURLTemplate is a CONCRETE, tag-pinned download base
+// (releases/download/<tag>/, not releases/latest/download/ - one %s
+// for the tag) - var, same test-injection reason as baseURL.
+var downloadBaseURLTemplate = "https://github.com/unidoc/alpine-zfsboot/releases/download/%s/"
+
+var sha256HexPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+// resolveTag resolves GitHub's "latest" release to ONE concrete,
+// immutable tag name - part of the fix for F16 (unidoc-alip's PR #5
+// review): ResolveBIOS used to fetch its five assets from five
+// independent releases/latest/download/ requests, each one its own,
+// separate "whatever /latest/ means AT THAT EXACT MOMENT" resolution.
+// If a new release was published between any two of those five
+// requests, the five downloaded files could come from two DIFFERENT
+// releases, mixed together with nothing to notice - a stage2 build ID
+// from vN alongside a kernel/initrd from vN+1. Resolving one tag ONCE,
+// before downloading anything, and building every URL from THAT SAME
+// tag closes the window: all five (or none) come from one real,
+// specific, immutable release.
+func resolveTag() (string, error) {
+	resp, err := httpClient.Get(apiLatestReleaseURL)
+	if err != nil {
+		return "", fmt.Errorf("resolving the latest release: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("resolving the latest release: HTTP %s", resp.Status)
+	}
+	var body struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", fmt.Errorf("parsing the latest-release API response: %w", err)
+	}
+	if body.TagName == "" {
+		return "", fmt.Errorf("the latest-release API response had no tag_name")
+	}
+	return body.TagName, nil
+}
+
+// fetchChecksums downloads and parses tagBase's own SHA256SUMS asset
+// (a plain `sha256sum` output file - see release.yml's own
+// "sha256sum * | tee SHA256SUMS") into a filename -> lowercase-hex-
+// sha256 map - the other half of the F16 fix: nothing previously
+// verified a downloaded BIOS asset's own integrity at all.
+func fetchChecksums(tagBase string) (map[string]string, error) {
+	resp, err := httpClient.Get(tagBase + "SHA256SUMS")
+	if err != nil {
+		return nil, fmt.Errorf("fetching SHA256SUMS: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetching SHA256SUMS: HTTP %s", resp.Status)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading SHA256SUMS: %w", err)
+	}
+	sums := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("SHA256SUMS: malformed line %q", line)
+		}
+		if !sha256HexPattern.MatchString(fields[0]) {
+			return nil, fmt.Errorf("SHA256SUMS: %q is not a 64-character hex sha256 sum", fields[0])
+		}
+		// sha256sum's own binary-mode "*" prefix on the filename field
+		// (see release.yml's own "sha256sum * | tee SHA256SUMS") -
+		// stripped so lookups match the plain asset name.
+		name := strings.TrimPrefix(fields[1], "*")
+		sums[name] = strings.ToLower(fields[0])
+	}
+	return sums, nil
+}
+
+// verifyChecksum confirms path's own real, on-disk content hashes to
+// sums[name] - fail closed: an asset missing from SHA256SUMS entirely
+// is refused, not silently trusted.
+func verifyChecksum(name, path string, sums map[string]string) error {
+	want, ok := sums[name]
+	if !ok {
+		return fmt.Errorf("%s is not listed in SHA256SUMS at all - refusing to trust it", name)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading %s to verify its checksum: %w", name, err)
+	}
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	if got != want {
+		return fmt.Errorf("%s: SHA256 mismatch (downloaded %s, SHA256SUMS says %s) - possible corruption or tampering in transit", name, got, want)
+	}
+	return nil
+}
+
 // ResolveBIOS resolves all five BIOS artifacts per src, each
 // independently sourced, defaulting whichever aren't overridden to
 // the latest GitHub release for arch. On any single artifact's
 // failure, every artifact successfully resolved so far is cleaned up
 // - same all-or-nothing contract as DownloadBIOS.
+//
+// F16 (unidoc-alip's PR #5 review): whichever of the five fall back to
+// the default (no explicit File/URL override) now come from ONE
+// concrete, tag-pinned release - resolved once, before any asset is
+// downloaded - and each one is checksum-verified against that SAME
+// release's own SHA256SUMS. An explicitly-overridden source (a custom
+// local file or URL) is NOT checksum-checked against the official
+// release's sums - it was never claiming to BE that release's asset
+// in the first place, so there's nothing legitimate to verify it
+// against.
 func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 	names := BIOSAssetName(arch)
-	var assets BIOSAssets
-	for _, f := range []struct {
-		name       string
-		source     Source
-		defaultURL string
-		dst        *string
+	fields := []struct {
+		name      string
+		assetFile string
+		source    Source
+		dst       *string
 	}{
-		{"stage1", src.Stage1, baseURL + names.Stage1, &assets.Stage1},
-		{"stage2", src.Stage2, baseURL + names.Stage2, &assets.Stage2},
-		{"kernel", src.Kernel, baseURL + names.Kernel, &assets.Kernel},
-		{"initrd", src.Initrd, baseURL + names.Initrd, &assets.Initrd},
-		{"cmdline", src.Cmdline, baseURL + names.Cmdline, &assets.Cmdline},
-	} {
-		path, err := f.source.resolve(f.defaultURL, dir)
+		{"stage1", names.Stage1, src.Stage1, nil},
+		{"stage2", names.Stage2, src.Stage2, nil},
+		{"kernel", names.Kernel, src.Kernel, nil},
+		{"initrd", names.Initrd, src.Initrd, nil},
+		{"cmdline", names.Cmdline, src.Cmdline, nil},
+	}
+
+	needDefault := false
+	for _, f := range fields {
+		if f.source.File == "" && f.source.URL == "" {
+			needDefault = true
+		}
+	}
+
+	var sums map[string]string
+	var tagBase string
+	if needDefault {
+		tag, err := resolveTag()
+		if err != nil {
+			return BIOSAssets{}, fmt.Errorf("resolving BIOS assets: %w", err)
+		}
+		tagBase = fmt.Sprintf(downloadBaseURLTemplate, tag)
+		sums, err = fetchChecksums(tagBase)
+		if err != nil {
+			return BIOSAssets{}, fmt.Errorf("resolving BIOS assets: %w", err)
+		}
+	}
+
+	var assets BIOSAssets
+	dsts := []*string{&assets.Stage1, &assets.Stage2, &assets.Kernel, &assets.Initrd, &assets.Cmdline}
+	for i := range fields {
+		fields[i].dst = dsts[i]
+	}
+	for _, f := range fields {
+		isDefault := f.source.File == "" && f.source.URL == ""
+		defaultURL := ""
+		if isDefault {
+			defaultURL = tagBase + f.assetFile
+		}
+		path, err := f.source.resolve(defaultURL, dir)
 		if err != nil {
 			assets.RemoveAll()
 			return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
+		}
+		if isDefault {
+			if err := verifyChecksum(f.assetFile, path, sums); err != nil {
+				os.Remove(path)
+				assets.RemoveAll()
+				return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
+			}
 		}
 		*f.dst = path
 	}

@@ -166,6 +166,28 @@ func TestPoolStats(t *testing.T) {
 	}
 }
 
+// TestPoolStats_NonzeroZcCookieRefused is the regression test for F20
+// (unidoc-alip's PR #5 review): a successful ZFS_IOC_POOL_STATS ioctl
+// (a config genuinely comes back) can still leave zc_cookie holding a
+// real, nonzero errno from the kernel's own attempt to open/scan the
+// pool - real libzfs checks this same field the same way. Before this
+// fix, PoolStats never read it back at all, so a troubled pool's
+// config was trusted exactly like a clean one.
+func TestPoolStats_NonzeroZcCookieRefused(t *testing.T) {
+	defer snapshotSeams()()
+
+	ioctlFn = func(_ *Handle, _ uintptr, cmd *zfsCmd) error {
+		putDst(t, Nvlist{
+			"feature_stats": Nvlist{"org.openzfs:large_blocks": uint64(1)},
+		})
+		cmd.setU64(offZcCookie, 5) // EIO, say - the pool had real trouble opening
+		return nil
+	}
+	if _, err := okHandle().PoolStats("tank"); err == nil {
+		t.Fatal("PoolStats with a nonzero post-call zc_cookie: want an error, got nil - a troubled pool's config was trusted as clean")
+	}
+}
+
 func TestCallWithDstEnomemGrowThenSucceed(t *testing.T) {
 	defer snapshotSeams()()
 	calls := 0

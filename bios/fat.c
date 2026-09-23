@@ -73,14 +73,38 @@ _Static_assert(sizeof(struct fat_dirent) == 32,
 #define FAT_CLUSTER_MASK 0x0FFFFFFFu /* FAT32 entries are 32 bits wide but only the low 28 bits are the cluster number - top 4 are reserved */
 
 /*
- * Generous relative to any realistically-sized kernel/initrd on even
- * the smallest FAT32 cluster size (65536 clusters covers a 70MB file
- * down to a 1KB-per-cluster volume, well past anything mkfs.vfat -F32
- * would ever actually choose for a partition this size) - a real,
- * finite ceiling so a corrupt or cyclic FAT chain can never loop this
- * driver forever, not "unlimited".
+ * A previous version of this file bounded chain walks against a fixed
+ * FAT_MAX_CHAIN_CLUSTERS=65536, on the claimed assumption that this
+ * was "well past anything mkfs.vfat -F32 would ever actually choose"
+ * for cluster size on a partition this project's own iso.sh builds.
+ * That assumption was wrong, and release-blocking: dosfstools 4.2
+ * chooses 512-byte (sectors-per-cluster=1) clusters for ANY FAT32
+ * volume up to 260MB, and iso.sh's own real payload-driven sizing
+ * (.EFI + kernel + initrd + cmdline + 8MiB headroom) lands well
+ * within that range for real release assets - so the real per-file
+ * ceiling a fixed 65536 imposed was about 32MiB, not "well past"
+ * anything, and a real production initrd (tens of MB) silently failed
+ * to load with "FAT read failed" on every x86_64 ISO this project
+ * built (found by unidoc-alip's PR #5 review, finding F1 - confirmed
+ * with a real PoC against production sizes, not just theorized).
+ *
+ * There is no fixed cluster-count ceiling that is simultaneously safe
+ * (small enough to bound a corrupt/cyclic chain) and correct (large
+ * enough for every real file this project might ever need to load) -
+ * because the real bound isn't a constant at all, it's the volume's
+ * own total_clusters (fat_chain_advance() below takes `vol` as a
+ * parameter already): a non-cyclic chain can never legitimately visit
+ * more clusters than the volume actually has, since doing so would
+ * necessarily revisit one - and a revisit is exactly what this same
+ * function's own Floyd's-algorithm tortoise/hare pointers already
+ * catch, independently of any hop count at all (see fat_chain_walk's
+ * own comment). So bounding hops against vol->total_clusters directly
+ * is both the correct generalization (scales with the REAL volume,
+ * not a guess about what volumes will look like) and still a real,
+ * finite ceiling - fat_mount() has already validated total_clusters
+ * against the volume's own real, external partition size before any
+ * chain walk ever runs.
  */
-#define FAT_MAX_CHAIN_CLUSTERS 65536u
 
 /* Component length cap for fat_pack_name()/fat_open() below - see
  * fat_open()'s own header comment for why this driver only ever needs
@@ -333,7 +357,8 @@ static int fat_cluster_in_range(const struct fat_volume *vol, uint32_t cluster)
  * real cycle detection (Floyd's algorithm), not just a generous hop
  * count.
  *
- * FAT_MAX_CHAIN_CLUSTERS alone is NOT sufficient here: a caller
+ * A hop-count ceiling ALONE is NOT sufficient here, regardless of
+ * whether it's a fixed constant or vol->total_clusters: a caller
  * driven by a byte/entry budget (fat_read_range() in particular) can
  * satisfy that budget by re-reading a SHORT cycle's clusters over and
  * over - the hop count still comes out exactly as expected, so it
@@ -341,18 +366,17 @@ static int fat_cluster_in_range(const struct fat_volume *vol, uint32_t cluster)
  * data (repeated clusters), not a hang or an over-long walk. Confirmed
  * the hard way against a synthetic self-referencing test fixture
  * (bios/tests/build_fat_fixtures.py's cyclic_chain.img): an earlier
- * version of this file that only capped chain_walked against
- * FAT_MAX_CHAIN_CLUSTERS returned success with corrupted output on
- * that fixture instead of failing. The tortoise pointer catches this
- * directly - it advances one cluster every second hare hop, so on any
- * real cycle of length L the two pointers coincide within about 2L
- * hops, independent of how many total bytes/entries the caller still
- * wants.
+ * version of this file that only capped chain_walked against a hop
+ * ceiling returned success with corrupted output on that fixture
+ * instead of failing. The tortoise pointer catches this directly - it
+ * advances one cluster every second hare hop, so on any real cycle of
+ * length L the two pointers coincide within about 2L hops,
+ * independent of how many total bytes/entries the caller still wants.
  */
 struct fat_chain_walk {
 	uint32_t cluster;   /* current ("hare") position */
 	uint32_t tortoise;  /* half-speed cycle-detection pointer */
-	uint32_t hops;      /* total hare hops so far - FAT_MAX_CHAIN_CLUSTERS is still the backstop for a very long but genuinely non-cyclic chain */
+	uint32_t hops;      /* total hare hops so far - bounded against vol->total_clusters in fat_chain_advance(), the backstop for a very long but genuinely non-cyclic chain */
 	int tortoise_due;   /* alternates each hop - tortoise only moves on every other one */
 };
 
@@ -387,7 +411,11 @@ static int fat_chain_advance(const struct fat_volume *vol, struct fat_chain_walk
 {
 	uint32_t next;
 
-	if (w->hops++ > FAT_MAX_CHAIN_CLUSTERS)
+	/* A valid, non-cyclic chain can never legitimately visit more
+	 * clusters than the volume actually has - see this function's own
+	 * struct's header comment for why this is the correct bound, not
+	 * a fixed guess about realistic file sizes. */
+	if (w->hops++ > vol->total_clusters)
 		return -1;
 	if (fat_get_next_cluster(vol, w->cluster, &next) != 0)
 		return -1;
@@ -507,6 +535,38 @@ int fat_mount(struct fat_volume *vol, uint64_t partition_lba, uint64_t partition
 	 * top of this one.
 	 */
 	if (total_sectors > partition_sectors)
+		return -1;
+
+	/*
+	 * F10 (unidoc-alip's PR #5 review): `reserved_sector_count +
+	 * num_fats * fat_size` below is entirely 32-bit arithmetic, and
+	 * `num_fats * fat_size` alone can OVERFLOW uint32 for a crafted
+	 * fat_size_32 (num_fats=2, fat_size_32 = real + 0x80000000 wraps
+	 * the product back to 2*real) - the "underflow guard" that
+	 * multiplication used to feed directly into only ever checked the
+	 * ALREADY-WRAPPED (small, plausible-looking) sum, not the real
+	 * one. mount() itself never actually used the wrapped value for
+	 * anything unsafe (data_start_lba, set further down in this same
+	 * function, casts to uint64_t before multiplying - the REAL,
+	 * non-wrapped product) - but that real product then lands the
+	 * data region far past where this wrapped check thought it was,
+	 * on a disk under 2TiB reading whatever real bytes happen to sit
+	 * there as if they were this volume's own data clusters.
+	 *
+	 * Checked here via DIVISION instead of multiplication - division
+	 * cannot overflow, so this proves fat_size is small enough that
+	 * the multiplication two lines below is safe BEFORE it ever runs,
+	 * rather than trying to detect an overflow after the fact.
+	 * bpb->reserved_sector_count >= total_sectors is checked
+	 * separately first, since it's the one thing that could still
+	 * make total_sectors - reserved_sector_count itself underflow
+	 * (reserved_sector_count is a real, otherwise-unbounded uint16 -
+	 * not part of this specific attack, but a fail-closed check should
+	 * not introduce a new wrap of its own while closing this one).
+	 */
+	if (bpb->reserved_sector_count >= total_sectors)
+		return -1;
+	if (fat_size > (total_sectors - bpb->reserved_sector_count) / bpb->num_fats)
 		return -1;
 
 	{

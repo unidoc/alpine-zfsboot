@@ -266,6 +266,39 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+echo "== boot-dataset.sh: F21 busy pre-check refuses BEFORE the attempt record/bootcheck counter are ever touched, not just before the real zpool export =="
+# Regression test for F21 (unidoc-alip's PR #5 review): the real zpool
+# export hard-fail (test just above) already stops the boot safely,
+# but it used to run strictly AFTER the attempt record and bootcheck
+# counter were already written - so a refused export still counted as
+# a real boot attempt for Last Boot Diagnostics, even though kexec -e
+# never ran at all. This test proves the NEW read-only /proc/mounts
+# pre-check refuses first, before either of those writes ever happens
+# - STUB_PROC_MOUNTS points at a fixture claiming a descendant dataset
+# is already mounted elsewhere (a stand-in for another boot environment
+# or a left-open rescue-SSH chroot_be() session).
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"
+: > "$d/pooldata/boot/initramfs-lts"
+printf 'zroot/ROOT/other /mnt/other zfs rw 0 0\n' > "$d/fake-proc-mounts"
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" STUB_PROC_MOUNTS="$d/fake-proc-mounts" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -qi "still has something else mounted" "$d/out" \
+   && grep -qi "zroot/ROOT/other at /mnt/other" "$d/out" \
+   && grep -q "TEST STUB: would exec setsid -c /bin/bash (no controlling terminal yet)" "$d/out" \
+   && ! grep -q "^kexec -e$" "$d/log" 2>/dev/null \
+   && ! grep -q "^zpool export" "$d/log" 2>/dev/null \
+   && ! grep -q "^zfs set.*attempt_" "$d/log" 2>/dev/null \
+   && ! grep -q "^zfs set.*bootcheck" "$d/log" 2>/dev/null; then
+    ok "the busy pre-check refuses (drops to a rescue shell via fail()) before the real zpool export, the attempt record, AND the bootcheck counter are ever reached"
+else
+    cat "$d/out" 2>/dev/null; cat "$d/log" 2>/dev/null
+    bad "the busy pre-check either did not fire, or something downstream of it still ran (zpool export / attempt record / bootcheck write)"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== boot-dataset.sh: unencrypted dataset -> no load-key call at all, log unchanged =="
 d="$(fresh_env)"
 mkdir -p "$d/pooldata/boot"
@@ -4436,6 +4469,74 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+# F11 (unidoc-alip's PR #5 review): the staleness check (_pid_alive
+# "$lock_pid") and the reclaim mv are not atomic together - two real
+# processes that both observe the SAME dead holder can race, and the
+# loser's own mv (run AFTER the winner already completed its full
+# mv+rm+mkdir+echo-pid reclaim) would move the WINNER's fresh, live
+# lock aside instead of the dead one it actually judged, leaving both
+# processes believing they hold it. Real timing, not simulated: two
+# genuinely separate processes, one with `mv` itself overridden to
+# sleep first (deterministically losing the race at the exact mv step
+# the fix's own re-check runs at, not just "probably loses" from a
+# head start) so the OTHER process's full reclaim genuinely completes
+# first, every run.
+_lock_racer_script() {
+    cat > "$1" <<EOF
+#!/bin/sh
+STUB_ROOT="$2"
+export STUB_ROOT
+. "$REPO_ROOT/init/pid-alive.sh"
+. "$REPO_ROOT/init/zfs-unlock.sh"
+$3
+zfs_op_lock "zroot/ROOT/enc"
+echo "lock_status=\$? pid=\$\$" > "$4"
+EOF
+    chmod +x "$1"
+}
+
+echo "== zfs-unlock.sh: zfs_op_lock() reclaim does not steal a lock another process ALREADY reclaimed in the same race window =="
+d="$(fresh_env)"
+mkdir -p "$d/root/tmp"
+_lock_holder_script "$d/holder.sh" "$d/root" 300
+sh "$d/holder.sh" &
+holder_pid=$!
+lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+i=0
+while [ ! -s "$lock_dir/pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+kill -KILL "$holder_pid" 2>/dev/null || true
+i=0
+while [ -d "/proc/$holder_pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+
+# racer_slow overrides mv to sleep 0.5s before the REAL mv (the exact
+# operation this fix's own re-check happens around) - a shell function
+# defined before zfs-unlock.sh is sourced takes precedence over the
+# real mv(1) for every call inside it, same function-override
+# technique this whole file already uses throughout.
+_lock_racer_script "$d/racer_slow.sh" "$d/root" \
+    'mv() { command sleep 0.5; command mv "$@"; }' "$d/slow.out"
+_lock_racer_script "$d/racer_fast.sh" "$d/root" '' "$d/fast.out"
+sh "$d/racer_slow.sh" &
+slow_shell_pid=$!
+sh "$d/racer_fast.sh" &
+fast_shell_pid=$!
+wait "$fast_shell_pid" 2>/dev/null
+wait "$slow_shell_pid" 2>/dev/null
+
+fast_status="$(sed -n 's/.*lock_status=\([0-9-]*\).*/\1/p' "$d/fast.out" 2>/dev/null)"
+fast_pid="$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' "$d/fast.out" 2>/dev/null)"
+slow_status="$(sed -n 's/.*lock_status=\([0-9-]*\).*/\1/p' "$d/slow.out" 2>/dev/null)"
+final_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
+if [ "$fast_status" = "0" ] && [ "$slow_status" = "1" ] && [ "$final_pid" = "$fast_pid" ]; then
+    ok "the slower racer detected the pid mismatch after its own delayed mv and backed off - the faster racer's real reclaim survived untouched"
+else
+    echo "fast: status=$fast_status pid=$fast_pid / slow: status=$slow_status / final lock pid=$final_pid"
+    cat "$d/fast.out" "$d/slow.out" 2>/dev/null
+    bad "zfs_op_lock()'s reclaim let a slower racer steal a lock the faster racer had already genuinely reclaimed"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== zfs-unlock.sh: zfs_op_lock_retry() itself is a real ~10-poll budget, not just barely wide enough for the other tests' own release timings =="
 # A DIRECT unit test of zfs_op_lock_retry() alone, deliberately not
 # routed through the full zfs_unlock() flow - that flow's own outer
@@ -4747,18 +4848,20 @@ i=0
 while [ -z "$(find "$d/scratch-tmp" -mindepth 1 2>/dev/null)" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 dialog_err_file="$(find "$d/scratch-tmp" -mindepth 1 2>/dev/null | head -1)"
 kill -TERM "$wrapper_pid" 2>/dev/null
-# Poll for the FILE being gone, not for the wrapper process itself
-# exiting - confirmed directly (real trap, real signal): registering a
-# trap for TERM suppresses the default terminate-immediately action,
-# so the handler runs (removing the file, fast) but the process itself
-# keeps running afterward, blocked back in its own poll loop, until
-# explicitly killed below - that's fine, only the file's removal is
-# this test's own real assertion. No pkill -P needed here either
-# (unlike the boot-dataset.sh mount-stub SIGTERM test, which blocks
-# inside a genuine foreground `wait()` for a slow child) - the poll
-# loop _zfs_prompt_once() sits in while dialog is up uses a plain
-# `sleep 1` between checks, short enough that the trap fires promptly
-# on its own.
+# Poll for the FILE being gone AND for the wrapper process itself
+# exiting. The second check is real regression coverage for init/
+# zfs-unlock's own F3-equivalent fix (unidoc-alip's PR #5 review found
+# this exact bug in boot-dataset.sh's own trap; the standalone
+# zfs-unlock wrapper had the identical shape and was fixed the same
+# way): a single `trap CMD EXIT INT TERM HUP` does not terminate a
+# POSIX sh script on its own - the handler runs and the script RESUMES
+# right after it. Before that fix, this wrapper cleaned up the temp
+# file and then kept running (confirmed directly, real trap, real
+# signal) until explicitly killed a few lines below - this test used
+# to accept that as fine, checking only the file's removal. After the
+# fix, the handler also disarms the EXIT trap and calls `exit 143`
+# (128+SIGTERM) for real, so the process is expected to actually be
+# gone here, not just quiescent.
 i=0
 while [ -e "$dialog_err_file" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 if [ -n "$dialog_err_file" ] && [ ! -e "$dialog_err_file" ]; then
@@ -4767,15 +4870,20 @@ else
     echo "dialog_err_file=[$dialog_err_file]"; ls -la "$d/scratch-tmp" 2>/dev/null; cat "$d/out" "$d/err" 2>/dev/null
     bad "SIGTERM mid-prompt left the plaintext-passphrase temp file behind"
 fi
-# || true on both - under this file's own `set -eu`, either one
-# returning nonzero (the trap already let the wrapper keep running
-# after removing the file, per its own documented semantics above, but
-# a genuine race is still possible: the wrapper could finish dying and
-# get reaped between these two lines, leaving pkill's own -P lookup
-# with no matching children and a real, expected exit 1) would abort
-# the ENTIRE test suite right here, not just this one cleanup step -
-# confirmed the hard way, this exact gap silently truncated every run
-# after this test until fixed.
+i=0
+while kill -0 "$wrapper_pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+if ! kill -0 "$wrapper_pid" 2>/dev/null; then
+    ok "SIGTERM mid-prompt made the standalone wrapper actually terminate, not just clean up and resume"
+else
+    bad "SIGTERM mid-prompt cleaned up but the wrapper process is still running - the trap resumed instead of exiting"
+fi
+# Safety net only now (the wrapper is expected to already be gone by
+# this point, per the real assertion just above) - || true on both
+# since under this file's own `set -eu`, either one returning nonzero
+# for the now-ordinary "already exited, nothing to kill" case would
+# abort the ENTIRE test suite right here, not just this one cleanup
+# step - confirmed the hard way, this exact gap silently truncated
+# every run after this test until fixed.
 kill -KILL "$wrapper_pid" 2>/dev/null || true
 pkill -9 -P "$wrapper_pid" 2>/dev/null || true
 rm -rf "$d"

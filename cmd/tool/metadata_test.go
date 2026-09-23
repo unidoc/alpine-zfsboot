@@ -5,8 +5,10 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
@@ -120,6 +122,66 @@ func newBIOSMountpoint(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return mountpoint
+}
+
+// TestWriteMetadata_MissingVersionOrBuildStamp_RefusesToWrite is the
+// regression test for F8 (unidoc-alip's PR #5 review): metadata.Decode
+// requires version/buildstamp non-empty, but metadata.Encode validated
+// nothing, and this project's BIOS install/update path takes both
+// values from cmdline.ParseText, which does not require them either -
+// a custom --cmdline-file or a hand-edited CMDLINE missing either
+// field used to write a manifest that decoded fine at write time but
+// that every LATER verify rejected as malformed, with verify --repair
+// then refusing to touch it (since it EXISTS) - a stuck installation
+// with no clean way out. writeMetadata must now refuse to write such
+// a manifest at all, at the one point a caller can still do something
+// about it (roll back).
+func TestWriteMetadata_MissingVersionOrBuildStamp_RefusesToWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		version, buildStamp string
+	}{
+		{"missing_version", "", "20260923T150000Z"},
+		{"missing_buildstamp", "0.1.0", ""},
+		{"missing_both", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mountpoint := newBIOSMountpoint(t)
+			kernel := buildFakeKernelBytes("6.18.53-0-lts")
+			initrd := buildFakeInitrdBytes(t, "2.4.4-1")
+
+			err := writeMetadata(mountpoint, "aarch64", tc.version, tc.buildStamp, kernel, initrd)
+			if err == nil {
+				t.Fatal("writeMetadata with a missing version/buildstamp: want an error, got nil - this would write a manifest verify could never accept")
+			}
+			if _, statErr := os.Stat(filepath.Join(mountpoint, layout.MetadataFile)); !os.IsNotExist(statErr) {
+				t.Error("writeMetadata must not leave a manifest file behind when it refuses to write one")
+			}
+		})
+	}
+}
+
+// TestWritePayloadWithRollback_MissingVersionRollsBackWholeGeneration
+// proves the full end-to-end consequence of the same F8 fix: the real
+// install/update path (writePayloadWithRollback) must not silently
+// "succeed" (return nil) with a CMDLINE that omits version/buildstamp
+// - it must fail and roll the whole generation back, leaving nothing
+// on the ESP a later verify could ever find stuck.
+func TestWritePayloadWithRollback_MissingVersionRollsBackWholeGeneration(t *testing.T) {
+	mountpoint := newBIOSMountpoint(t)
+	kernel := buildFakeKernelBytes("6.18.53-0-lts")
+	initrd := buildFakeInitrdBytes(t, "2.4.4-1")
+	cmdlineTxt := []byte("root=ZFS=zroot/ROOT/default ro\n") // no alpine-zfsboot.version=/buildstamp=
+
+	err := writePayloadWithRollback(mountpoint, "aarch64", "", "", kernel, initrd, cmdlineTxt)
+	if err == nil {
+		t.Fatal("writePayloadWithRollback with no version/buildstamp: want an error, got nil")
+	}
+	for _, rel := range []string{layout.KernelFile, layout.InitrdFile, layout.CmdlineFile, layout.MetadataFile} {
+		if _, statErr := os.Stat(filepath.Join(mountpoint, rel)); !os.IsNotExist(statErr) {
+			t.Errorf("writePayloadWithRollback must roll back %s on a fresh install with no prior generation to restore - found it left behind", rel)
+		}
+	}
 }
 
 // TestWritePayloadWithRollback_WritesRealMetadata is the direct happy-path
@@ -445,6 +507,107 @@ func TestVerifyMetadata_PresentButUndecodable_NeverAutoRepaired(t *testing.T) {
 	}
 }
 
+// TestVerifyMetadata_DirectoryInPlaceOfMetadata_NeverFalsePasses is the
+// regression test for F7 (unidoc-alip's PR #5 review): tryReadMetadata
+// used to treat ANY os.ReadFile error - not just os.IsNotExist - as
+// "the manifest simply doesn't exist", which broke the property
+// verifyMetadata's own doc comment promises for --repair ("never
+// touches one that exists and disagrees"). A directory sitting where
+// METADATA should be a plain file is a real, concrete instance of
+// "exists but is not readable as a manifest" (os.ReadFile on a
+// directory fails with EISDIR, not ENOENT) - before the fix, this was
+// silently reported as no manifest at all: plain `verify` returned NO
+// errors (a false pass), and `verify --repair` would have happily
+// written a fresh manifest INTO that same path (os.WriteFile on an
+// existing directory also fails, so --repair should itself surface a
+// real error here too, not quietly "succeed").
+func TestVerifyMetadata_DirectoryInPlaceOfMetadata_NeverFalsePasses(t *testing.T) {
+	mountpoint := newBIOSMountpoint(t)
+	kernel := buildFakeKernelBytes("6.18.53-0-lts")
+	initrd := buildFakeInitrdBytes(t, "2.4.4-1")
+	mustWriteFile(t, mountpoint, layout.KernelFile, kernel)
+	mustWriteFile(t, mountpoint, layout.InitrdFile, initrd)
+	mustWriteFile(t, mountpoint, layout.CmdlineFile, []byte("root=ZFS=zroot/ROOT/default ro\n"))
+	if err := os.MkdirAll(filepath.Join(mountpoint, layout.MetadataFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tgt := &target{uefi: false, arch: "x86_64", mountpoint: mountpoint}
+
+	errs := verifyMetadata(tgt, false, false)
+	if len(errs) == 0 {
+		t.Fatal("verifyMetadata(repair=false) with a DIRECTORY at the metadata path: want an error (a real unreadable manifest), got a false pass")
+	}
+
+	errs = verifyMetadata(tgt, false, true)
+	if len(errs) == 0 {
+		t.Fatal("verifyMetadata(repair=true) with a DIRECTORY at the metadata path: want an error, got a silent (false) success")
+	}
+	info, statErr := os.Stat(filepath.Join(mountpoint, layout.MetadataFile))
+	if statErr != nil || !info.IsDir() {
+		t.Error("--repair must not have replaced the directory at the metadata path with a file - it should have hard-failed instead of 'repairing' something that exists but isn't readable")
+	}
+}
+
+// TestVerifyMetadata_UnreadableManifest_NeverAutoRepaired is the second
+// half of F7's regression coverage: an EXISTING manifest this process
+// cannot even READ (permissions, not corruption) must be treated the
+// same as "present but undecodable" - a hard failure, never silently
+// treated as missing-and-safe-to-regenerate. Skipped as root: root
+// ignores file permission bits entirely, so chmod 0000 would not
+// actually reproduce the unreadable condition this test depends on
+// (the same real gap F22, this same review, flagged in
+// internal/uefiboot's TestBackupPrevious_FailedNewBackupPreservesOldOne
+// - fixed there too, not just avoided here).
+func TestVerifyMetadata_UnreadableManifest_NeverAutoRepaired(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root - chmod 0000 does not make a file unreadable to root, so this test cannot reproduce the condition it exists to check")
+	}
+
+	mountpoint := newBIOSMountpoint(t)
+	kernel := buildFakeKernelBytes("6.18.53-0-lts")
+	initrd := buildFakeInitrdBytes(t, "2.4.4-1")
+	mustWriteFile(t, mountpoint, layout.KernelFile, kernel)
+	mustWriteFile(t, mountpoint, layout.InitrdFile, initrd)
+	mustWriteFile(t, mountpoint, layout.CmdlineFile, []byte("root=ZFS=zroot/ROOT/default ro\n"))
+	// A manifest whose hashes deliberately do NOT match kernel/initrd
+	// above - if this were readable, plain `verify` would correctly
+	// fail on it. The point of this test is that making it unreadable
+	// must not turn that real, existing mismatch into a silent pass.
+	badManifest := metadata.Encode(metadata.Manifest{
+		Version: "0.1.0", BuildStamp: "20260101T000000Z", Arch: "x86_64",
+		Kernel: "6.18.53-0-lts", OpenZFS: "2.4.4-1",
+		KernelSHA256: "0000000000000000000000000000000000000000000000000000000000000000",
+		InitrdSHA256: "1111111111111111111111111111111111111111111111111111111111111111",
+	})
+	metadataPath := filepath.Join(mountpoint, layout.MetadataFile)
+	mustWriteFile(t, mountpoint, layout.MetadataFile, badManifest)
+	if err := os.Chmod(metadataPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(metadataPath, 0o644) // let t.TempDir() clean up afterward
+
+	tgt := &target{uefi: false, arch: "x86_64", mountpoint: mountpoint}
+
+	if errs := verifyMetadata(tgt, false, false); len(errs) == 0 {
+		t.Fatal("verifyMetadata(repair=false) on an unreadable (chmod 0000) manifest: want an error, got a false pass")
+	}
+	if errs := verifyMetadata(tgt, false, true); len(errs) == 0 {
+		t.Fatal("verifyMetadata(repair=true) on an unreadable manifest: want an error (never auto-repaired), got a silent success")
+	}
+
+	if err := os.Chmod(metadataPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, badManifest) {
+		t.Error("--repair must not have overwritten a manifest it could not prove was actually missing - the original (mismatched) content should be untouched")
+	}
+}
+
 func mustWriteFile(t *testing.T, mountpoint, rel string, content []byte) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(mountpoint, rel), content, 0o644); err != nil {
@@ -466,6 +629,42 @@ func mustWriteFile(t *testing.T, mountpoint, rel string, content []byte) {
 // real ESP to find, and die() would os.Exit the test binary. What CAN
 // be pinned, and is the entire content of the bug, is the decision:
 // read-only for every verify mode EXCEPT --repair.
+// TestVerifyCmd_PartialKernelFileFlags_RejectedBeforeRun is the
+// regression test for F12 (unidoc-alip's PR #5 review): VerifyPayload
+// checks kernel/initrd/cmdline together as one unit, but nothing used
+// to enforce that at the CLI layer - `verify --kernel-file X` alone
+// used to silently compare nothing at all and still print "verify:
+// OK", even though the flag's own --help text already promised "needs
+// all three ... together". cmd.MarkFlagsRequiredTogether makes cobra
+// itself refuse to run the command at all when only some of the three
+// are given - this validation runs BEFORE the Run closure, so (unlike
+// most of this command's own behavior - see TestVerifyMountReadonly's
+// own comment on why THAT can't be exercised here) this is safe to
+// call directly: a bad flag combination never reaches Run at all,
+// never touches disk, never calls die()/os.Exit.
+func TestVerifyCmd_PartialKernelFileFlags_RejectedBeforeRun(t *testing.T) {
+	for _, args := range [][]string{
+		{"--kernel-file", "/tmp/x"},
+		{"--initrd-file", "/tmp/x"},
+		{"--cmdline-file", "/tmp/x"},
+		{"--kernel-file", "/tmp/x", "--initrd-file", "/tmp/x"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			cmd := newVerifyCmd()
+			cmd.SetArgs(args)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatalf("verify %v: want a rejection before Run ever executes, got nil (this would have silently compared nothing and still printed verify: OK)", args)
+			}
+			if !strings.Contains(err.Error(), "kernel-file") {
+				t.Errorf("error = %q, want it to mention the flag group", err.Error())
+			}
+		})
+	}
+}
+
 func TestVerifyMountReadonly(t *testing.T) {
 	if got := verifyMountReadonly(false); got != true {
 		t.Errorf("verifyMountReadonly(repair=false) = %v, want true - plain verify must never mount the ESP writable", got)

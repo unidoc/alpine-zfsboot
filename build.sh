@@ -179,7 +179,19 @@ cd "$BUILD_DIR"
 KVER="$(apk info -L "linux-$KERNEL_FLAVOR" 2>/dev/null | sed -n 's#^\(usr/\)\{0,1\}lib/modules/\([^/]*\)/.*#\2#p' | sort -u)"
 case "$(printf '%s\n' "$KVER" | wc -l)" in
     1) [ -n "$KVER" ] || { echo "linux-$KERNEL_FLAVOR is not installed (apk info -L returned nothing under lib/modules/ or usr/lib/modules/)" >&2; exit 1; } ;;
-    *) echo "linux-$KERNEL_FLAVOR's own file list names more than one /lib/modules/<kver> directory - can't pick one deterministically: $(printf '%s ' $KVER)" >&2; exit 1 ;;
+    # F19 (unidoc-alip's PR #5 review): $KVER quoted here now, rather
+    # than silenced via a disable comment the way the other five real
+    # instances of this same deliberate pattern are elsewhere in this
+    # repo - a linter's own per-line disable comments are only valid
+    # in front of a complete command (confirmed directly: placed on a
+    # single case branch like this one, this linter fails to parse the
+    # branch at all), so quoting was simpler here than restructuring
+    # around that placement rule. $KVER can hold more than one
+    # newline-separated entry (sort -u, above) when this branch runs;
+    # printf '%s\n' with it quoted still prints every one of them, one
+    # per line - real, readable output, just not the same space-joined
+    # single-line shape the old unquoted word-split produced.
+    *) { echo "linux-$KERNEL_FLAVOR's own file list names more than one /lib/modules/<kver> directory - can't pick one deterministically:"; printf '%s\n' "$KVER"; } >&2; exit 1 ;;
 esac
 [ -d "/lib/modules/$KVER" ] || { echo "linux-$KERNEL_FLAVOR claims kernel version $KVER but /lib/modules/$KVER does not exist" >&2; exit 1; }
 KERNEL="/boot/vmlinuz-$KERNEL_FLAVOR"
@@ -1281,7 +1293,7 @@ add_section .initrd initramfs.img 0x3000000
 add_section .linux "$KERNEL" 0x2000000
 
 OUT_FILE="$OUT_DIR/alpine-zfsboot-${ARCH}.EFI"
-# shellcheck disable=SC2086 - objcopy_args is a deliberately unquoted
+# shellcheck disable=SC2086 # objcopy_args is a deliberately unquoted
 # word-split argument list, built up above for exactly this purpose.
 objcopy $objcopy_args "$STUB" "$OUT_FILE"
 

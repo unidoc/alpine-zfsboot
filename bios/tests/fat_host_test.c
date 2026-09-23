@@ -505,6 +505,59 @@ static void test_high_cluster(const char *dir)
 	free(content_ref);
 }
 
+/*
+ * Regression test for F1 (unidoc-alip's PR #5 review): fat_chain_advance()
+ * used to bound chain walks against a fixed FAT_MAX_CHAIN_CLUSTERS=65536,
+ * on the wrong assumption that no real file on a real iso.sh-built
+ * FAT32 volume would ever need a longer chain - dosfstools 4.2
+ * actually chooses 512-byte clusters up to 260MB volumes, so a real
+ * production initrd needed a chain well past that fixed cap and got
+ * rejected exactly as if it were corrupt or cyclic. long_chain.img's
+ * KERNEL is 67584 clusters (just over 33MiB at this fixture's own
+ * spc=1) - comfortably past the OLD fixed cap, comfortably within the
+ * real fix (bounded against vol->total_clusters instead).
+ *
+ * Reads only the LAST 512 bytes, not the whole ~33MB file: g_phys
+ * (this harness's stand-in for physical memory) is a fixed
+ * PHYS_MEM_SIZE=16MB buffer, well under this fixture's own size. A
+ * tail read still forces fat_read_range() to walk the ENTIRE chain
+ * first (it skips skip_clusters = offset/cluster_bytes clusters via
+ * fat_chain_advance() BEFORE reading anything - see that function's
+ * own code), so this is real, complete proof the whole 67584-cluster
+ * chain was traversed, not a shortcut that only exercises part of it.
+ */
+static void test_long_chain(const char *dir)
+{
+	char path[512];
+	struct fat_volume vol;
+	struct fat_file f;
+	long content_len;
+	uint8_t *content_ref;
+	uint32_t dst_phys = 0;
+	const uint32_t tail_len = 512;
+
+	snprintf(path, sizeof(path), "%s/long_chain.img", dir);
+	set_disk(path);
+	snprintf(path, sizeof(path), "%s/long_chain.kernel", dir);
+	content_ref = load_file(path, &content_len);
+
+	CHECK(fat_mount(&vol, 0, disk_sectors()) == 0, "fat_mount succeeds on the long-chain image");
+	CHECK(fat_open(&vol, "/EFI/ALPINE/KERNEL", &f) == 0, "fat_open finds the long-chain entry");
+	CHECK((long)f.size == content_len, "long-chain entry's size matches (%lu == %ld)", (unsigned long)f.size, content_len);
+	CHECK(f.size > 65536u * 512u,
+	      "the opened entry (%lu bytes) is actually past the OLD fixed 65536-cluster/32MiB cap - a fixture-generator bug here would make this test vacuous",
+	      (unsigned long)f.size);
+
+	memset(g_phys, 0xAA, tail_len);
+	CHECK(fat_read_range(&vol, &f, f.size - tail_len, tail_len, dst_phys, 0, 0) == 0,
+	      "fat_read_range succeeds reading the LAST %u bytes of a 67584-cluster chain - proves the walk to reach them (67583 hops) was not rejected by the chain-length bound",
+	      tail_len);
+	CHECK(memcmp(g_phys, content_ref + content_len - tail_len, tail_len) == 0,
+	      "long-chain file's own tail content matches byte-for-byte - the walk landed on the real, correct final cluster, not just returned success");
+
+	free(content_ref);
+}
+
 static void test_negative_images(const char *dir)
 {
 	char path[512];
@@ -592,6 +645,26 @@ static void test_negative_images(const char *dir)
 	CHECK(fat_mount(&vol, 0, disk_sectors()) != 0,
 	      "fat_mount rejects a self-consistent BPB whose claimed total_sectors_32 exceeds the real partition size");
 
+	/*
+	 * Regression test for F10 (unidoc-alip's PR #5 review): a THIRD,
+	 * independent gap in the same general area as bad_geometry.img/
+	 * oversized_bpb_vs_partition.img above, but a real integer-overflow
+	 * bug, not a missing cross-check. fat_size_overflow.img sets
+	 * fat_size_32 to (the real value + 0x80000000) with num_fats=2 -
+	 * `num_fats * fat_size` wraps uint32 arithmetic back to 2x the
+	 * REAL fat_size, so the OLD "reserved_plus_fats >= total_sectors"
+	 * underflow guard (itself computed entirely in uint32) saw the
+	 * SAME small, plausible-looking wrapped value a genuine BPB would
+	 * produce and let it through - while data_start_lba (computed in
+	 * uint64_t, further down in fat_mount()) used the REAL,
+	 * non-wrapped fat_size, landing the actual data region far past
+	 * where the wrapped check thought it was.
+	 */
+	snprintf(path, sizeof(path), "%s/fat_size_overflow.img", dir);
+	set_disk(path);
+	CHECK(fat_mount(&vol, 0, disk_sectors()) != 0,
+	      "fat_mount rejects a fat_size_32 crafted so num_fats*fat_size overflows uint32 and wraps back to a plausible value");
+
 	snprintf(path, sizeof(path), "%s/truncated_chain.img", dir);
 	set_disk(path);
 	CHECK(fat_mount(&vol, 0, disk_sectors()) == 0, "fat_mount still succeeds on a volume with one corrupt file chain (mount itself is fine)");
@@ -638,6 +711,7 @@ int main(int argc, char **argv)
 	test_batching(dir);
 	test_fat_table_cache(dir);
 	test_high_cluster(dir);
+	test_long_chain(dir);
 	test_negative_images(dir);
 
 	free(g_disk);

@@ -153,11 +153,25 @@
  * Each step is exactly 2048 bytes (NATIVE_SECTOR_SIZE), as expected -
  * g_native_buf is by far this build's largest single .bss consumer.
  * 9 is the new deliberate choice: 5382 bytes of margin in THIS
- * toolchain is enough headroom that even the ~1.3KB toolchain swing
- * just observed firsthand (not a hypothetical) leaves comfortably
- * more than the original ~4.4KB design intent behind 11 used to
- * provide, without guessing at how much bigger some future toolchain
- * might run. Costs a real, modest thing in return: the ATAPI-fallback
+ * (sandbox) toolchain is enough headroom that even the ~1.3KB
+ * toolchain swing just observed firsthand (not a hypothetical) leaves
+ * comfortably more than the original ~4.4KB design intent behind 11
+ * used to provide, without guessing at how much bigger some future
+ * toolchain might run.
+ *
+ * UPDATE (F22, unidoc-alip's PR #5 review): re-measured against the
+ * REAL Alpine gcc 15.2.0 CI toolchain this project actually ships
+ * with (not this sandbox's own Debian cross-compiler, the toolchain
+ * every number in the table above was built with) - _bss_end there is
+ * 0xe80a, 4070 bytes of margin at NATIVE_BATCH=9. Still real, still
+ * comfortable headroom (over the ~4.4KB original design intent behind
+ * NATIVE_BATCH=11, and nowhere near check-bss-bounds's own limit) -
+ * just a third real data point (sandbox gcc: 5382B, Alpine gcc
+ * 15.2.0: 4070B) worth keeping alongside the table above rather than
+ * letting it silently stand in as if it were the number that matters
+ * for the toolchain real builds actually use.
+ *
+ * Costs a real, modest thing in return: the ATAPI-fallback
  * native-sector backend (cdrom_disk.c's own atapi_read_native() path
  * - only ever used when a BIOS lacks working INT13h extensions on
  * optical media, see this file's own int13_extensions_present()) now
@@ -249,7 +263,21 @@ static int int13_read_native(uint32_t native_lba, uint16_t native_count, void *b
 	dap.buffer_segment = ds_seg;
 	dap.start_lba = native_lba;
 
-	/* See disk.c's own identical comment for the "memory" clobber. */
+	/* See disk.c's own identical comment for the "memory" clobber, and
+	 * e820.c's own comment for why "ebp" (F18, unidoc-alip's PR #5
+	 * review - the same real hardware finding console.c's own
+	 * console_putc() and e820.c's own INT 0x15 call already carry a
+	 * clobber for: a BIOS's own interrupt handler is free to use, and
+	 * not restore, EBP internally, a plain GPR here under
+	 * -fomit-frame-pointer). "esi" is deliberately NOT also added -
+	 * unlike e820.c's case, this asm already explicitly preserves it
+	 * itself (push/pop around the call), a stronger guarantee than a
+	 * clobber would add (the real original value survives, not just
+	 * "GCC no longer trusts it"). Confirmed to compile cleanly at this
+	 * file's own real -O2 build flags and boot for real under QEMU
+	 * (tests/bios-iso-entry-test.sh, both the plain INT13h and forced-
+	 * ATAPI paths, and tests/bios-hdd-entry-test.sh for disk.c's own
+	 * identical fix) - not just reasoned about. */
 	__asm__ __volatile__(
 		"push %%si\n\t"
 		"mov %1, %%si\n\t"
@@ -259,7 +287,7 @@ static int int13_read_native(uint32_t native_lba, uint16_t native_count, void *b
 		"pop %%si\n\t"
 		: "=q"(failed)
 		: "r"(dap_off), "d"(g_drive_number)
-		: "ah", "cc", "memory"
+		: "ah", "ebp", "cc", "memory"
 	);
 
 	if (failed)
@@ -286,6 +314,35 @@ static int int13_read_native(uint32_t native_lba, uint16_t native_count, void *b
  * check reported. disk_init() below treats this as a cheap first
  * filter only, always followed by one real, functional test read
  * before trusting this backend for the whole rest of the boot.
+ *
+ * Known, accepted limitation (F18, unidoc-alip's PR #5 review): this
+ * asm passes g_drive_number in via a plain "d" (DX) input constraint,
+ * and AH=0x41's own real BIOS return convention can leave DH holding
+ * data this code never reads - a bare input operand doesn't tell GCC
+ * DX's contents are redefined afterward, so in principle some OTHER
+ * live value the compiler happened to also be keeping in DX around
+ * this call could be silently corrupted, the same class of finding
+ * that got "ebp" added to this file's own int13_read_native() above
+ * and to e820.c's INT 0x15 call. Unlike those two, this one could NOT
+ * be closed the same way: this function's other three outputs already
+ * pin BX ("=b"), CX ("=c"), and DX itself would need a real "+d"
+ * capture operand to tell GCC its value is destroyed - confirmed
+ * empirically, not just reasoned, that adding either "dx" to the
+ * clobber list (invalid - a register can't be both a constraint
+ * operand and a clobber) or a "+d" scratch capture operand both fail
+ * this file's own real -O2 build with "asm operand has impossible
+ * constraints or there are not enough registers", the identical
+ * register-exhaustion failure e820.c's own comment already documents
+ * for its unrelated "edi" case - this function's tightly-packed
+ * 4-operand set (carry/bx/cx/dx) genuinely has no register budget left
+ * for a fifth. In practice: g_drive_number is a plain uint8_t global,
+ * reloaded from memory wherever it's next used rather than kept live
+ * in a register across this call, so the actual corruption window this
+ * leaves open is narrow (the compiler would have to independently
+ * choose to cache some OTHER unrelated value in DX spanning this exact
+ * asm statement) - not proven impossible, but real testing (this
+ * file's own build, both real QEMU boot paths) shows no evidence of it
+ * actually happening with this compiler/flags today.
  */
 static int int13_extensions_present(void)
 {

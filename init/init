@@ -388,6 +388,17 @@ ALPINE_ZFSBOOT_SSH_ALLOW=""
 ALPINE_ZFSBOOT_BOOTCHECK=""
 ALPINE_ZFSBOOT_BOOTCHECK_MAX=""
 ALPINE_ZFSBOOT_PANIC_TIMEOUT=""
+# ESP device found during discovery further down - empty by default,
+# not just left undeclared (F22, unidoc-alip's PR #5 review): this is
+# only ever export'd once exactly one ESP candidate qualifies, so on
+# any OTHER machine (zero or more than one candidate - refused-to-
+# guess is a real, supported outcome, not just a startup-order
+# accident) it's never set at all, and read_fat_console_pref()'s own
+# `[ -n "$ALPINE_ZFSBOOT_ESP_DEV" ]` check - which already correctly
+# treats "empty" as "nothing to do, return" - hit a hard "parameter
+# not set" abort under this file's own `set -u` instead, on every
+# select_console() call on such a machine.
+ALPINE_ZFSBOOT_ESP_DEV=""
 # Persisted console choice (see select_console()'s own comment for the
 # full mechanism) - empty means "no persisted preference", not "tty0
 # specifically"; select_console()'s own kernel-reported default still

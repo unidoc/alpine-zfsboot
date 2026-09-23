@@ -226,6 +226,114 @@ func TestParseExistingMount_SymlinkForm(t *testing.T) {
 	}
 }
 
+// --- VerifyESPMounted / parseMountAtPath / checkMountInfo (F17, unidoc-alip's PR #5 review) ---
+
+func TestParseMountAtPath(t *testing.T) {
+	mounts := `/dev/sdb1 /mnt/alpine/boot/efi vfat rw,noatime 0 0
+zroot/ROOT/alpine / zfs rw,relatime 0 0
+`
+	dev, fstype, ok := parseMountAtPath(mounts, "/mnt/alpine/boot/efi")
+	if !ok || dev != "/dev/sdb1" || fstype != "vfat" {
+		t.Errorf("dev=%q fstype=%q ok=%v, want /dev/sdb1 vfat true", dev, fstype, ok)
+	}
+}
+
+func TestParseMountAtPath_NotMounted(t *testing.T) {
+	mounts := `/dev/sda1 / ext4 rw,relatime 0 0
+`
+	_, _, ok := parseMountAtPath(mounts, "/mnt/alpine/boot/efi")
+	if ok {
+		t.Fatal("expected /mnt/alpine/boot/efi to be reported as not mounted")
+	}
+}
+
+// TestParseMountAtPath_LaterMountWins proves a path mounted over more
+// than once in the same mount table (a real, if unusual, sequence -
+// mount, unmount, mount something else there) resolves to the LAST
+// entry, matching what's actually visible through that path right
+// now - not the first, stale one.
+func TestParseMountAtPath_LaterMountWins(t *testing.T) {
+	mounts := `/dev/sdb1 /mnt/alpine/boot/efi ext4 rw 0 0
+/dev/sdc1 /mnt/alpine/boot/efi vfat rw 0 0
+`
+	dev, fstype, ok := parseMountAtPath(mounts, "/mnt/alpine/boot/efi")
+	if !ok || dev != "/dev/sdc1" || fstype != "vfat" {
+		t.Errorf("dev=%q fstype=%q ok=%v, want the LATER entry /dev/sdc1 vfat true", dev, fstype, ok)
+	}
+}
+
+func identityResolve(p string) string { return p }
+
+func TestCheckMountInfo_NotMounted(t *testing.T) {
+	err := checkMountInfo("/mnt/alpine/boot/efi", "", "", false, "", identityResolve)
+	if err == nil {
+		t.Fatal("want an error when nothing is mounted at the ESP path, got nil")
+	}
+}
+
+func TestCheckMountInfo_WrongFilesystem(t *testing.T) {
+	err := checkMountInfo("/mnt/alpine/boot/efi", "/dev/sdb1", "ext4", true, "", identityResolve)
+	if err == nil {
+		t.Fatal("want an error for a mounted-but-not-vfat filesystem, got nil")
+	}
+}
+
+func TestCheckMountInfo_UEFI_NoDiskArgNeeded(t *testing.T) {
+	// diskArg="" (UEFI's own call shape - it owns no separate disk
+	// argument) - a valid vfat mount must pass with no disk comparison
+	// attempted at all.
+	if err := checkMountInfo("/mnt/alpine/boot/efi", "/dev/sdb1", "vfat", true, "", identityResolve); err != nil {
+		t.Errorf("want nil for a valid vfat mount with no disk to compare against, got: %v", err)
+	}
+}
+
+func TestCheckMountInfo_BIOS_DiskMatches(t *testing.T) {
+	resolve := func(p string) string {
+		if p == "/dev/sda" {
+			return "/dev/sda" // DevicePartitionBase("/dev/sda1") -> "/dev/sda" already
+		}
+		return p
+	}
+	if err := checkMountInfo("/mnt/alpine/boot/efi", "/dev/sda1", "vfat", true, "/dev/sda", resolve); err != nil {
+		t.Errorf("want nil when the ESP's own parent disk matches diskArg, got: %v", err)
+	}
+}
+
+// TestCheckMountInfo_BIOS_DiskMismatch is the direct regression test
+// for F17's own core scenario: stage1/stage2 are about to be written
+// to <disk>, but the mounted ESP is actually on a DIFFERENT disk -
+// must be refused, not silently written to two different disks.
+func TestCheckMountInfo_BIOS_DiskMismatch(t *testing.T) {
+	err := checkMountInfo("/mnt/alpine/boot/efi", "/dev/sdb1", "vfat", true, "/dev/sda", identityResolve)
+	if err == nil {
+		t.Fatal("want an error when the mounted ESP's own disk (sdb) does not match the disk argument (sda), got nil")
+	}
+}
+
+// TestCheckMountInfo_BIOS_DiskMatchesViaSymlink proves the comparison
+// is symlink-aware on BOTH sides (an operator passing /dev/disk/by-id/
+// ...-part1's own whole-disk equivalent, or the kernel reporting a
+// symlinked path in /proc/self/mounts) - matching parseExistingMount's
+// own established symlink-resolution behavior, not a literal-string-
+// only comparison that would reject a legitimate match.
+func TestCheckMountInfo_BIOS_DiskMatchesViaSymlink(t *testing.T) {
+	resolve := func(p string) string {
+		aliases := map[string]string{
+			"/dev/disk/by-id/nvme-Model_serial": "/dev/nvme0n1",
+			"/dev/nvme0n1":                      "/dev/nvme0n1",
+		}
+		if real, ok := aliases[p]; ok {
+			return real
+		}
+		return p
+	}
+	err := checkMountInfo("/mnt/alpine/boot/efi", "/dev/nvme0n1p1", "vfat", true,
+		"/dev/disk/by-id/nvme-Model_serial", resolve)
+	if err != nil {
+		t.Errorf("want nil when both sides resolve to the same real disk via symlink, got: %v", err)
+	}
+}
+
 func TestSelectESP(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -372,6 +480,13 @@ func TestDevicePartitionBase(t *testing.T) {
 		"/dev/mmcblk0p1":  "/dev/mmcblk0",
 		"/dev/loop0p1":    "/dev/loop0",
 		"/dev/sda":        "/dev/sda", // no partition suffix at all - returned unchanged
+		// F22 (unidoc-alip's PR #5 review): these two are already
+		// WHOLE-DISK names (no "p<N>" partition suffix) - the real bug
+		// this regression-tests would have stripped them to "nvme0n"/
+		// "mmcblk" instead of leaving them unchanged, since their own
+		// whole-disk name already ends in a digit.
+		"/dev/nvme0n1": "/dev/nvme0n1",
+		"/dev/mmcblk0": "/dev/mmcblk0",
 	}
 	for in, want := range cases {
 		if got := DevicePartitionBase(in); got != want {

@@ -47,7 +47,22 @@ LIB_DIR="$(cd "$_dir" && pwd)"
 # action - mid-prompt used to leave the operator's plaintext passphrase
 # sitting in one of two mktemp files in tmpfs for the rest of the
 # rescue session, with nothing here to ever clean it up.
-trap _zfs_unlock_cleanup_tempfiles EXIT INT TERM HUP
+#
+# EXIT alone, not EXIT INT TERM HUP together (F3-equivalent gap in
+# this file, found the same way unidoc-alip's PR #5 review found it in
+# boot-dataset.sh): a single trap command for a signal doesn't
+# terminate a POSIX sh script on its own - it runs the handler and then
+# RESUMES right after it, so a signal here used to clean up the
+# plaintext-passphrase temp files and then carry on straight into
+# zfs_unlock()/zfs_lock() as if nothing happened, instead of actually
+# stopping. Unlike boot-dataset.sh, this file is never PID 1 (menu.py
+# always shells out to it as a real subprocess - see this file's own
+# header comment), so there is no PID-1-must-never-exit case to guard
+# here at all: every invocation can safely terminate for real.
+trap _zfs_unlock_cleanup_tempfiles EXIT
+trap '_zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 129' HUP
+trap '_zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 130' INT
+trap '_zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 143' TERM
 
 case "$ACTION" in
     unlock) zfs_unlock "$ENCRYPTIONROOT" ;;

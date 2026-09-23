@@ -277,6 +277,104 @@ func findExistingMount(dev string) (mountpoint string, rw bool, ok bool) {
 	return parseExistingMount(string(data), dev, filepath.EvalSymlinks)
 }
 
+// parseMountAtPath is FindMountAtPath's own pure parsing logic (same
+// split-for-testability idiom as parseExistingMount above) - the
+// REVERSE lookup direction: given a mountpoint PATH, what device and
+// fstype is actually mounted there right now. Scans every line rather
+// than stopping at the first match: /proc/self/mounts lists mounts in
+// chronological order, and a path can legitimately be mounted over
+// more than once in a process's lifetime (mount, unmount, mount
+// something else there) - only the LAST entry for a given mountpoint
+// is what's actually visible through that path right now.
+func parseMountAtPath(mountsContent, mountpoint string) (dev, fstype string, ok bool) {
+	for _, line := range strings.Split(mountsContent, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		if unescapeMountField(fields[1]) == mountpoint {
+			dev, fstype, ok = unescapeMountField(fields[0]), fields[2], true
+		}
+	}
+	return dev, fstype, ok
+}
+
+// FindMountAtPath reports what device and fstype are mounted at
+// mountpoint right now, per /proc/self/mounts - the reverse of
+// findExistingMount's own device -> mountpoint direction.
+func FindMountAtPath(mountpoint string) (dev, fstype string, ok bool) {
+	data, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return "", "", false
+	}
+	return parseMountAtPath(string(data), mountpoint)
+}
+
+// VerifyESPMounted is install's own preflight (F17, unidoc-alip's PR
+// #5 review): confirms mountpoint (--root/boot/efi) is a genuinely
+// mounted vfat filesystem before a single byte gets written there.
+// Without this, three real failure modes install could not previously
+// distinguish from success:
+//   - --root/boot/efi was never actually mounted at all (a caller
+//     forgot the mount step, or it silently failed earlier) - the
+//     payload write would land inside the plain TARGET ROOTFS
+//     directory tree instead, and espconfig.VerifyPayload's own later
+//     byte-for-byte check would just compare that write against
+//     itself, reporting "verified byte-for-byte" with no real ESP
+//     behind it at all.
+//   - --root/boot/efi is mounted, but as something other than vfat (a
+//     stale bind mount, an empty tmpfs placeholder) - same silent-
+//     success risk.
+//   - BIOS only: the mounted ESP's own parent disk does not match the
+//     <disk> argument install was given - stage1/stage2 land on disk
+//     A, the FAT payload on disk B's ESP, two disks now holding half
+//     of one inconsistent boot chain.
+//
+// diskArg is the disk BIOS install is about to write stage1/stage2
+// onto - pass "" for UEFI (which owns no separate disk argument of
+// its own - install already never uses one there; that mismatch has
+// no corresponding check to add here, since there is no second disk
+// argument to compare against in the first place).
+func VerifyESPMounted(mountpoint, diskArg string) error {
+	dev, fstype, ok := FindMountAtPath(mountpoint)
+	return checkMountInfo(mountpoint, dev, fstype, ok, diskArg, resolveSymlinkOrSelf)
+}
+
+// checkMountInfo is VerifyESPMounted's own pure decision logic, split
+// out (same idiom as parseExistingMount vs. findExistingMount above)
+// so it has its own test independent of a real /proc/self/mounts or
+// real symlinked device paths - resolveSymlink is injected for the
+// same reason.
+func checkMountInfo(mountpoint, dev, fstype string, found bool, diskArg string, resolveSymlink func(string) string) error {
+	if !found {
+		return fmt.Errorf("%s is not a mounted filesystem at all - refusing to write the boot payload into a plain directory (mount the FAT/ESP filesystem there first)", mountpoint)
+	}
+	if fstype != "vfat" {
+		return fmt.Errorf("%s is mounted, but as %q, not vfat - refusing to write the boot payload onto the wrong filesystem", mountpoint, fstype)
+	}
+	if diskArg == "" {
+		return nil
+	}
+	gotDisk := resolveSymlink(DevicePartitionBase(dev))
+	wantDisk := resolveSymlink(diskArg)
+	if gotDisk != wantDisk {
+		return fmt.Errorf("%s's own filesystem (%s, on disk %s) does not match the disk argument (%s) - stage1/stage2 and the boot payload would land on two different disks", mountpoint, dev, gotDisk, wantDisk)
+	}
+	return nil
+}
+
+// resolveSymlinkOrSelf resolves p via filepath.EvalSymlinks, falling
+// back to p itself on any error (p doesn't exist, isn't a symlink,
+// or - in a test fixture - simply isn't a real path at all) - same
+// best-effort-resolution idiom parseExistingMount's own resolveSymlink
+// parameter already uses.
+func resolveSymlinkOrSelf(p string) string {
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	return p
+}
+
 // MountESP mounts dev at a private, temporary mountpoint (same
 // pattern as init/init's own /tmp/esp-config and menu.py's
 // /tmp/esp-console-pref - never assumes the target OS's own fstab
@@ -513,6 +611,17 @@ func DetectDiskLayout(disk string) (DiskLayout, error) {
 var (
 	partitionSuffixP     = regexp.MustCompile(`^(.*\d)p(\d+)$`)
 	partitionSuffixPlain = regexp.MustCompile(`^(.*[a-zA-Z])(\d+)$`)
+	// nvmeOrMMCWholeDisk matches an nvme namespace or mmcblk WHOLE-DISK
+	// name that itself ends in a digit (nvme0n1, mmcblk0) - see
+	// DevicePartitionBase's own comment on the real, confirmed bug
+	// this guards: partitionSuffixPlain's "any trailing digit is a
+	// partition number" heuristic is correct for sda/vda-style names
+	// (whole disk never ends in a digit there), but WRONG for these
+	// two device classes, whose own whole-disk name already ends in a
+	// digit by convention - a real partition of either always adds an
+	// explicit "p<N>" (matched by partitionSuffixP above, tried
+	// first), never a bare digit.
+	nvmeOrMMCWholeDisk = regexp.MustCompile(`(nvme\d+n\d+|mmcblk\d+)$`)
 )
 
 // DevicePartitionBase returns the whole-disk device path for a
@@ -526,9 +635,22 @@ var (
 // something bootenv queries the kernel for, since a partition's own
 // device NAME already encodes this deterministically on Linux; no
 // case here should ever fail for a real blkid-reported device path.
+//
+// A real gap a follow-up review found (F22, unidoc-alip's PR #5
+// review): called on an ALREADY-whole-disk nvme/mmcblk name (no "p<N>"
+// partition suffix at all - "/dev/nvme0n1", "/dev/mmcblk0"),
+// partitionSuffixPlain's own generic "trailing digit = partition
+// number" fallback used to match anyway (nvme0n1 -> nvme0n,
+// mmcblk0 -> mmcblk) - wrong, and silently so, since nothing about
+// that shape signals an error on its own. nvmeOrMMCWholeDisk, checked
+// BEFORE falling through to that generic heuristic, recognizes this
+// specific shape and returns it unchanged instead.
 func DevicePartitionBase(part string) string {
 	if m := partitionSuffixP.FindStringSubmatch(part); m != nil {
 		return m[1]
+	}
+	if nvmeOrMMCWholeDisk.MatchString(part) {
+		return part
 	}
 	if m := partitionSuffixPlain.FindStringSubmatch(part); m != nil {
 		return m[1]

@@ -314,6 +314,57 @@ def build_high_cluster(content):
     return img, kernel_first
 
 
+def build_long_chain(content):
+    """A dedicated image whose KERNEL file's own FAT chain is longer
+    than the OLD fixed FAT_MAX_CHAIN_CLUSTERS=65536 ceiling fat.c used
+    to enforce - the regression fixture for a real, release-blocking
+    gap unidoc-alip's PR #5 review found (finding F1). That old
+    ceiling's own comment claimed 65536 clusters was "well past
+    anything mkfs.vfat -F32 would ever actually choose" - wrong:
+    dosfstools 4.2 chooses 512-byte (sectors-per-cluster=1, this
+    module's own SECTORS_PER_CLUSTER) clusters for ANY FAT32 volume up
+    to 260MB, and this project's own iso.sh sizes its FAT32 volume
+    directly from the real kernel+initrd+cmdline+efi payload - so a
+    real production initrd (tens of MB) at spc=1 needs a chain well
+    past 65536 clusters, and the old fixed cap rejected it exactly as
+    if it were corrupt or cyclic. This fixture is at this module's own
+    spc=1 (the same cluster size dosfstools actually chooses at these
+    volume sizes) with a KERNEL chain of about 67584 clusters - a file
+    just over 33MiB, comfortably past the old 65536-cluster/32MiB
+    ceiling and comfortably within this module's own DATA_CLUSTERS=
+    70000 budget.
+    """
+    img = Image()
+    img.write_bpb()
+
+    kernel_first, kernel_clusters = img.alloc_chain_contiguous(len(content))
+    assert len(kernel_clusters) > 65536, \
+        "fixture generator itself must build a chain longer than the old fixed cap this regression-tests"
+    img._write_file_clusters(content, kernel_first, kernel_clusters)
+    kernel_size = len(content)
+
+    alpine_cluster = img.next_free_cluster
+    img.next_free_cluster += 1
+    img.set_fat_entry(alpine_cluster, EOC)
+    img.write_dir(alpine_cluster, [
+        (img.pack_name("KERNEL"), 0, kernel_first, kernel_size),
+    ])
+
+    efi_cluster = img.next_free_cluster
+    img.next_free_cluster += 1
+    img.set_fat_entry(efi_cluster, EOC)
+    img.write_dir(efi_cluster, [
+        (img.pack_name("ALPINE"), ATTR_DIR, alpine_cluster, 0),
+    ])
+
+    img.set_fat_entry(ROOT_CLUSTER, EOC)
+    img.write_dir(ROOT_CLUSTER, [
+        (img.pack_name("EFI"), ATTR_DIR, efi_cluster, 0),
+    ])
+
+    return img, kernel_first
+
+
 def build_mid_chain_truncated(kernel_content, initrd_content, cmdline_content):
     """Like build_base(), but truncates the KERNEL chain to EOC at a
     cluster in the MIDDLE of its chain, not the first one - a real
@@ -506,6 +557,21 @@ def main():
     with open(os.path.join(outdir, "high_cluster.kernel"), "wb") as f:
         f.write(high_cluster_content)
 
+    # long_chain.img - a KERNEL chain of 67584 clusters (just over
+    # 33MiB at this module's own spc=1) - see build_long_chain()'s own
+    # docstring for why this exact shape (F1, unidoc-alip PR #5
+    # review). A fast repeating-but-position-dependent pattern
+    # (bytearray comprehension, not the slower generator-expression
+    # style the smaller fixtures above use) - this content is ~33MB,
+    # nearly 9x the next-largest fixture in this file, and needs to
+    # generate quickly enough to stay a normal part of a test run.
+    long_chain_clusters = 67584
+    long_chain_content = bytes(bytearray((i * 7 + 3) & 0xff for i in range(long_chain_clusters * 512)))
+    img_long, _ = build_long_chain(long_chain_content)
+    img_long.save(os.path.join(outdir, "long_chain.img"))
+    with open(os.path.join(outdir, "long_chain.kernel"), "wb") as f:
+        f.write(long_chain_content)
+
     img2, _ = build_base(kernel_content, initrd_content, cmdline_content)
     img2.data[510] = 0x00
     img2.data[511] = 0x00
@@ -608,6 +674,24 @@ def main():
     assert len(img9.data) == TOTAL_SECTORS * SECTOR, \
         "oversized_bpb_vs_partition.img's own real file size must stay unchanged - only the BPB's claim grows"
     img9.save(os.path.join(outdir, "oversized_bpb_vs_partition.img"))
+
+    # fat_size_overflow.img - F10 (unidoc-alip's PR #5 review): fat_size_32
+    # inflated by exactly 0x80000000 so that NUM_FATS(2) * fat_size_32
+    # overflows uint32 and wraps back to 2 * the REAL fat_size - the
+    # OLD reserved_plus_fats check (all 32-bit arithmetic) computed
+    # this same wrapped value and saw nothing wrong, while
+    # data_start_lba (computed in 64-bit, further down in fat_mount())
+    # used the REAL, non-wrapped product - landing the data region far
+    # past where the wrapped check thought it was. total_sectors_32
+    # and everything else about this image stay exactly as build_base()
+    # already set them - only fat_size_32 changes, the one field this
+    # check is supposed to catch a lie in.
+    img_fat_overflow, _ = build_base(kernel_content, initrd_content, cmdline_content)
+    evil_fat_size = FAT_SIZE_SECTORS + 0x80000000
+    assert (NUM_FATS * evil_fat_size) % (1 << 32) == NUM_FATS * FAT_SIZE_SECTORS, \
+        "fixture generator's own overflow arithmetic must actually wrap the way the real bug does"
+    struct.pack_into("<I", img_fat_overflow.data, 36, evil_fat_size)
+    img_fat_overflow.save(os.path.join(outdir, "fat_size_overflow.img"))
 
     print("fixtures written to", outdir)
 

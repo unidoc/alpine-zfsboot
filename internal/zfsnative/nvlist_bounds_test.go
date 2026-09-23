@@ -12,7 +12,7 @@
 // checkElemCount's call sites) confirmed the exact predicted failure mode:
 // not a clean test failure, but a genuine unrecovered panic
 // ("slice bounds out of range [:1073741824] with capacity 12") that would
-// take down the whole process — see temp/hardening-ledger.md.
+// take down the whole process.
 
 package zfsnative
 

@@ -84,6 +84,19 @@ int disk_read_lba(uint64_t lba, uint16_t count, void *buf)
 	 * barely optimizes at all) never actually exercised this bug,
 	 * which is why it went unnoticed until built the same way the
 	 * real Makefile does.
+	 *
+	 * "ebp" clobber (F18, unidoc-alip's PR #5 review): the same real
+	 * hardware finding console.c's own console_putc() and e820.c's own
+	 * INT 0x15 call already carry a clobber for - a BIOS's own
+	 * interrupt handler is free to use, and not restore, EBP
+	 * internally, a plain GPR here under -fomit-frame-pointer. "esi"
+	 * is deliberately NOT also added - unlike e820.c's case, this asm
+	 * already explicitly preserves it itself (push/pop around the
+	 * call), a stronger guarantee than a clobber would add (the real
+	 * original value survives, not just "GCC no longer trusts it").
+	 * Confirmed to compile cleanly at this file's own real -O2 build
+	 * flags and boot for real under QEMU (tests/bios-hdd-entry-test.sh)
+	 * - not just reasoned about.
 	 */
 	__asm__ __volatile__(
 		"push %%si\n\t"
@@ -94,7 +107,7 @@ int disk_read_lba(uint64_t lba, uint16_t count, void *buf)
 		"pop %%si\n\t"
 		: "=q"(failed)
 		: "r"(dap_off), "d"(g_drive_number)
-		: "ah", "cc", "memory"
+		: "ah", "ebp", "cc", "memory"
 	);
 
 	if (failed)

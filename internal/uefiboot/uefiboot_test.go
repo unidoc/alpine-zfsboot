@@ -132,6 +132,16 @@ func TestBackupPreviousFallsBackToCopyWhenLinkFails(t *testing.T) {
 // with a real pre-existing .previous already in place, and proves that
 // old backup survives.
 func TestBackupPrevious_FailedNewBackupPreservesOldOne(t *testing.T) {
+	// F22 (unidoc-alip's PR #5 review): this test relies on chmod 0000
+	// actually making `path` unreadable to force the copy-fallback path
+	// to fail for real - root ignores file permission bits entirely, so
+	// running this suite as root would silently fail to reproduce the
+	// condition the test depends on (BackupPrevious would then succeed,
+	// and the assertions below would fail for an unrelated reason).
+	if os.Getuid() == 0 {
+		t.Skip("running as root - chmod 0000 does not make a file unreadable to root, so this test cannot reproduce the condition it exists to check")
+	}
+
 	orig := HardLink
 	HardLink = func(string, string) error {
 		return errors.New("simulated: no hard links on this filesystem (e.g. vfat/ESP)")

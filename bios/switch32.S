@@ -45,6 +45,29 @@ enable_a20:
 	pushl %eax
 	pushw %ds
 	/*
+	 * %ebp/%esi/%edi also saved/restored around the INT 15h call below
+	 * (F18, unidoc-alip's PR #5 review) - the same real hardware
+	 * finding console.c's own console_putc() and e820.c's own INT 15h
+	 * call already carry a detailed comment about: a BIOS's own
+	 * interrupt handler is free to use, and not restore, any general-
+	 * purpose register internally. This is a hand-written assembly
+	 * FUNCTION (called from C via `call enable_a20`), not inline asm
+	 * inside a C statement, so there's no GCC clobber-list/register-
+	 * budget constraint to work around here at all (unlike
+	 * cdrom_disk.c's own int13_extensions_present(), which genuinely
+	 * ran out of registers trying to close its own, narrower version
+	 * of this same class of gap) - simply saving every register a
+	 * standard i386 cdecl-style caller would expect this function to
+	 * preserve (ebp/esi/edi/ebx, alongside the eax/ds already handled)
+	 * costs a few real-mode push/pop instructions in a function called
+	 * exactly once per boot, in exchange for correctness regardless of
+	 * what the calling C code happens to keep live in them.
+	 */
+	pushl %ebx
+	pushl %ebp
+	pushl %esi
+	pushl %edi
+	/*
 	 * INT 15h, AX=2401h ("enable A20 gate") - a real BIOS service
 	 * (SeaBIOS: src/system.c's handle_15 case 0x2401), not a fast-A20
 	 * chipset trick; some BIOSes clobber %ds across INT 15h calls
@@ -55,6 +78,10 @@ enable_a20:
 	 */
 	movw $0x2401, %ax
 	int $0x15
+	popl %edi
+	popl %esi
+	popl %ebp
+	popl %ebx
 	popw %ds
 	/*
 	 * Fast A20 via System Control Port A (port 0x92, bit 1) - keep bit

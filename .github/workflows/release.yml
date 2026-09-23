@@ -209,11 +209,16 @@ jobs:
           # way - but setting this on both makes that not an accident
           # of which arch happens to match the runner.
           # $GITHUB_REF_NAME (an env var this runner already sets, read
-          # inside the shell), NOT a literal ${{ github.ref_name }}
-          # interpolation into this script - a full source audit found
-          # this was the one template-injection sink across all four
-          # workflows in this project. GitHub expands ${{ }} textually
-          # into the script BEFORE bash ever sees it, and
+          # inside the shell), NOT a literal dollar-double-brace
+          # github.ref_name interpolation into this script - a full
+          # source audit found this was the one template-injection
+          # sink across all four workflows in this project. GitHub
+          # expands double-curly-brace expressions textually into the
+          # script BEFORE bash ever sees it (even inside a comment -
+          # confirmed the hard way: writing the literal syntax in
+          # these two lines made the whole workflow file fail to
+          # parse, "unexpected end of input ... [expression]" - the
+          # exact reason this comment is now worded around it), and
           # `git check-ref-format` permits `` ` ``, $, ", ;, &, |, (, )
           # in a tag name (it only bans space/control chars/~^:?*[\ and
           # a few structural patterns) - a tag like

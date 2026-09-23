@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,12 +13,87 @@ import (
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
 )
 
+// captureStderr runs fn with os.Stderr redirected to a pipe and
+// returns everything written to it - used to prove what a CRITICAL-
+// failure rollback path actually prints, not just that it returns
+// (these functions are void - fmt.Fprintln(os.Stderr, ...) is their
+// only observable output).
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	fn()
+	w.Close()
+	os.Stderr = orig
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
 // checkArchMatch, backupPrevious, and hardLink moved to
 // internal/uefiboot (see that package's own tests, ported verbatim
 // from this file's earlier versions) as part of generalizing this
 // tool's UEFI logic so install/update/verify can all call it, not
 // just update. What's left here is this file's own glue: arch
 // detection and the report struct's print/pass-fail logic.
+
+// TestRollbackPayload_CriticalFailureNeverPrintsSuccessLine is the
+// regression test for F22 (unidoc-alip's PR #5 review): rollbackPayload
+// used to print "restored the previous boot payload ... " unconditionally,
+// even after one of its own restore attempts had already printed a real
+// CRITICAL failure - an operator could see both lines back to back, the
+// second directly undercutting the seriousness of the first ("do not
+// reboot without investigating further" immediately followed by
+// "restored ... after a failed write", which reads like recovery
+// succeeded). layout.KernelFile is pre-created as a DIRECTORY - a real,
+// structural way to make espconfig.WriteFile's own final rename fail
+// (can't rename a regular file over an existing directory), not a mock.
+func TestRollbackPayload_CriticalFailureNeverPrintsSuccessLine(t *testing.T) {
+	mountpoint := newBIOSMountpoint(t)
+	if err := os.MkdirAll(filepath.Join(mountpoint, layout.KernelFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backup := payloadBackup{kernel: []byte("old-kernel-bytes")}
+
+	out := captureStderr(t, func() {
+		rollbackPayload(mountpoint, backup)
+	})
+	if !strings.Contains(out, "CRITICAL") {
+		t.Errorf("output = %q, want it to contain a CRITICAL failure line", out)
+	}
+	if strings.Contains(out, "restored the previous boot payload") {
+		t.Errorf("output = %q, want it to NOT claim success after a CRITICAL failure", out)
+	}
+}
+
+// TestRollbackUEFIGeneration_CriticalFailureNeverPrintsSuccessLine is
+// rollbackUEFIGeneration's own identical regression test - see
+// TestRollbackPayload_CriticalFailureNeverPrintsSuccessLine's own
+// comment for the full reasoning, same bug, same fix, same shape.
+func TestRollbackUEFIGeneration_CriticalFailureNeverPrintsSuccessLine(t *testing.T) {
+	mountpoint := newUEFIMountpoint(t)
+	loaderRel := "EFI/BOOT/BOOTX64.EFI"
+	if err := os.MkdirAll(filepath.Join(mountpoint, loaderRel), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backup := uefiGenerationBackup{loader: []byte("old-efi-bytes")}
+
+	out := captureStderr(t, func() {
+		rollbackUEFIGeneration(mountpoint, loaderRel, backup)
+	})
+	if !strings.Contains(out, "CRITICAL") {
+		t.Errorf("output = %q, want it to contain a CRITICAL failure line", out)
+	}
+	if strings.Contains(out, "restored the previous UEFI loader") {
+		t.Errorf("output = %q, want it to NOT claim success after a CRITICAL failure", out)
+	}
+}
 
 func TestDetectArch(t *testing.T) {
 	// Only the branch matching this test's own build environment is
@@ -50,6 +126,23 @@ func TestReportErrs(t *testing.T) {
 	}
 	if errs := broken.errs(); len(errs) != 2 {
 		t.Errorf("a report with 2 error fields set: errs() = %v, want 2 entries", errs)
+	}
+}
+
+// TestReportErrs_IncludesMetadataErr is the regression test for F22
+// (unidoc-alip's PR #5 review): metadataErr was missing from errs()'s
+// own field list entirely, despite print()'s own "Metadata:" line
+// already surfacing it as a real, populated error - a report whose
+// ONLY problem is a present-but-undecodable metadata manifest used to
+// report zero errors from this collector.
+func TestReportErrs_IncludesMetadataErr(t *testing.T) {
+	r := report{metadataErr: errors.New("metadata problem")}
+	errs := r.errs()
+	if len(errs) != 1 {
+		t.Fatalf("a report with only metadataErr set: errs() = %v, want exactly 1 entry", errs)
+	}
+	if errs[0].Error() != "metadata problem" {
+		t.Errorf("errs()[0] = %q, want \"metadata problem\"", errs[0].Error())
 	}
 }
 

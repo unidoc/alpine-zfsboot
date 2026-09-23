@@ -126,7 +126,7 @@ for file in "$@"; do
     sha_args=""
     [ -n "$file_sha" ] && sha_args="-f sha=$file_sha"
 
-    # shellcheck disable=SC2086 - sha_args is intentionally either empty
+    # shellcheck disable=SC2086 # sha_args is intentionally either empty
     # or a single well-formed -f flag, never attacker-controlled.
     cur_sha="$(gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$file" \
         -f message="$MESSAGE" \

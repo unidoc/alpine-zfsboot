@@ -13,7 +13,7 @@
 // single-maintainer, zero-tagged-release status made pinning an external
 // commit a weaker guarantee than owning the trimmed, read-only-by-
 // construction subset directly. See internal/zfsnative/abi.go for the full
-// provenance note and temp/hardening-ledger.md for the audit.
+// provenance note.
 //
 // ABI due diligence, done BEFORE adopting this code, not assumed: fetched
 // the real, current OpenZFS source at all five release tags this project's
@@ -154,10 +154,25 @@ var zfsFeatureGUIDToShortName = map[string]string{
 // parser's own sawFeatureLine check already guards against for a
 // different failure mode). An unknown GUID is reported as its OWN error,
 // naming the exact guid, rather than a generic "something went wrong".
+//
+// An EMPTY stats nvlist is NOT itself an error (F20, unidoc-alip's PR #5
+// review, correcting a false premise this function's own earlier version
+// asserted) - real upstream spa_add_feature_stats() (module/zfs/spa.c)
+// only ever adds an entry for a feature that is actually enabled or
+// active; a DISABLED feature (the default state for every feature on a
+// pool created with `zpool create -d`, and the initial state of any
+// feature never explicitly enabled) is skipped entirely, both from the
+// live cache (feature_get_refcount() returning ENOTSUP) and from what's
+// actually recorded on disk (only enabled/active features ever get a
+// real entry in the on-disk feature ZAP to begin with). So a pool using
+// zero non-default features - a real, valid, if uncommon state, not a
+// hypothetical one - legitimately reports a genuinely empty feature_stats,
+// and that pool IS compatible with every OpenZFS release line this
+// project knows about (it uses nothing beyond what every release line
+// already supports by definition). Previously reported as UNKNOWN with a
+// confusing "parse/decode problem" message for exactly this real,
+// compatible case.
 func parseFeatureStats(stats zfs.Nvlist) (poolFeatures, activeFeatures []string, err error) {
-	if len(stats) == 0 {
-		return nil, nil, fmt.Errorf("feature_stats nvlist is empty - a real pool always reports its full registered feature set here regardless of state, so this is a parse/decode problem, not a real pool with zero features")
-	}
 	var unknown []string
 	for guid, v := range stats {
 		refcount, ok := v.(uint64)

@@ -17,9 +17,13 @@ import "fmt"
 // No pool name is supplied in zc_name; the kernel packs every imported
 // pool's config into zc_nvlist_dst.
 func (h *Handle) PoolConfigs() (map[string]Nvlist, error) {
-	nv, err := h.callWithDst(ZFS_IOC_POOL_CONFIGS, func(c *zfsCmd) error {
+	nv, _, err := h.callWithDst(ZFS_IOC_POOL_CONFIGS, func(c *zfsCmd) error {
 		// zc_cookie carries the generation count the caller last saw; 0
-		// always returns the current set.
+		// always returns the current set. (This ioctl's own POST-call
+		// zc_cookie is the kernel's fresh generation count, a different
+		// meaning than PoolStats' own post-call errno use of the same
+		// field - see callWithDst's own doc comment - and not something
+		// this function currently has a use for.)
 		c.setU64(offZcCookie, 0)
 		return nil
 	}, 64*1024)

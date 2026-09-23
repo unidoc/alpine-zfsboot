@@ -77,7 +77,7 @@ jobs:
         run: |
           set -e
           branch="bump-zfs-compat-$TAG"
-          # shellcheck disable=SC2086 - CHANGED_FILES is a script-controlled
+          # shellcheck disable=SC2086 # CHANGED_FILES is a script-controlled
           # list of repo-relative paths, not attacker input.
           .github/scripts/commit-verified.sh "$branch" \
             "zfs-compatibility.d: vendor $TAG (Alpine zfs $ALPINE_ZFS_VERSION)" \
@@ -90,6 +90,13 @@ jobs:
             body="$(printf '%s\n\n**New release line(s): %s.** zfscompat.go picked up a new map entry + go:embed line for it automatically - go build/vet/test already validated it (see above), but read the zfscompat.go diff yourself before approving: this is the one part of the change that isnt a plain data-file copy.' "$body" "$NEW_RELEASE_LINES")"
           fi
 
-          gh pr create --title "zfs-compatibility.d: vendor $TAG" --body "$body" \
-            --head "$branch" --base master \
-            || echo "PR already open for $branch, or nothing to do"
+          # F15 (unidoc-alip's PR #5 review): see check-alpine.yml's own
+          # identical fix for the full reasoning - `|| echo` here
+          # turned ANY gh pr create failure (not just "already open")
+          # into a green job.
+          if [ "$(gh pr list --head "$branch" --json number --jq length)" -gt 0 ]; then
+              echo "PR already open for $branch - nothing to do"
+          else
+              gh pr create --title "zfs-compatibility.d: vendor $TAG" --body "$body" \
+                --head "$branch" --base master
+          fi

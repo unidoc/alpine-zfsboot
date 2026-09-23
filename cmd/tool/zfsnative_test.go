@@ -46,18 +46,28 @@ func TestParseFeatureStats_RealShape(t *testing.T) {
 	}
 }
 
-// TestParseFeatureStats_Empty is this rewrite's own version of the
-// original text-parser's sawFeatureLine regression test: an empty
-// feature_stats must be a real error, never silently zero active
-// features feeding CheckZFSCompat into a false VERIFIED (nothing
-// unsupported among nothing).
+// TestParseFeatureStats_Empty is corrected (F20, unidoc-alip's PR #5
+// review) from this function's own earlier version, which treated an
+// empty feature_stats as always an error - on the false premise that a
+// real pool always reports its full registered feature set regardless
+// of state. Real upstream spa_add_feature_stats() (module/zfs/spa.c)
+// only adds an entry for a feature that is enabled or active; a
+// DISABLED feature (every feature, on a pool created with
+// `zpool create -d`) is skipped entirely, both from the live cache and
+// from what's actually on disk. So a genuinely empty feature_stats is a
+// real, valid pool state - not a parse/decode failure - and such a pool
+// really is compatible with every release line (it uses nothing beyond
+// what all of them already support).
 func TestParseFeatureStats_Empty(t *testing.T) {
-	_, activeFeatures, err := parseFeatureStats(zfs.Nvlist{})
-	if err == nil {
-		t.Fatal("parseFeatureStats on an empty feature_stats: want an error, got nil - this is the exact false-VERIFIED bug")
+	poolFeatures, activeFeatures, err := parseFeatureStats(zfs.Nvlist{})
+	if err != nil {
+		t.Fatalf("parseFeatureStats on an empty feature_stats (a real `zpool create -d` pool's own valid state): want nil, got: %v", err)
 	}
 	if len(activeFeatures) != 0 {
 		t.Errorf("activeFeatures = %v, want none", activeFeatures)
+	}
+	if len(poolFeatures) != 0 {
+		t.Errorf("poolFeatures = %v, want none", poolFeatures)
 	}
 }
 

@@ -15,13 +15,18 @@
 // This is NOT the XDR encoding used by on-disk vdev labels: the ioctl path
 // packs nvlists in host-endian, in-memory layout. The codec here mirrors
 // OpenZFS module/nvpair/nvpair.c (nvs_native_*) wire format. The DECODER
-// below is not a byte-for-byte behavioral mirror of nvs_native_native_op -
-// it additionally bounds array element counts (checkElemCount) and nesting
-// depth (maxNVListDepth) beyond what upstream's own C decoder checks (which
-// bounds recursion via nvpair_max_recursion but had no equivalent array-count
-// bound at the commit this package derives from - see checkElemCount's own
-// doc comment), both real hardening fixes found in this project's own
-// review, not upstream behavior being preserved.
+// below is not a byte-for-byte behavioral mirror of the Go package this
+// project internalized (go-fsctl/zfs) - it additionally bounds array
+// element counts (checkElemCount) and nesting depth (maxNVListDepth), both
+// real hardening fixes a supply-chain/code audit of that THIRD-PARTY GO
+// PORT found missing there (see checkElemCount's own doc comment).
+//
+// Corrected (F22, unidoc-alip's PR #5 review) from an earlier, inaccurate
+// version of this comment that attributed the missing array-count bound to
+// upstream OpenZFS's own real C decoder (nvs_native_nvp_op) - real upstream
+// DOES bound it; the gap this project found and fixed was specific to
+// go-fsctl/zfs's own independent Go reimplementation, not something
+// upstream's own C source ever lacked.
 //
 // Native packing rules (verified by upstream against OpenZFS 2.2.2):
 //

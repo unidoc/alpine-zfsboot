@@ -1104,10 +1104,22 @@ the installed kernel's embedded version string, and the OpenZFS version
 baked into the initrd's own `zfs.ko` (extracted directly from its ELF
 `.modinfo` section, NOT inferred from the kernel version - independent
 facts) - alongside a live pool's own active feature flags, for real
-`zpool upgrade` decision-making. `Boot compatible:` deliberately stays
-`UNKNOWN` rather than computing a false yes/no: there's no sound,
-verified OpenZFS-version-to-pool-feature-flag mapping yet, so this
-reports the facts it can actually establish and stops there.
+`zpool upgrade` decision-making, plus a real `Boot compatible:` verdict
+(F13, unidoc-alip's PR #5 review - this section previously described an
+older design that always reported `UNKNOWN`; the code has since grown a
+real check, computed from OpenZFS's own vendored `compatibility.d`
+feature data, and this section had drifted out of sync with it).
+Three verdicts, never a guessed yes/no:
+- `VERIFIED` - every active pool feature is supported by the boot
+  environment's own OpenZFS release line.
+- `NO` - at least one active feature is NOT supported - the boot
+  environment cannot import this pool. This is the one verdict `verify`
+  actually fails on (exit 1); `VERIFIED` and `UNKNOWN` both pass.
+- `UNKNOWN` - not enough information to say either way (no imported
+  pool to check against, the boot environment's own OpenZFS version
+  couldn't be determined, or no vendored compatibility data exists yet
+  for that release line) - reports the facts it can actually establish
+  and stops there, rather than computing a false yes/no.
 
 Every write (`install`/`update`) goes through the same low-level
 primitives regardless of caller - `internal/biosboot`'s `WriteStage1`/

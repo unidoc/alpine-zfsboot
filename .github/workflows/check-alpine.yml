@@ -105,7 +105,7 @@ jobs:
           go test ./...
 
           branch="bump-alpine-$latest"
-          # shellcheck disable=SC2086 - changed_files is a script-built list
+          # shellcheck disable=SC2086 # changed_files is a script-built list
           # of repo-relative paths, not attacker input.
           .github/scripts/commit-verified.sh "$branch" \
             "ci: bump Alpine to $latest" $changed_files
@@ -119,6 +119,20 @@ jobs:
             body="$(printf '%s\n\n**New OpenZFS release line(s): %s.** Read the zfscompat.go diff yourself before approving - go build/vet/test (already run above) catches a build break but not a semantic one.' "$body" "$new_release_lines")"
           fi
 
-          gh pr create --title "ci: bump Alpine to $latest" --body "$body" \
-            --head "$branch" --base master \
-            || echo "PR already open for $branch, or nothing to do"
+          # F15 (unidoc-alip's PR #5 review): `... || echo "..."` here
+          # used to turn ANY gh pr create failure into a green job -
+          # "a PR is already open" is the one real reason to expect a
+          # nonzero exit, but the same swallow also hid a genuine
+          # failure (the most plausible: this repo/org setting "Allow
+          # GitHub Actions to create and approve pull requests" being
+          # off) - the branch gets pushed, no PR opens, and nobody
+          # finds out Alpine moved on until someone happens to notice.
+          # Check for an existing PR explicitly first; only skip for
+          # that specific, expected reason, and let a real gh pr create
+          # failure fail this job for real otherwise.
+          if [ "$(gh pr list --head "$branch" --json number --jq length)" -gt 0 ]; then
+              echo "PR already open for $branch - nothing to do"
+          else
+              gh pr create --title "ci: bump Alpine to $latest" --body "$body" \
+                --head "$branch" --base master
+          fi

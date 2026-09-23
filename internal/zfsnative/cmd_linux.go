@@ -121,11 +121,16 @@ func realIoctl(h *Handle, req uintptr, cmd *zfsCmd) error {
 // nvlist decoder itself does with the resulting buffer.
 const maxDstGrowSize = 16 * 1024 * 1024
 
-func (h *Handle) callWithDst(req uintptr, build func(*zfsCmd) error, dstSize uint64) (Nvlist, error) {
+// The third return value is the ioctl's own zc_cookie field, exactly as
+// the kernel left it after a SUCCESSFUL call - meaning varies per ioctl
+// (PoolStats' own caller checks it as a real post-open errno; every other
+// current caller ignores it) so interpreting it is each caller's own job,
+// not this shared primitive's.
+func (h *Handle) callWithDst(req uintptr, build func(*zfsCmd) error, dstSize uint64) (Nvlist, uint64, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		cmd := &zfsCmd{}
 		if err := build(cmd); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		dst := make([]byte, dstSize)
 		cmd.setU64(offZcNvlistDst, uint64(uintptr(unsafe.Pointer(&dst[0]))))
@@ -143,11 +148,15 @@ func (h *Handle) callWithDst(req uintptr, build func(*zfsCmd) error, dstSize uin
 			}
 		}
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		// The kernel may report the actual packed size; decode the whole
 		// buffer (DecodeNative stops at the list terminator regardless).
-		return DecodeNative(dst)
+		nv, err := DecodeNative(dst)
+		if err != nil {
+			return nil, 0, err
+		}
+		return nv, cmd.getU64(offZcCookie), nil
 	}
-	return nil, fmt.Errorf("ioctl dst buffer kept growing")
+	return nil, 0, fmt.Errorf("ioctl dst buffer kept growing")
 }

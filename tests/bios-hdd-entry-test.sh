@@ -132,8 +132,9 @@ assert stage1[510] == 0x55 and stage1[511] == 0xAA, "stage1.bin missing 55AA sig
 # Real installers write this table at install time - stage1.bin's own
 # build currently leaves bytes 446-509 all-zero, so this splice is
 # always safe today, but that's a fact about stage1.S's own current
-# code size (77 of 440 bytes used, per the "stage1 magic/retry" fix's
-# own ledger entry), not a guarantee - checked here for real rather
+# code size (88 of 440 bytes used, per a real `objcopy`d stage1.bin -
+# corrected, F22 in unidoc-alip's PR #5 review, from a stale 77 this
+# comment previously said), not a guarantee - checked here for real rather
 # than assumed, so a future stage1.S that genuinely grows into this
 # region fails this script loudly instead of silently splicing a
 # partition entry over live boot code in the fixture. One classic MBR

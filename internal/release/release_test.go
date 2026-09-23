@@ -2,10 +2,14 @@ package release
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -215,6 +219,39 @@ func TestSourceResolve_FallsBackToDefault(t *testing.T) {
 	}
 }
 
+// newFakeReleaseServer serves a fake "latest release" - a tag-
+// resolution API response, a real SHA256SUMS computed from
+// assetContent, and each named asset's own content - everything
+// ResolveBIOS's own default (non-overridden) path now needs (F16,
+// unidoc-alip's PR #5 review). Returns the base URL to point
+// apiLatestReleaseURL/downloadBaseURLTemplate at.
+func newFakeReleaseServer(t *testing.T, tag string, assetContent map[string]string) *httptest.Server {
+	t.Helper()
+	var sums strings.Builder
+	for name, content := range assetContent {
+		sum := sha256.Sum256([]byte(content))
+		fmt.Fprintf(&sums, "%s  %s\n", hex.EncodeToString(sum[:]), name)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"tag_name":%q}`, tag)
+	})
+	mux.HandleFunc("/download/", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Path[len("/download/"+tag+"/"):]
+		if name == "SHA256SUMS" {
+			w.Write([]byte(sums.String()))
+			return
+		}
+		content, ok := assetContent[name]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(content))
+	})
+	return httptest.NewServer(mux)
+}
+
 func TestResolveBIOS_MixedSources(t *testing.T) {
 	dir := t.TempDir()
 	localStage1 := dir + "/my-stage1.bin"
@@ -222,17 +259,27 @@ func TestResolveBIOS_MixedSources(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	explicitSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("from-" + r.URL.Path[1:]))
 	}))
-	defer srv.Close()
-	origBase := baseURL
-	baseURL = srv.URL + "/"
-	defer func() { baseURL = origBase }()
+	defer explicitSrv.Close()
+
+	assetContent := map[string]string{
+		"alpine-zfsboot-x86_64-vmlinuz":       "real-kernel-bytes",
+		"alpine-zfsboot-x86_64-initramfs.img": "real-initrd-bytes",
+		"alpine-zfsboot-x86_64-cmdline.txt":   "real-cmdline-bytes",
+	}
+	fakeRelease := newFakeReleaseServer(t, "v9.9.9", assetContent)
+	defer fakeRelease.Close()
+
+	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
+	apiLatestReleaseURL = fakeRelease.URL + "/api/latest"
+	downloadBaseURLTemplate = fakeRelease.URL + "/download/%s/"
+	defer func() { apiLatestReleaseURL, downloadBaseURLTemplate = origAPI, origDownload }()
 
 	src := BIOSSources{
-		Stage1: Source{File: localStage1},                   // local file override
-		Stage2: Source{URL: srv.URL + "/custom-stage2.bin"}, // explicit URL override
+		Stage1: Source{File: localStage1},                           // local file override
+		Stage2: Source{URL: explicitSrv.URL + "/custom-stage2.bin"}, // explicit URL override
 		// Kernel/Initrd/Cmdline: no override, default to "latest GitHub release"
 	}
 	assets, err := ResolveBIOS(src, "x86_64", t.TempDir())
@@ -253,7 +300,105 @@ func TestResolveBIOS_MixedSources(t *testing.T) {
 	}
 	check(assets.Stage1, "local-stage1")
 	check(assets.Stage2, "from-custom-stage2.bin")
-	check(assets.Kernel, "from-alpine-zfsboot-x86_64-vmlinuz")
-	check(assets.Initrd, "from-alpine-zfsboot-x86_64-initramfs.img")
-	check(assets.Cmdline, "from-alpine-zfsboot-x86_64-cmdline.txt")
+	check(assets.Kernel, "real-kernel-bytes")
+	check(assets.Initrd, "real-initrd-bytes")
+	check(assets.Cmdline, "real-cmdline-bytes")
+}
+
+// TestResolveBIOS_DefaultAssetsAreTagPinnedAndChecksumVerified is the
+// direct regression test for F16 (unidoc-alip's PR #5 review): all
+// five default-sourced assets must come from ONE resolved tag and
+// pass SHA256SUMS verification.
+func TestResolveBIOS_DefaultAssetsAreTagPinnedAndChecksumVerified(t *testing.T) {
+	assetContent := map[string]string{
+		"alpine-zfsboot-x86_64-bios-stage1.bin": "stage1-bytes",
+		"alpine-zfsboot-x86_64-bios-stage2.bin": "stage2-bytes",
+		"alpine-zfsboot-x86_64-vmlinuz":         "kernel-bytes",
+		"alpine-zfsboot-x86_64-initramfs.img":   "initrd-bytes",
+		"alpine-zfsboot-x86_64-cmdline.txt":     "cmdline-bytes",
+	}
+	fakeRelease := newFakeReleaseServer(t, "v1.2.3", assetContent)
+	defer fakeRelease.Close()
+
+	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
+	apiLatestReleaseURL = fakeRelease.URL + "/api/latest"
+	downloadBaseURLTemplate = fakeRelease.URL + "/download/%s/"
+	defer func() { apiLatestReleaseURL, downloadBaseURLTemplate = origAPI, origDownload }()
+
+	assets, err := ResolveBIOS(BIOSSources{}, "x86_64", t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveBIOS: %v", err)
+	}
+	defer assets.RemoveAll()
+
+	for path, want := range map[string]string{
+		assets.Stage1:  "stage1-bytes",
+		assets.Stage2:  "stage2-bytes",
+		assets.Kernel:  "kernel-bytes",
+		assets.Initrd:  "initrd-bytes",
+		assets.Cmdline: "cmdline-bytes",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("content = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestResolveBIOS_ChecksumMismatchRefused proves the checksum
+// verification is real, not decorative: an asset whose content does
+// NOT match what SHA256SUMS claims must be refused, not silently
+// accepted.
+func TestResolveBIOS_ChecksumMismatchRefused(t *testing.T) {
+	tag := "v1.2.3"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"tag_name":%q}`, tag)
+	})
+	mux.HandleFunc("/download/", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Path[len("/download/"+tag+"/"):]
+		if name == "SHA256SUMS" {
+			// A real, correctly-shaped hash - but for content that is
+			// NOT what any asset below actually serves.
+			fakeSum := sha256.Sum256([]byte("this is not the real content"))
+			names := []string{
+				"alpine-zfsboot-x86_64-bios-stage1.bin",
+				"alpine-zfsboot-x86_64-bios-stage2.bin",
+				"alpine-zfsboot-x86_64-vmlinuz",
+				"alpine-zfsboot-x86_64-initramfs.img",
+				"alpine-zfsboot-x86_64-cmdline.txt",
+			}
+			for _, n := range names {
+				fmt.Fprintf(w, "%s  %s\n", hex.EncodeToString(fakeSum[:]), n)
+			}
+			return
+		}
+		w.Write([]byte("real-but-mismatched-content"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
+	apiLatestReleaseURL = srv.URL + "/api/latest"
+	downloadBaseURLTemplate = srv.URL + "/download/%s/"
+	defer func() { apiLatestReleaseURL, downloadBaseURLTemplate = origAPI, origDownload }()
+
+	dir := t.TempDir()
+	_, err := ResolveBIOS(BIOSSources{}, "x86_64", dir)
+	if err == nil {
+		t.Fatal("ResolveBIOS with content that doesn't match SHA256SUMS: want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "SHA256 mismatch") {
+		t.Errorf("error = %q, want it to mention a SHA256 mismatch", err.Error())
+	}
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("temp dir has %d leftover file(s) after a checksum-mismatch failure, want 0: %v", len(entries), entries)
+	}
 }

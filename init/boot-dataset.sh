@@ -91,6 +91,27 @@ boot_lock_acquire() {
     if [ -n "$lock_pid" ] && command -v _pid_alive >/dev/null 2>&1 && ! _pid_alive "$lock_pid"; then
         stale="$boot_lock_dir.stale.$$"
         if mv "$boot_lock_dir" "$stale" 2>/dev/null; then
+            # F11 (unidoc-alip's PR #5 review) - same real race as
+            # zfs_op_lock's own identical reclaim shape (zfs-unlock.sh):
+            # the staleness check above and this mv are not atomic
+            # together, so another session that ALSO judged $lock_pid
+            # dead could already have finished its own full reclaim
+            # (mv+rm+mkdir+its own live pid) before this mv runs - which
+            # would then move THAT session's fresh, live lock aside
+            # instead of the dead one this attempt actually judged, and
+            # both sessions end up believing they hold it (the exact
+            # double-kexec scenario this lock exists to prevent).
+            # Re-reading the pid actually captured in the moved-aside
+            # directory and comparing it against the dead pid this
+            # attempt judged closes that window: a mismatch means
+            # someone else already won a real reclaim, so put their
+            # lock back untouched and fail this attempt instead of
+            # stealing it.
+            moved_pid="$(cat "$stale/pid" 2>/dev/null)"
+            if [ "$moved_pid" != "$lock_pid" ]; then
+                mv "$stale" "$boot_lock_dir" 2>/dev/null
+                return 1
+            fi
             rm -rf "$stale"
             if mkdir "$boot_lock_dir" 2>/dev/null; then
                 echo "$$" > "$boot_lock_dir/pid" 2>/dev/null
@@ -121,12 +142,13 @@ release_boot_lock() {
 # copy of the encryption passphrase in plaintext, removed
 # unconditionally: the kexec handoff's own combined-initrd (which
 # embeds the key inside its own appended cpio segment - see that
-# block's own header comment further down), the staged secret itself
-# ($zfs_key_stage_path), and the handoff block's own two intermediate
-# copies ($handoff_root, containing .../run/alpine-zfsboot/zfs-key, and
-# $handoff_cpio, the packed archive built FROM it - both exist only
-# transiently while the handoff block runs, normally rm'd by its own
-# end, but not yet if a signal interrupts partway through). ${var:-}
+# block's own header comment further down), the handoff block's own
+# two intermediate copies ($handoff_root, containing
+# .../run/alpine-zfsboot/zfs-key, and $handoff_cpio, the packed
+# archive built FROM it - both exist only transiently while the
+# handoff block runs, normally rm'd by its own end, but not yet if a
+# signal interrupts partway through), and (staged_by_me only - see
+# below) the staged secret itself ($zfs_key_stage_path). ${var:-}
 # throughout, deliberately - this runs from contexts reached long
 # before kexec_initrd/encryptionroot/handoff_root/handoff_cpio are ever
 # assigned (the encryption-key-load failure, the mount failure, a
@@ -139,11 +161,31 @@ release_boot_lock() {
 # one of these plaintext copies sitting in tmpfs indefinitely if a
 # signal happened to land between staging a secret and this file's own
 # normal end-of-block cleanup.
+#
+# staged_by_me gate (F2, unidoc-alip's PR #5 review): the staged-secret
+# path ($zfs_key_stage_path) is keyed per encryptionroot, not per
+# process - every session unlocking the SAME dataset shares it. This
+# used to remove that path unconditionally, on ANY exit, including
+# lose_boot_race()'s own `exit 0` - a real, confirmed regression: a
+# session that loses the boot race (arrives after another session
+# already staged a secret and won boot_lock_acquire) deleted the
+# WINNER's staged key on its own way out, without ever holding
+# zfs_op_lock, leaving the winner's own kexec handoff carrying no key -
+# exactly the double-ZFS-prompt bug this project's kexec handoff fix
+# exists to remove, reintroduced by this cleanup path. staged_by_me is
+# a plain global (no `local` in this codebase's shell, same convention
+# every other cross-function variable here already uses), set ONLY at
+# zfs_unlock()'s own two real zfs_stage_secret success sites
+# (zfs-unlock.sh) - so this process only ever removes a stage it
+# actually created itself, never one it merely found already staged
+# (zfs_unlock()'s own "already unlocked and staged... discarding this
+# passphrase" early-return path never sets it) or one another session
+# is using.
 _cleanup_secrets() {
     if [ -n "${kexec_initrd:-}" ] && [ "${kexec_initrd:-}" != "${initrd:-}" ]; then
         rm -f "$kexec_initrd" 2>/dev/null
     fi
-    if [ -n "${encryptionroot:-}" ] && [ "${encryptionroot:-}" != "-" ]; then
+    if [ "${staged_by_me:-0}" = 1 ] && [ -n "${encryptionroot:-}" ] && [ "${encryptionroot:-}" != "-" ]; then
         rm -f "$(zfs_key_stage_path "$encryptionroot")" 2>/dev/null
     fi
     [ -n "${handoff_root:-}" ] && rm -rf "$handoff_root" 2>/dev/null
@@ -159,16 +201,55 @@ _cleanup_secrets() {
     command -v _zfs_unlock_cleanup_tempfiles >/dev/null 2>&1 && _zfs_unlock_cleanup_tempfiles
 }
 
-# _on_exit_cleanup - the actual EXIT/INT/TERM/HUP trap target (a trap
-# can only ever bind ONE command per signal, so this is the one place
-# both of the independent cleanups above run together) - so a Ctrl-C or
-# a dropped SSH session removes every plaintext secret AND releases the
-# boot lock exactly like a normal fail()/lose_boot_race() exit would.
+# _on_exit_cleanup - the actual EXIT trap target: removes every
+# plaintext secret AND releases the boot lock exactly like a normal
+# fail()/lose_boot_race() exit would.
 _on_exit_cleanup() {
     _cleanup_secrets
     release_boot_lock
 }
-trap _on_exit_cleanup EXIT INT TERM HUP
+trap _on_exit_cleanup EXIT
+
+# INT/TERM/HUP handling (F3, unidoc-alip's PR #5 review): a single
+# `trap _on_exit_cleanup EXIT INT TERM HUP` (this file's own previous
+# shape) is a real, confirmed regression, not a hardening no-op. POSIX
+# sh signal traps do not terminate the script on their own - a
+# handler that doesn't itself exit lets the script RESUME right after
+# the trap runs. So a signal here used to release the boot lock AND
+# delete the staged secret, then carry on straight through to
+# `kexec -e` with NEITHER held - defeating the entire point of both:
+# a second frontend can take the now-released lock and start its own
+# boot while the first is still heading for its own kexec (the exact
+# double-kexec the lock exists to prevent), and if the signal lands
+# before the handoff initrd is built, the target re-prompts anyway.
+# Realistic triggers, not edge cases: a dropped rescue-SSH session
+# (SIGHUP) or an operator's `kill <pid>`/Ctrl-C while this script
+# waits in a long `kexec -l` on a real, tens-of-MB initrd.
+#
+# This process is always PID 1 on a real boot (exec'd straight from
+# /init or from menu.py's own os.execv - see this file's own top
+# comment) - and PID 1 must never actually exit on a signal: the
+# kernel panics ("Attempted to kill init") the instant it does,
+# whether via this trap's own explicit exit or via the signal's
+# ordinary default disposition (this file had NO trap at all before
+# this whole hardening pass - meaning a signal used to terminate the
+# process outright via that default disposition, which is exactly as
+# unsafe for PID 1 as this bug's own resume-without-cleanup behavior,
+# just a different failure mode). So PID 1 explicitly ignores these
+# three signals - the one behavior that is actually safe for it -
+# while a non-PID-1 invocation (this project's own test harness,
+# tests/run-tests.sh, does not exec this file as PID 1) gets a real
+# handler: clean up, disarm the EXIT trap (so cleanup doesn't run
+# TWICE - once here, once again from this same handler's own `exit`),
+# and terminate with the conventional 128+signum exit code instead of
+# resuming.
+if [ "$$" -eq 1 ]; then
+    trap '' INT TERM HUP
+else
+    trap '_on_exit_cleanup; trap - EXIT; exit 129' HUP
+    trap '_on_exit_cleanup; trap - EXIT; exit 130' INT
+    trap '_on_exit_cleanup; trap - EXIT; exit 143' TERM
+fi
 
 # Same real-boot-vs-test-harness path resolution as /init's own
 # RESCUE_LIB_DIR (see its comment there for the full reasoning) -
@@ -720,10 +801,25 @@ fi
 exec /usr/sbin/zfs.alpine-zfsboot-real "$@"
 ZFSWRAP
             chmod 755 "$handoff_root/usr/sbin/zfs"
+            # F9 (unidoc-alip's PR #5 review): this cp's own exit status
+            # used to go unchecked entirely - if $zfs_key_stage vanished
+            # between being staged and here (F2/F3's own race window,
+            # now closed, but a transient tmpfs I/O error is still a
+            # real possibility independent of those) or the copy itself
+            # failed partway, this block used to carry on regardless,
+            # packing a missing-or-truncated key into the handoff
+            # archive. [ -s ... ] right after cp (not just checking cp's
+            # own exit status) also catches a cp that "succeeded" but
+            # produced a real, on-disk EMPTY file (some cp
+            # implementations can do this on specific I/O error shapes
+            # without a nonzero exit) - cheap, immediate, before ever
+            # building the cpio archive from it.
             cp "$zfs_key_stage" "$handoff_root/run/alpine-zfsboot/zfs-key"
-            chmod 400 "$handoff_root/run/alpine-zfsboot/zfs-key"
+            cp_status=$?
+            chmod 400 "$handoff_root/run/alpine-zfsboot/zfs-key" 2>/dev/null
             handoff_cpio="$ROOTFS/tmp/zfs-handoff.$$.cpio"
-            if ( cd "$handoff_root" && find . | cpio -o -H newc 2>/dev/null > "$handoff_cpio" ) \
+            if [ "$cp_status" = 0 ] && [ -s "$handoff_root/run/alpine-zfsboot/zfs-key" ] \
+               && ( cd "$handoff_root" && find . | cpio -o -H newc 2>/dev/null > "$handoff_cpio" ) \
                && [ -s "$handoff_cpio" ]; then
                 # Round-trip verification, not just "cpio -o exited 0
                 # and wrote non-empty output" - a real boot showed the
@@ -788,7 +884,25 @@ ZFSWRAP
                 # by the very next check up. The staged secret is always
                 # short (an interactively-typed passphrase), so a full hex
                 # dump comparison costs nothing.
-                if [ "$(od -An -tx1 "$zfs_key_stage" 2>/dev/null | tr -d ' \n')" \
+                # [ -s ... ] on BOTH files first, restored (F9,
+                # unidoc-alip's PR #5 review) - the byte-for-byte od
+                # comparison alone has a real blind spot: if EITHER
+                # file is missing or unreadable, `od` produces no
+                # output (stderr already discarded), `tr` on empty
+                # input is still empty, and empty-string equals
+                # empty-string - so a staged key that vanished (a
+                # signal landing in this exact window, before this
+                # file's own F2/F3 trap fixes existed to prevent it
+                # racing another session's own stage; a transient read
+                # error either way) or an extraction that never
+                # actually produced the file made this check report
+                # "match" with NO KEY PRESENT AT ALL, and the log line
+                # below said "verified ... round-tripped correctly"
+                # for a kexec that would carry no key whatsoever.
+                if [ ! -s "$zfs_key_stage" ] \
+                   || [ ! -s "$handoff_check/run/alpine-zfsboot/zfs-key" ]; then
+                    handoff_ok=0
+                elif [ "$(od -An -tx1 "$zfs_key_stage" 2>/dev/null | tr -d ' \n')" \
                      != "$(od -An -tx1 "$handoff_check/run/alpine-zfsboot/zfs-key" 2>/dev/null | tr -d ' \n')" ]; then
                     handoff_ok=0
                 fi
@@ -881,6 +995,44 @@ if ! kexec -l "$kernel" --initrd="$kexec_initrd" \
 fi
 
 msg "kexec -l succeeded, unmounting and exporting $POOL before the jump"
+
+umount "$ROOTFS"/mnt/root 2>/dev/null
+
+# F21 (unidoc-alip's PR #5 review): a read-only busy pre-check, BEFORE
+# the attempt record/bootcheck counter below - not a full replacement
+# for the real `zpool export` check further down (that one stays,
+# unchanged, as the authoritative final gate right before the jump -
+# see its own comment), but a real gap this closes on its own: the
+# export hard-fail used to run strictly AFTER the attempt record was
+# already written and the bootcheck counter already bumped, so a
+# refused export (something else still has a dataset under $POOL
+# mounted - another boot environment, a rescue-SSH chroot_be() session
+# left open) counted as a real boot attempt even though the actual
+# jump (kexec -e) never happened at all - the very next Last Boot
+# Diagnostics screen would then read "Previous boot: FAILED" for a
+# kexec that was never even tried. The real, authoritative zpool
+# export call can't simply move earlier instead - it re-derives which
+# properties this record needs by unmounting/exporting $POOL itself,
+# and once export succeeds this pool is gone from this rescue kernel's
+# own view entirely, with no way to still write the org.alpinezfsboot:
+# attempt_*/bootcheck properties on it afterward - the record and
+# export are unavoidably coupled to happen on the SAME still-imported
+# pool, in that order. A cheap, read-only /proc/mounts scan for any
+# OTHER dataset under $POOL already mounted (this script's own
+# $ROOTFS/mnt/root was just unmounted above, so it no longer shows up
+# here) catches the exact realistic scenarios named above before ever
+# touching the attempt record - not a full guarantee (a genuinely new
+# busy condition appearing in the brief window between this check and
+# the real export further down would still slip through, same as
+# today), but real, meaningful coverage for the common case.
+# STUB_PROC_MOUNTS: same real-vs-test-harness override convention as
+# STUB_ROOT/STUB_TTY elsewhere in this project (/proc/mounts is a real
+# kernel-provided file, not something under $ROOTFS a test could point
+# elsewhere the way every OTHER path in this script already can).
+other_pool_mount="$(awk -v pool="$POOL" '$1 == pool || index($1, pool "/") == 1 { print $1 " at " $2; exit }' "${STUB_PROC_MOUNTS:-/proc/mounts}" 2>/dev/null)"
+if [ -n "$other_pool_mount" ]; then
+    fail "refusing to proceed toward the kexec jump for $DATASET - $POOL still has something else mounted ($other_pool_mount), which would make the real zpool export below fail anyway; find out what's still using this pool (another mounted boot environment? a rescue-SSH chroot session?) before retrying"
+fi
 
 # Last Boot Diagnostics: the "attempt record" - what was actually
 # attempted this kexec, independent of whether it succeeds. This is the
@@ -1009,7 +1161,13 @@ if [ "${ALPINE_ZFSBOOT_BOOTCHECK:-}" != "off" ]; then
     fi
 fi
 
-umount "$ROOTFS"/mnt/root 2>/dev/null
+# $ROOTFS/mnt/root is already unmounted (moved earlier, right after
+# kexec -l - see the F21 busy pre-check's own comment above for why:
+# the attempt record needs an accurate "is anything else mounted under
+# $POOL" read, which needs this script's own mount out of the way
+# first). No umount call here anymore - a second one would just be a
+# harmless no-op.
+#
 # Checked, not swallowed like every OTHER export/umount call in this
 # file (fail()'s own best-effort umount, the handoff block's own
 # cleanup) - a full source audit found this one previously silently

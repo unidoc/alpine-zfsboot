@@ -40,18 +40,28 @@
 # symptom (stuck at "loading kernel", never reaching "done") instead
 # of silently regressing.
 #
-# A tiny kernel/initrd would be faster to boot but doesn't work here:
-# the FAT32 volume itself needs to be large enough that mkfs.vfat's
-# own cluster-count math produces a structurally real FAT32 filesystem
-# - this project's own fat.c mount correctly refuses anything smaller
-# (confirmed directly: an 8MB volume mkfs.vfat itself calls FAT32 gets
-# rejected by fat_mount() as "not a valid FAT32 volume", a real,
-# deliberate strictness check, not a bug to work around). 20MB
-# kernel + 12MB initrd (iso.sh's own payload-driven sizing then lands
-# comfortably past that threshold, confirmed empirically) is the
-# smallest combination confirmed to produce a real FAT32 volume in
-# this project's own testing - keep it at least this large if you ever
-# need to change these sizes.
+# A tiny kernel/initrd would be faster to boot but doesn't shrink the
+# FAT32 volume for free: the volume itself needs to be large enough
+# that mkfs.vfat's own cluster-count math produces a structurally real
+# FAT32 filesystem - this project's own fat.c mount correctly refuses
+# anything smaller (confirmed directly: below 65525 clusters,
+# fat_mount() rejects it as "not a valid FAT32 volume", a real,
+# deliberate strictness check, not a bug to work around - empirically,
+# a 32MiB total volume lands at 64496 clusters, REJECTED, while 36MiB
+# lands at 72562, accepted).
+#
+# The kernel/initrd generator below does NOT couple "real ATAPI-
+# transferred bytes" to "FAT32 volume size" the way an earlier version
+# of this test did (20MiB kernel + 12MiB initrd, purely so iso.sh's
+# own payload-driven volume-size formula would clear the FAT32 floor -
+# see the hardening ledger's "CI investigation: real bios-iso-atapi-
+# test failure" entry for why that coupling turned into a real CI
+# flakiness problem). KERNEL/INITRD are now sized just for real
+# ATAPI/FAT coverage (multiple commands, multiple progress dots); the
+# FAT32 volume is padded up to a safe size separately, via a dummy.EFI
+# stub inflated with cold filler bytes stage2_main.c never reads (see
+# the generator's own comment for the exact reasoning and the
+# confirmation that no BIOS code path ever opens that file).
 #
 # Needs: gcc/as/ld/objcopy (to build bios/stage-iso.bin - same
 # toolchain bios/Makefile already needs), xorriso, dosfstools
@@ -119,24 +129,74 @@ assert len(hdr) == 123, len(hdr)
 buf = bytearray(SETUP_HEADER_FILE_OFFSET) + hdr
 real_mode_bytes = 5 * 512  # (setup_sects 0 -> 4) + 1
 buf += bytes(real_mode_bytes - len(buf))
-# 20MiB protected-mode payload - see this script's own header comment
-# for why this size (not something smaller/faster): the FAT32 volume
-# it forces iso.sh to build needs to clear fat_mount()'s own real
-# structural FAT32 threshold.
-buf += bytes([(i * 37 + 11) & 0xff for i in range(20 * 1024 * 1024)])
+# 2MiB protected-mode payload (down from a historical 20MiB - see
+# "why 2MiB+1MiB, not 20MiB+12MiB" below) - enough to comfortably clear
+# the >=1 progress-dot check below (PROGRESS_DOT_BYTES=1MiB in
+# stage2_main.c) with real margin, and enough to force several dozen
+# separate NATIVE_BATCH-sized ATAPI READ(10) commands under
+# FORCE_ATAPI=1 (NATIVE_BATCH=9 sectors=18432 bytes/command in
+# cdrom_disk.c - 2MiB/18432 is ~114 commands), not just one.
+KERNEL_PAYLOAD_BYTES = 2 * 1024 * 1024
+buf += bytes([(i * 37 + 11) & 0xff for i in range(KERNEL_PAYLOAD_BYTES)])
 with open(f"{w}/KERNEL", "wb") as f:
     f.write(buf)
+kernel_file_size = len(buf)
 
-chunk = bytes([(i * 13 + 3) & 0xff for i in range(1024 * 1024)])
+# 1MiB initrd (down from a historical 12MiB) - same reasoning as the
+# kernel above: still >=1 progress dot, still tens of separate ATAPI
+# commands (1MiB/18432 is ~57).
+INITRD_BYTES = 1 * 1024 * 1024
+chunk = bytes([(i * 13 + 3) & 0xff for i in range(INITRD_BYTES)])
 with open(f"{w}/INITRD", "wb") as f:
-    for _ in range(12):
-        f.write(chunk)
+    f.write(chunk)
 
+cmdline_bytes = b"console=ttyS0 alpine-zfsboot.iso-entry-test=1\n"
 with open(f"{w}/CMDLINE", "wb") as f:
-    f.write(b"console=ttyS0 alpine-zfsboot.iso-entry-test=1\n")
+    f.write(cmdline_bytes)
 
+# why 2MiB+1MiB, not 20MiB+12MiB: a real CI investigation (see the
+# hardening ledger, "CI investigation: real bios-iso-atapi-test
+# failure") found this test's own historical 20MiB+12MiB sizing meant
+# FORCE_ATAPI=1 pushed ~32MB through ~1800 individual ATAPI READ(10)
+# commands - each one several separate port-I/O VM-exits under QEMU's
+# software (TCG) CPU emulation - and that got slow enough under real
+# CI host contention (not a driver bug - re-verified the exact CI
+# QEMU 8.2.2/SeaBIOS 1.16.3 combination locally, both idle AND under
+# deliberate synthetic core-saturation; it always completed, just
+# slowly under load) to blow past even a 300s external test timeout.
+#
+# The 20MiB/12MiB sizing was never actually about exercising that much
+# ATAPI traffic - it was a SIDE EFFECT of the old design coupling two
+# unrelated things: the on-disk FAT32 volume's own total size (which
+# genuinely does need to be large - bios/fat.c's own fat_mount() hard-
+# refuses anything under 65525 clusters, the real FAT32 spec floor;
+# empirically confirmed here, in this same investigation, that a
+# 32MiB total volume gives 64496 clusters - REJECTED as FAT16-shaped -
+# while 36MiB gives 72562 - accepted) and how much of that volume is
+# real KERNEL/INITRD content stage2 actually reads over the slow
+# ATAPI PIO path.
+#
+# Those two things don't need to be coupled at all: dummy.EFI below
+# lives at EFI/BOOT/<name>.EFI on the FAT volume iso.sh builds, a path
+# bios/stage2_main.c never opens under ANY boot path - confirmed
+# directly by reading it: the only three fat_open_retry() calls in the
+# whole file are literally "/EFI/ALPINE/KERNEL", "/EFI/ALPINE/INITRD",
+# "/EFI/ALPINE/CMDLINE". Inflating dummy.EFI pads the FAT32 volume
+# exactly the way the old, oversized KERNEL/INITRD used to, but every
+# added byte is now cold - never read by ATAPI, never read by INT13h
+# either, completely inert filler that only exists to satisfy
+# mkfs.vfat's own cluster-count arithmetic.
+#
+# TARGET_VOLUME_MB reproduces very close to the OLD total FAT32 volume
+# size (iso.sh: img_size_mb = payload_size/1MiB + 8) - comfortable,
+# already-proven margin over the real 36MiB crossover point above, not
+# a newly-guessed minimum.
+TARGET_VOLUME_MB = 40
+payload_before_efi = kernel_file_size + INITRD_BYTES + len(cmdline_bytes)
+efi_padding_bytes = (TARGET_VOLUME_MB - 8) * 1024 * 1024 - payload_before_efi
+assert efi_padding_bytes > 0, "kernel+initrd+cmdline already exceed the target volume size"
 with open(f"{w}/dummy.EFI", "wb") as f:
-    f.write(b"\x00" * 64)
+    f.write(bytes(efi_padding_bytes))
 PYEOF
 
 echo "== building the test ISO via this project's own iso.sh =="
@@ -146,10 +206,34 @@ mv "$W/dummy.iso" "$W/test.iso"
 
 MONITOR_PORT=45678
 
-echo "== booting under QEMU (El Torito, INT13h backend, no acceleration assumed) =="
+# backend_label: cosmetic-only (F5, unidoc-alip's PR #5 review) - the
+# old banner said "INT13h backend" unconditionally, even under
+# FORCE_ATAPI=1, which is the whole point of that variant.
+if [ -n "${FORCE_ATAPI:-}" ]; then
+    backend_label="forced-ATAPI backend"
+else
+    backend_label="INT13h backend"
+fi
+
+echo "== booting under QEMU (El Torito, $backend_label, no acceleration assumed) =="
+# -serial file:$W/serial.log, not -serial none (F5): stage2 itself
+# never writes to the serial port (bios/console.c is VGA-text-only,
+# confirmed by reading it - grep for outb/0x3f8/serial/COM1 there
+# turns up nothing), but SeaBIOS's own boot-device probing does, by
+# default, and this is a genuinely independent capture channel from
+# the VGA-snapshot polling below (a plain byte stream to a file, no
+# polling/timing race) - see that review's own finding for why the
+# VGA-only view wasn't enough to diagnose a real failure: two real CI
+# timeouts both captured a completely BLANK VGA snapshot, which
+# doesn't match this test's own "loading kernel" slow-crawl theory
+# (a blank screen means stage2 never printed ITS OWN startup banner
+# either) and was left unexplained - a capture-mechanism gap, not a
+# root cause fix. This log is printed on every non-PASS outcome below
+# so the NEXT failure, whatever it turns out to be, is diagnosable
+# instead of another guess.
 qemu-system-x86_64 \
     -cdrom "$W/test.iso" \
-    -m 256 -display none -no-reboot -no-shutdown -serial none -machine pc \
+    -m 256 -display none -no-reboot -no-shutdown -serial file:"$W/serial.log" -machine pc \
     -monitor "tcp:127.0.0.1:$MONITOR_PORT,server,wait=off" \
     >"$W/qemu.log" 2>&1 &
 qemu_pid=$!
@@ -187,39 +271,73 @@ def snapshot():
         lines.append(line.rstrip())
     return "\n".join(lines)
 
-# 300s, not 90s - raised after a real CI failure (both the push and
-# pull_request runs on the 0.1.0-hardening-pass branch timed out here,
-# identically) that turned out NOT to be a #cs-at-entry regression or
-# any other driver bug: this exact commit, built and booted under the
-# EXACT QEMU 8.2.2 + SeaBIOS 1.16.3 combination GitHub's ubuntu-latest
-# runner apt-installs (fetched and reproduced locally, byte-for-byte
-# matching versions), reaches "starting kernel" in well under a second
-# with the host otherwise idle - proving the code itself is correct.
-# Deliberately saturating all cores first (28 `yes` processes on 4
-# cores, load average ~29) reproduced the exact failure symptom -
-# "loading kernel" advancing one dot roughly every 5s instead of
-# instantly - and it still reached "starting kernel" and "done" every
-# time, just slowly: real, continuing forward progress, not a hang.
-# Root cause: FORCE_ATAPI's PIO transfer issues thousands of individual
-# inb/outb port operations (~1800 READ(10) commands for a 32MB
-# kernel+initrd at NATIVE_BATCH=9, each with its own wait_status_clear
-# spin-wait) - every one is a VM-exit under software emulation, and
-# wait_status_clear's own 20-million-iteration ceiling (ata_atapi.c) is
-# deliberately an ITERATION count, not a wall-clock one (see that
-# constant's own comment - a real-time budget would need interrupts
-# enabled for the WHOLE wait, which this driver can't assume). That's
-# the right call for the driver's own real hang-detection purpose, but
-# it means the REAL wall-clock cost of a full transfer scales with
-# whatever this host's own per-VM-exit cost happens to be at the
-# moment - fine on an idle dedicated machine, not fine on a CI runner
-# sharing physical cores with other tenants at the hypervisor level
-# (real, well-documented CPU steal-time noise, orthogonal to GitHub
-# Actions' own per-job VM isolation). 300s leaves over 100x this
-# project's own real, repeatedly-measured ~2.3s idle-host baseline
-# (see the hardening ledger) - generous enough to absorb realistic CI
-# noise without masking an actual hang (a genuinely wedged device would
-# still exceed it, just as before).
-deadline = time.time() + 300
+# 60s - tight, and based on real measurement, not padding. History,
+# kept because it's the actual evidence this number rests on:
+#
+# A real CI failure (push and pull_request both, 0.1.0-hardening-pass
+# branch) turned out NOT to be a #cs-at-entry regression or any other
+# driver bug: this project's own stage-iso.bin, built and booted under
+# the EXACT QEMU 8.2.2 + SeaBIOS 1.16.3 combination GitHub's
+# ubuntu-latest runner apt-installs (fetched and reproduced locally,
+# byte-for-byte matching versions), reached "starting kernel" in well
+# under a second with the host otherwise idle - proving the code
+# itself was correct. Deliberately saturating all local cores (28x
+# `yes` on 4 cores, load ~29) reproduced the exact CI failure symptom
+# for real - "loading kernel" crawling instead of instant - and it
+# still reached "starting kernel" and "done" every time, just slowly:
+# real, continuing forward progress, never a hang.
+#
+# Root cause: this test's OLD 20MiB kernel + 12MiB initrd meant
+# FORCE_ATAPI=1 pushed ~32MB through ~1800 individual ATAPI READ(10)
+# commands (NATIVE_BATCH=9 sectors/command in cdrom_disk.c), each with
+# its own wait_status_clear() spin-wait (ata_atapi.c) - a deliberate
+# ITERATION-count timeout, not wall-clock (a real-time budget would
+# need interrupts enabled for the whole wait, which this driver can't
+# assume this early in boot - see that constant's own comment). Every
+# inb/outb in that spin loop is a VM-exit under QEMU's software (TCG)
+# CPU emulation, so the REAL wall-clock cost of ~1800 commands' worth
+# of these scales with whatever this host's own per-VM-exit cost
+# happens to be at the moment - trivial on an idle dedicated machine,
+# not on a CI runner sharing physical cores with other tenants at the
+# hypervisor level (real, well-documented CPU steal-time noise,
+# orthogonal to GitHub Actions' own per-job VM isolation). Raising
+# this deadline alone (90s, then 300s, then 900s - each one still not
+# comfortably clearing a real subsequent CI run) never fixed anything:
+# it only bought the same ~1800-command cost more time to finish in,
+# which also means a REAL ATAPI regression could take up to however
+# long this deadline is to even get flagged.
+#
+# The actual fix: this test's OLD 20MiB/12MiB sizing was never really
+# about exercising that much ATAPI traffic - it was a side effect of
+# coupling two unrelated things (see the kernel/initrd generator above
+# for the full explanation and the real fat_mount()/mkfs.vfat cluster-
+# count numbers): the on-disk FAT32 volume's own total size, which
+# genuinely needs to be large, and how much of that volume is real
+# KERNEL/INITRD content this test actually reads over the slow ATAPI
+# PIO path, which does not need to be anywhere near that large.
+# dummy.EFI now carries ALL of the volume-padding weight (cold filler
+# bytes stage2_main.c never reads - confirmed directly: it only ever
+# opens /EFI/ALPINE/{KERNEL,INITRD,CMDLINE}), while KERNEL/INITRD
+# shrank to 2MiB/1MiB - still comfortably multiple ATAPI commands
+# (~171, not 1) and multiple progress dots, still the real native
+# ATAPI path, real FAT32 traversal, real kernel/initrd loading -
+# proven identical on-disk FAT32 (80628 clusters, same as before) and
+# a real successful boot, just ~10.6x less data moved.
+#
+# Measured (this exact 2MiB/1MiB payload, same CI-matching QEMU
+# 8.2.2/SeaBIOS 1.16.3 binaries used throughout this investigation):
+#   idle host:                                          3.7s
+#   load ~26 (28x `yes`/4 cores - the SAME contention     5.1s
+#     level that took the OLD 32MB payload 173.6s)
+#   load ~48 (56x `yes`/4 cores - roughly double the      9.7s
+#     contention that made the OLD payload fail in CI)
+# 60s leaves >6x the worst of those real measurements, at a
+# contention level already well past what two real observed CI
+# failures needed to occur - tight enough that an actual regression
+# (a real hang, not just slow) is flagged in under a minute instead of
+# quietly eating up to 900s of CI time, and no longer built on "make
+# the number bigger and hope."
+deadline = time.time() + 60
 last = None
 while time.time() < deadline:
     text = snapshot()
@@ -236,7 +354,7 @@ while time.time() < deadline:
         # "starting kernel" via some path that never actually exercised
         # the indirect call at all). progress_dot() (stage2_main.c)
         # prints one '.' via console_putc() per real 1MiB of progress -
-        # the synthetic kernel/initrd this test builds are 20MB/12MB
+        # the synthetic kernel/initrd this test builds are 2MiB/1MiB
         # (see this file's own header comment), comfortably enough to
         # cross that threshold many times over during a real, working
         # boot. Counted in the "loading kernel"..."done" window
@@ -260,8 +378,30 @@ while time.time() < deadline:
         sys.exit(0)
     time.sleep(2)
 
+# unidoc-alip's PR #5 review (F5): two real CI timeouts both captured
+# a completely BLANK VGA snapshot - inconsistent with this test's own
+# slow-crawl theory (a blank screen means stage2 never even printed
+# its own startup banner) and never explained. `info registers` here
+# is a second, independent signal at the exact moment of timeout: it
+# comes straight from the monitor, not from polling text-mode video
+# memory, so it still says something useful even if the VGA capture
+# itself is blank/wrong (an actual real vs. capture-artifact question
+# this test could not previously answer at all).
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    time.sleep(0.2)
+    s.recv(4096)
+    s.sendall(b"info registers\n")
+    time.sleep(0.3)
+    regs = s.recv(8192).decode("ascii", "replace")
+    s.close()
+except OSError as e:
+    regs = f"(could not query monitor for info registers: {e})"
+
 print("TIMEOUT")
 print(last or "(no VGA output ever captured)")
+print("--- info registers at timeout ---")
+print(regs)
 PYEOF
 )"
 
@@ -270,24 +410,41 @@ kill -9 "$qemu_pid" 2>/dev/null || true
 status_line="$(echo "$result" | head -1)"
 screen="$(echo "$result" | tail -n +2)"
 
+# unidoc-alip's PR #5 review (F5): the old harness ran QEMU with
+# -serial none and never printed $W/qemu.log, so a failure gave no
+# diagnostics beyond one VGA text snapshot - and that snapshot came
+# back completely blank on both real CI timeouts this review found,
+# which this test's own FAIL message couldn't explain. Print both
+# real, independent logs on every non-PASS outcome now.
+print_diagnostics() {
+    echo "--- \$W/qemu.log (QEMU's own stdout/stderr) ---" >&2
+    cat "$W/qemu.log" >&2 2>/dev/null || echo "(no qemu.log)" >&2
+    echo "--- \$W/serial.log (SeaBIOS + guest serial output, if any) ---" >&2
+    cat "$W/serial.log" >&2 2>/dev/null || echo "(no serial.log)" >&2
+}
+
 case "$status_line" in
     PASS)
         ok "ISO El-Torito boot loaded kernel+initrd through a non-NULL progress callback and reached 'starting kernel'"
         ;;
     PASS_BUT_NO_PROGRESS_DOTS)
         echo "$screen" >&2
+        print_diagnostics
         bad "boot reached 'starting kernel' but printed zero progress-dot characters during the kernel load - the success messages alone don't prove the indirect progress_dot() callback actually fired (the exact gap this check exists to close)"
         ;;
     FATAL)
         echo "$screen" >&2
+        print_diagnostics
         bad "stage2 reported a FATAL error - see captured screen above"
         ;;
     TIMEOUT)
         echo "$screen" >&2
-        bad "boot never reached 'starting kernel' within the timeout - if the screen above is stuck at 'loading kernel' with no progress, this is the #cs=SEG-at-entry regression this test exists to catch"
+        print_diagnostics
+        bad "boot never reached 'starting kernel' within the timeout - if the screen above is stuck at 'loading kernel' with no progress, this is the #cs=SEG-at-entry regression this test exists to catch; if the screen above is BLANK, see the qemu.log/serial.log just printed instead - a blank VGA snapshot means stage2 never even reached its own startup banner (or the VGA snapshot itself is the unreliable part - this is exactly the unresolved case unidoc-alip's PR #5 review flagged, see the hardening ledger)"
         ;;
     *)
         echo "$result" >&2
+        print_diagnostics
         bad "unexpected test harness output"
         ;;
 esac
