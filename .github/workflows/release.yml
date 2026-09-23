@@ -49,7 +49,14 @@ jobs:
           }
 
   build-x86_64:
-    needs: verify-version
+    # needs build-tool too, not just verify-version: build.sh bakes
+    # cmd/tool's own binary straight into the image at /boot/alpine-zfsboot
+    # (see build.sh's own comment there) and fails fast if it isn't already
+    # sitting in out/ before build.sh runs - build-tool is the job that
+    # produces it (with the real pushed tag stamped into --version, which a
+    # second build here could not replicate), so its artifact has to land
+    # in this job's own out/ first.
+    needs: [verify-version, build-tool]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -57,6 +64,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: alpine-zfsboot-tool
+          path: out
+
+      - name: Make downloaded cmd/tool binaries executable
+        run: chmod +x out/alpine-zfsboot-x86_64 out/alpine-zfsboot-aarch64
 
       # No job-level `container:` - GitHub only bundles a Node runtime
       # for x64 Alpine containers, not arm64 (confirmed the hard way in
@@ -67,11 +82,10 @@ jobs:
       - name: Build EFI image (x86_64)
         run: |
           set -e
-          mkdir -p out
           docker run --rm \
             -v "$PWD:/work" -w /work \
             -e OUT_DIR=/work/out \
-            alpine:3.24 sh -c '
+            alpine:$(cat alpine-version.txt) sh -c '
               set -eu
               apk update
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
@@ -85,6 +99,13 @@ jobs:
           # ownership here, same fix already proven in unidoc-aports'
           # own CI for the identical container-writes-as-root pattern.
           sudo chown -R "$(id -u):$(id -g)" out/
+          # Already published under the build-tool job's own
+          # alpine-zfsboot-tool artifact (that's where these came from,
+          # downloaded above) - build.sh only reads them, never removes
+          # them, so left alone they'd upload here too and publish's own
+          # merge-multiple download would just overwrite one copy with an
+          # identical other. Not incorrect, just a redundant upload.
+          rm -f out/alpine-zfsboot-x86_64 out/alpine-zfsboot-aarch64
           ls -la out/
 
       - uses: actions/upload-artifact@v4
@@ -94,7 +115,9 @@ jobs:
           if-no-files-found: error
 
   build-aarch64:
-    needs: verify-version
+    # See build-x86_64's own comment on why build-tool is a real
+    # dependency, not just verify-version.
+    needs: [verify-version, build-tool]
     # Native runner, not QEMU - this repo's own build doesn't compile
     # anything (zfs-lts ships prebuilt kernel modules, objcopy/mkinitfs
     # just move bytes around), so QEMU emulation would probably be
@@ -108,14 +131,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: alpine-zfsboot-tool
+          path: out
+
+      - name: Make downloaded cmd/tool binaries executable
+        run: chmod +x out/alpine-zfsboot-x86_64 out/alpine-zfsboot-aarch64
+
       - name: Build EFI image (aarch64)
         run: |
           set -e
-          mkdir -p out
           docker run --rm \
             -v "$PWD:/work" -w /work \
             -e OUT_DIR=/work/out \
-            alpine:3.24 sh -c '
+            alpine:$(cat alpine-version.txt) sh -c '
               set -eu
               apk update
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
@@ -129,6 +159,7 @@ jobs:
           # ownership here, same fix already proven in unidoc-aports'
           # own CI for the identical container-writes-as-root pattern.
           sudo chown -R "$(id -u):$(id -g)" out/
+          rm -f out/alpine-zfsboot-x86_64 out/alpine-zfsboot-aarch64
           ls -la out/
 
       - uses: actions/upload-artifact@v4
@@ -166,8 +197,35 @@ jobs:
           # own `--version` flag (see cmd/tool/main.go) - a local
           # `go build`/`just build-tool` has no tag to attribute
           # itself to, so it keeps the "dev" default instead.
-          GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=${{ github.ref_name }}" -o out/alpine-zfsboot-x86_64 ./cmd/tool
-          GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version=${{ github.ref_name }}" -o out/alpine-zfsboot-aarch64 ./cmd/tool
+          # CGO_ENABLED=0 explicitly on BOTH - amd64 is this runner's
+          # own native arch, so without this it silently cgo-links
+          # against the runner's glibc (confirmed: `file` on the
+          # resulting binary shows a real dynamic ELF interpreter,
+          # /lib64/ld-linux-x86-64.so.2) instead of coming out static.
+          # A target running this on musl-based Alpine (every real
+          # target this binary is for) would fail outright. arm64 is
+          # cross-compiled here, which already disables cgo by
+          # default (no cross C toolchain available) - static either
+          # way - but setting this on both makes that not an accident
+          # of which arch happens to match the runner.
+          # $GITHUB_REF_NAME (an env var this runner already sets, read
+          # inside the shell), NOT a literal ${{ github.ref_name }}
+          # interpolation into this script - a full source audit found
+          # this was the one template-injection sink across all four
+          # workflows in this project. GitHub expands ${{ }} textually
+          # into the script BEFORE bash ever sees it, and
+          # `git check-ref-format` permits `` ` ``, $, ", ;, &, |, (, )
+          # in a tag name (it only bans space/control chars/~^:?*[\ and
+          # a few structural patterns) - a tag like
+          # `v0.1.1"; curl ...|sh; #` pushed to this repo would execute
+          # arbitrary commands inside this job. verify-version, earlier
+          # in this same file, already does this correctly
+          # (`want="${GITHUB_REF_NAME#v}"`) - matching that pattern here
+          # closes the gap. The precondition is real but narrow: pushing
+          # a tag requires write access to this repo already, so this
+          # is a hardening fix, not a fork-PR-exploitable one.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=$GITHUB_REF_NAME" -o out/alpine-zfsboot-x86_64 ./cmd/tool
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version=$GITHUB_REF_NAME" -o out/alpine-zfsboot-aarch64 ./cmd/tool
           ls -la out/
 
       - uses: actions/upload-artifact@v4
@@ -182,6 +240,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only for the release body's own "Built on Alpine X.Y" line below -
+      # everything that actually builds anything already read
+      # alpine-version.txt in its own job.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            alpine-version.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Read alpine-version.txt
+        run: echo "ALPINE_VERSION=$(cat alpine-version.txt)" >> "$GITHUB_ENV"
+
       - uses: actions/download-artifact@v4
         with:
           path: out
@@ -197,7 +268,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: alpine-zfsboot ${{ github.ref_name }}
-          body: "Built on Alpine 3.24. A self-contained Alpine Linux ZFS bootloader, installer, and remote recovery environment for BIOS and UEFI systems. For each of x86_64/aarch64: .EFI, .iso, and loose vmlinuz/initramfs.img/cmdline.txt (GRUB chainload) - both consoles active, switch live from the menu. Also included: the legacy BIOS boot code (x86_64 only, GPT and MBR partition tables both supported by the same stage1/stage2/bootblob files) and alpine-zfsboot-x86_64/alpine-zfsboot-aarch64 (cmd/tool - the install-time version/update helper). SHA256SUMS covers every asset here."
+          body: "Built on Alpine ${{ env.ALPINE_VERSION }}. A self-contained Alpine Linux ZFS bootloader, installer, and remote recovery environment for BIOS and UEFI systems. For each of x86_64/aarch64: .EFI, .iso, and loose vmlinuz/initramfs.img/cmdline.txt (GRUB chainload, and the BIOS FAT payload) - both consoles active, switch live from the menu. Also included: the legacy BIOS boot code (x86_64 only, GPT and MBR partition tables both supported by the same stage1/stage2 files - both read the same FAT/ESP partition UEFI mode uses) and alpine-zfsboot-x86_64/alpine-zfsboot-aarch64 (cmd/tool - the install-time version/update helper). SHA256SUMS covers every asset here."
           generate_release_notes: true
           files: |
             out/*

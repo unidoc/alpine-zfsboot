@@ -5,8 +5,10 @@
 
 /*
  * Minimal GPT header + partition-array reading - only what stage2
- * needs: find the one partition it cares about (the "alpine-zfsboot
- * boot blob", by type GUID) and hand back its starting LBA + size. No
+ * needs: find the one partition it cares about (the canonical
+ * alpine-zfsboot FAT/ESP partition, by type GUID - see
+ * ZFSBOOT_ESP_TYPE_GUID_BYTES below) and hand back its starting LBA +
+ * size. No
  * writing, no CRC verification of the partition array (the header's
  * own CRC is checked - see gpt_read() - but re-summing the whole
  * partition array on every boot is real code+time this stage doesn't
@@ -79,26 +81,39 @@ struct gpt_partition_entry {
 } __attribute__((packed));
 
 /*
- * ZFSBOOT_BOOTBLOB_TYPE_GUID: a real, freshly generated random UUID
- * (f5bd658b-eee4-402f-be5b-d939c082b649), specific to this project,
- * not reused from anywhere else - same precedent as EFIVAR_GUID in
- * init/menu.py. Identifies the one partition on a legacy-BIOS/GPT
- * disk that holds the boot-blob (see bootblob.h) build.sh packs and
- * this code reads - deliberately a NEW type GUID, not GRUB's own
- * "BIOS boot partition" GUID (21686148-6449-6E6F-744E-656564454649,
- * which the *stage1/stage2 code itself* lives on instead, at a fixed
- * LBA stage1 already knows by construction - see stage1.S - so it
- * never needs to be found via GPT lookup at all).
+ * ZFSBOOT_ESP_TYPE_GUID: the REAL, standard EFI System Partition type
+ * GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B - the same GUID `sgdisk
+ * -t N:EF00` writes, and the one UEFI firmware itself looks for).
+ * Deliberately NOT a project-specific GUID: since alpine-zfsboot's own
+ * unified architecture change, this ESP is the single canonical,
+ * firmware-neutral alpine-zfsboot storage partition on every layout -
+ * UEFI firmware loads BOOTX64.EFI/BOOTAA64.EFI from it directly, and
+ * on legacy-BIOS/GPT disks THIS code (stage2's own FAT reader, see
+ * fat.h) finds the exact same partition, by the exact same real ESP
+ * identity, to load the kernel/initramfs/cmdline stage2 needs - one
+ * partition, one identity, both firmware paths. This retires the
+ * project's own former ZFSBOOT_BOOTBLOB_TYPE_GUID (a freshly generated
+ * random UUID that identified a filesystem-less "boot blob" partition
+ * format this project no longer uses at all - see git history, not
+ * this file, for that format).
+ *
+ * Distinct from GRUB's own "BIOS boot partition" GUID
+ * (21686148-6449-6E6F-744E-656564454649), which the *stage1/stage2
+ * code itself* lives on instead, at a fixed LBA stage1 already knows
+ * by construction - see stage1.S - so it never needs to be found via
+ * GPT lookup at all.
  *
  * Stored here in the mixed-endian on-disk byte order the GPT spec
  * itself uses for every GUID field (first three fields little-endian,
  * last two as-is) - computed once for real (not hand-converted) and
  * cross-checked against Python's own uuid module before being written
- * here, not just eyeballed hex.
+ * here, not just eyeballed hex; verified against this file's own
+ * pre-existing ZFSBOOT_BOOTBLOB_TYPE_GUID_BYTES entry (same byte-order
+ * algorithm, known-correct worked example) before being trusted.
  */
-#define ZFSBOOT_BOOTBLOB_TYPE_GUID_BYTES \
-	{ 0x8b, 0x65, 0xbd, 0xf5, 0xe4, 0xee, 0x2f, 0x40, \
-	  0xbe, 0x5b, 0xd9, 0x39, 0xc0, 0x82, 0xb6, 0x49 }
+#define ZFSBOOT_ESP_TYPE_GUID_BYTES \
+	{ 0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, \
+	  0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b }
 
 /*
  * Reads and validates the primary GPT header (signature + CRC32 of
@@ -114,7 +129,8 @@ int gpt_read_header(struct gpt_header *hdr);
 /*
  * Scans the partition array for the first entry whose type_guid
  * matches type_guid (16 raw bytes, on-disk order - pass
- * ZFSBOOT_BOOTBLOB_TYPE_GUID_BYTES for the boot-blob partition).
+ * ZFSBOOT_ESP_TYPE_GUID_BYTES for the canonical alpine-zfsboot FAT/ESP
+ * partition).
  * On a match, fills *start_lba and *sector_count (inclusive range
  * converted to a plain count) and returns 0. Returns -1 if no
  * matching partition is found, or if hdr itself looks invalid.

@@ -37,7 +37,11 @@
 # stdlib subset it needs, not the whole package - see the FEATURES
 # comment below), dialog (the menu's actual rendering - see menu.py's
 # own header comment), ncurses-terminfo-base (terminfo entries dialog
-# itself needs at runtime), xz (mkinitfs's initramfs compression),
+# itself needs at runtime), xz (bundled into the rescue image itself
+# for boot-dataset.sh's own decompress_initrd() - a TARGET system's
+# separately-built initramfs may be xz-compressed even though this
+# project's OWN rescue initramfs is gzip now, see this file's own "-C
+# gzip, NOT xz" comment below),
 # xorriso/dosfstools/mtools (iso.sh's ISO wrapper, called at the end),
 # sgdisk (bundled into the rescue shell itself, not used by this
 # script - see the alpine-zfsboot.files list below).
@@ -144,8 +148,40 @@ cd "$BUILD_DIR"
 # also how the /boot/vmlinuz-<flavor> filename maps to a real module
 # tree, both here and later at real boot time when the target system's
 # own linux-<flavor> package is a different build.
-KVER="$(basename "$(find /lib/modules -maxdepth 1 -type d -name '*-*' | head -1)")"
-[ -n "$KVER" ] || { echo "no /lib/modules/* found - is linux-$KERNEL_FLAVOR installed?" >&2; exit 1; }
+#
+# Asked apk itself which /lib/modules/<kver> directory belongs to
+# linux-$KERNEL_FLAVOR specifically, rather than globbing
+# /lib/modules and taking whatever `find | head -1` happens to list
+# first - a full source audit flagged the old form as non-deterministic
+# and silently wrong if a second kernel package's module tree is ever
+# present in the same build container (a leftover from a previous apk
+# layer, or a build-image change that installs more than one
+# linux-<flavor> for other reasons): `find`'s ordering is not
+# guaranteed to match $KERNEL_FLAVOR at all, and every check after this
+# line (file exists, mkinitfs succeeds, initramfs contains a zfs.ko)
+# would keep passing even while bundling modules built for the WRONG
+# kernel - a mismatch that only surfaces as a real boot failure
+# ("modules ... zfs: unknown symbol" or similar) on real hardware, not
+# here. `apk info -L` lists the exact paths the linux-$KERNEL_FLAVOR
+# package itself installed, so this ties KVER to that package
+# deterministically instead of to whatever /lib/modules happens to
+# contain.
+# `usr/lib/modules/` as well as a bare `lib/modules/` - `apk info -L`
+# prints paths relative to /, with no leading slash, and Alpine has
+# been moving toward a /usr merge (bin/sbin/lib as symlinks into
+# usr/); this pins to whichever prefix alpine-version.txt's own Alpine
+# release actually uses without having to know that in advance, rather
+# than guessing one and hard-failing on the other the moment it moves
+# (the exact "cannot resolve a hard-earned system fact until the guess
+# is finally proven wrong on a real build" bug class this file's own
+# [ -d ... ] sanity check just below already exists to catch, made
+# narrower by allowing both known-real prefixes here instead).
+KVER="$(apk info -L "linux-$KERNEL_FLAVOR" 2>/dev/null | sed -n 's#^\(usr/\)\{0,1\}lib/modules/\([^/]*\)/.*#\2#p' | sort -u)"
+case "$(printf '%s\n' "$KVER" | wc -l)" in
+    1) [ -n "$KVER" ] || { echo "linux-$KERNEL_FLAVOR is not installed (apk info -L returned nothing under lib/modules/ or usr/lib/modules/)" >&2; exit 1; } ;;
+    *) echo "linux-$KERNEL_FLAVOR's own file list names more than one /lib/modules/<kver> directory - can't pick one deterministically: $(printf '%s ' $KVER)" >&2; exit 1 ;;
+esac
+[ -d "/lib/modules/$KVER" ] || { echo "linux-$KERNEL_FLAVOR claims kernel version $KVER but /lib/modules/$KVER does not exist" >&2; exit 1; }
 KERNEL="/boot/vmlinuz-$KERNEL_FLAVOR"
 [ -f "$KERNEL" ] || { echo "$KERNEL not found" >&2; exit 1; }
 
@@ -542,10 +578,11 @@ mkdir -p "$BUILD_DIR/features.d"
     # package, not a busybox symlink), so it must be bundled explicitly
     # like dbclient/zgenhostid above, not assumed. xz alongside it for
     # the same reason boot-dataset.sh's own decompress_initrd() needs
-    # it - this project's OWN rescue initramfs is always built with -C
-    # xz (see above), but a given TARGET system's separately-built
-    # initramfs-$KERNEL_SUFFIX might be gzip or xz depending on that
-    # system's own mkinitfs config, and only gzip has a busybox applet
+    # it - this project's OWN rescue initramfs is gzip now (see this
+    # file's own "-C gzip, NOT xz" comment), but a given TARGET system's
+    # separately-built initramfs-$KERNEL_SUFFIX might be gzip or xz
+    # depending on that system's own mkinitfs config, and only gzip has
+    # a busybox applet
     # to fall back on for free.
     command -v cpio
     command -v xz
@@ -650,6 +687,34 @@ mkdir -p "$BUILD_DIR/features.d"
     # zpool also checks) is deliberately not also bundled - nothing
     # writes anything there, so there's nothing to gain from it.
     echo /usr/share/zfs/compatibility.d
+    # cmd/tool, this project's own status/install/update/verify CLI -
+    # baked in from THIS SAME build/commit (see the cp below, which
+    # copies the just-cross-compiled out/alpine-zfsboot-$ARCH binary
+    # to this path before mkinitfs runs), not apk-installed. A rescue
+    # shell that had to `apk add alpine-zfsboot` instead would get
+    # whatever version unidoc-aports last happened to package - which
+    # lags behind this repo's own master by however long it's been
+    # since someone last bumped that APKBUILD's pkgver, and could be
+    # flat-out incompatible with THIS build's own on-disk layout
+    # (internal/layout's ABI constants) if the two ever drift. Bundling
+    # the freshly-built binary here instead means the rescue shell's
+    # own alpine-zfsboot always matches the image it's running on,
+    # exactly - the same guarantee status/verify/update/install already
+    # give an operator on an already-installed target OS, now also true
+    # of the rescue environment itself. `apk add alpine-zfsboot` is
+    # still how a target OS gets it post-install (see alpine-installer's
+    # own README) - this is only about what ships inside THIS image.
+    #
+    # /boot/alpine-zfsboot, deliberately NOT /usr/bin/alpine-zfsboot:
+    # this rescue shell's own `apk add` is real (see the `command -v
+    # apk` entry above) - an operator running `apk add alpine-zfsboot`
+    # by habit inside a live rescue session would install straight
+    # over /usr/bin/alpine-zfsboot if that's where this baked-in copy
+    # lived, silently replacing the exactly-matching build with
+    # whatever unidoc-aports last packaged. /boot is not on $PATH, so
+    # it has to be invoked as /boot/alpine-zfsboot - a small, correct
+    # price for "the baked-in copy can never be clobbered by mistake".
+    echo /boot/alpine-zfsboot
 } > "$BUILD_DIR/features.d/alpine-zfsboot.files"
 
 # Deliberately using mkinitfs's `dhcp` feature (small: af_packet.ko +
@@ -742,6 +807,21 @@ cp "$REPO_ROOT/init/alpine-zfsboot-shell" /alpine-zfsboot-shell
 cp "$REPO_ROOT/init/dialogrc" /etc/dialogrc
 chmod +x /menu.py /boot-dataset.sh /net-config.sh /rescue-ssh.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
 
+# cmd/tool's own binary, built by `just build-tool` (a Justfile
+# dependency of the `build` recipe - see Justfile) BEFORE this script
+# ever runs, straight from this checkout's own source, no Docker/apk
+# involved for this one piece. Same $ARCH this whole script is already
+# building for - build-tool's own GOARCH mapping (amd64/arm64) names
+# its output out/alpine-zfsboot-x86_64 / out/alpine-zfsboot-aarch64 to
+# match $ARCH exactly, no translation needed here.
+[ -f "$OUT_DIR/alpine-zfsboot-$ARCH" ] || { echo "$OUT_DIR/alpine-zfsboot-$ARCH not found - run 'just build-tool' first (the Justfile's build recipe already depends on it)" >&2; exit 1; }
+# /boot, not /usr/bin - see the alpine-zfsboot.files entry above for why
+# (apk add alpine-zfsboot inside the rescue shell must never be able to
+# clobber this exact-match build). /boot already exists on this build
+# container (linux-$KERNEL_FLAVOR's own install populates it).
+cp "$OUT_DIR/alpine-zfsboot-$ARCH" /boot/alpine-zfsboot
+chmod +x /boot/alpine-zfsboot
+
 # /etc/shells, listing /alpine-zfsboot-shell - load-bearing for rescue SSH,
 # not documentation. dropbear's own checkusername() (confirmed against the
 # real bundled binary, not just its docs) refuses a login OUTRIGHT if the
@@ -828,24 +908,65 @@ echo "$BUILD_STAMP" > /etc/alpine-zfsboot-build-stamp
 # here, so a release bump is one file edit, not a build.sh change too.
 cat "$REPO_ROOT/version.txt" > /etc/alpine-zfsboot-version
 
-# -C xz: back to mkinitfs's better compression after an early false
-# lead this project chased for a while. gzip was adopted earlier this
-# session when a real boot hit "RAMDISK: Couldn't find valid RAM disk
-# image starting at 0." right after the EFI loader's own initrd
-# delivery - at the time this looked like it might be a kernel xz-
-# support gap, since the archive itself checked out fine offline
-# (`xzcat ... | cpio -itv` showed real XZ, /init at the root, correct
-# mode). The REAL bug, found later the same session, was entirely
-# different and upstream of compression altogether: efi/initrd.c was
-# using gnu-efi's CopyMem_1 across an ABI mismatch that silently
-# copied nothing, handing the kernel a buffer of firmware poison bytes
-# instead of the real initrd - which a kernel decompressor of any kind
-# would equally fail to recognize. Once that was fixed (see initrd.c's
-# own comment), initrd delivery started working correctly regardless
-# of compression, and this had never actually been an xz-vs-gzip
-# problem to begin with. Back to xz now for the real size win.
+# -C gzip, NOT xz: a real, direct latency measurement, not a re-guess of
+# the earlier xz-vs-gzip false lead noted below. `alpine-zfsboot status`
+# was measured at 6.37s wall-clock on a real Hetzner CAX aarch64 machine,
+# almost entirely CPU time (`real 6.37s` / `user 6.34s`) spent inside
+# internal/initrdinfo decompressing this rescue initramfs purely to find
+# zfs.ko's own version string. Benchmarked directly (go tool pprof +
+# hand timing, identical realistic content, both via Go): this project's
+# own pure-Go xz decoder (github.com/ulikunitz/xz, kept for reading
+# already-deployed xz artifacts - see internal/initrdinfo's own header
+# comment) sustains ~37-43MB/s; Go's stdlib compress/gzip sustains
+# ~170-175MB/s on the exact same data - a ~4.6x gap, confirmed via
+# pprof to be the LZMA range-decoder's own inherent bit-level cost, not
+# a usage inefficiency (no GC/syscall/buffering pathology found). The
+# ESP/FAT partition alpine-installer provisions is a fixed 512MiB
+# (alpine-install-zfs.sh's own `sgdisk -n ...:+512MiB`) - gzip's own
+# ~1.6x larger compressed size versus xz on the same content (a few MiB
+# in absolute terms for this project's own initramfs) is negligible
+# against that, unlike the LZMA decode cost, which is paid in full on
+# every single status/verify call. See the hardening ledger's own entry
+# for the full benchmark.
+#
+# The historical note below (why this project once believed gzip itself
+# was implicated in a real boot bug, and what the bug actually was) is
+# kept for context - that investigation is unrelated to and superseded
+# by the real performance measurement above, not a reason to doubt this
+# switch.
+#
+# gzip was adopted earlier in this project's history when a real boot
+# hit "RAMDISK: Couldn't find valid RAM disk image starting at 0."
+# right after the EFI loader's own initrd delivery - at the time this
+# looked like it might be a kernel xz-support gap, since the archive
+# itself checked out fine offline (`xzcat ... | cpio -itv` showed real
+# XZ, /init at the root, correct mode). The REAL bug, found later the
+# same session, was entirely different and upstream of compression
+# altogether: efi/initrd.c was using gnu-efi's CopyMem_1 across an ABI
+# mismatch that silently copied nothing, handing the kernel a buffer of
+# firmware poison bytes instead of the real initrd - which a kernel
+# decompressor of any kind would equally fail to recognize. Once that
+# was fixed (see initrd.c's own comment), initrd delivery started
+# working correctly regardless of compression, and this had never
+# actually been an xz-vs-gzip
+# problem to begin with.
 mkinitfs -i "$REPO_ROOT/init/init" -P "$BUILD_DIR/features.d" \
-    -F "$FEATURES" -C xz -o initramfs.img "$KVER"
+    -F "$FEATURES" -C gzip -o initramfs.img "$KVER"
+
+# Explicit, immediate format check - the exact class of bug a real
+# pre-release audit found just below (the verification step a few
+# lines down was still extracting with `xz -dc` after this line had
+# already been switched to `-C gzip`, a leftover from before the
+# switch that unit/Go tests never caught since nothing in them runs
+# this far). Checking the real magic bytes right here, right after
+# mkinitfs produces the file, means a future accidental compression/
+# tooling mismatch fails loudly at the exact point it was introduced,
+# not several steps later with a confusing decompressor error.
+initramfs_magic="$(od -An -tx1 -N2 initramfs.img | tr -d ' ')"
+if [ "$initramfs_magic" != "1f8b" ]; then
+    echo "initramfs.img does not start with the gzip magic bytes (1f8b, got $initramfs_magic) - mkinitfs's own -C flag and this script's later extraction/verification steps have drifted apart; keep them in sync" >&2
+    exit 1
+fi
 
 # --- verify menu.py's own import chain against what actually got bundled --
 # Catches, at build time with no VM/hardware needed, exactly the
@@ -866,7 +987,15 @@ mkinitfs -i "$REPO_ROOT/init/init" -P "$BUILD_DIR/features.d" \
 verify_dir="$BUILD_DIR/initramfs-verify"
 rm -rf "$verify_dir"
 mkdir -p "$verify_dir"
-(cd "$verify_dir" && xz -dc "$BUILD_DIR/initramfs.img" | cpio -idm --quiet)
+# gzip, not xz: this project's OWN rescue initramfs.img is gzip now
+# (see this file's own "-C gzip, NOT xz" comment above) - a real
+# pre-release audit found this line had been left extracting with xz,
+# a leftover from before that switch, which would fail outright
+# against the actual mkinitfs-produced artifact on the very next real
+# build. Exactly why this step exists: unit/Go tests all stayed green
+# throughout (nothing in them ever runs this far), so only a REAL
+# build catches a break here.
+(cd "$verify_dir" && gzip -dc "$BUILD_DIR/initramfs.img" | cpio -idm --quiet)
 if ! chroot "$verify_dir" /bin/sh -c 'cd / && exec python3 -c "import menu"' \
         2>"$BUILD_DIR/menu-import-check.log"; then
     cat "$BUILD_DIR/menu-import-check.log" >&2
@@ -889,13 +1018,23 @@ echo "menu.py import check passed against the actual bundled initramfs contents"
 # wrong before, so it fails the BUILD instead of a real boot next time.
 for f in /etc/apk/repositories /etc/apk/keys /etc/apk/world /etc/ssl/certs /etc/ssl/cert.pem \
          /lib/apk/db/installed /etc/dialogrc /etc/alpine-zfsboot-build-stamp /etc/alpine-zfsboot-version \
-         /usr/share/zfs/compatibility.d /etc/shells; do
+         /usr/share/zfs/compatibility.d /etc/shells /boot/alpine-zfsboot; do
     if [ ! -e "$verify_dir$f" ]; then
         echo "$f is missing from the bundled initramfs - its content-generation and its alpine-zfsboot.files manifest entry have drifted apart, add/fix the missing one" >&2
         exit 1
     fi
 done
 echo "bundled-file presence check passed for apk/dialog/version-stamp files"
+
+# The CLI binary specifically also needs its execute bit to actually be
+# runnable from the rescue shell, not just present - cp preserves
+# source permissions rather than guaranteeing +x on its own, and
+# out/alpine-zfsboot-$ARCH's mode depends on whatever `go build` (or a
+# umask) happened to leave it as.
+if [ ! -x "$verify_dir/boot/alpine-zfsboot" ]; then
+    echo "/boot/alpine-zfsboot is bundled but not executable" >&2
+    exit 1
+fi
 
 # /etc/shells existing isn't enough on its own - dropbear's checkusername()
 # does a byte-exact strcmp against getusershell() entries, so a stray
@@ -1205,74 +1344,37 @@ if [ "$ARCH" = "x86_64" ]; then
     make -C "$BUILD_DIR/bios" stage1.bin stage2.bin stage-iso.bin \
         ZFSBOOT_VERSION="$(cat "$REPO_ROOT/version.txt")"
 
-    # The boot-blob stage2 reads (see bios/bootblob.h for the exact,
-    # sector-aligned layout this must match byte for byte): a small
-    # header, then the SAME kernel/initramfs.img/cmdline.txt already
-    # built above for the UEFI path - repackaged, not rebuilt. Python,
-    # not shell arithmetic, for the header's exact binary layout - this
-    # container already depends on python3 for menu.py, and precise
-    # little-endian struct packing is exactly the kind of thing shell's
-    # own arithmetic is the wrong tool for.
-    python3 - "$KERNEL" initramfs.img cmdline.txt "$BUILD_DIR/bios-bootblob.img" <<'PYEOF'
-import struct
-import sys
-
-kernel_path, initrd_path, cmdline_path, out_path = sys.argv[1:5]
-SECTOR = 512
-
-def read_all(path):
-    with open(path, "rb") as f:
-        return f.read()
-
-def sector_padded(data):
-    rem = len(data) % SECTOR
-    if rem:
-        data += b"\x00" * (SECTOR - rem)
-    return data
-
-kernel = read_all(kernel_path)
-initrd = read_all(initrd_path)
-# Same NUL-terminated convention the .cmdline PE section above uses
-# (see cmdline.section) - stage2 reads this as a plain C string, not
-# a newline-terminated text file.
-cmdline = read_all(cmdline_path).rstrip(b"\n") + b"\x00"
-
-header = struct.pack(
-    "<8sIIII",
-    b"ZFSBOOT1",  # ZFSBOOT_BOOTBLOB_MAGIC, see bios/bootblob.h
-    24,           # header_size = sizeof(struct zfsboot_bootblob_header)
-    len(kernel),
-    len(initrd),
-    len(cmdline),
-)
-
-with open(out_path, "wb") as f:
-    f.write(sector_padded(header))
-    f.write(sector_padded(kernel))
-    f.write(sector_padded(initrd))
-    f.write(sector_padded(cmdline))
-PYEOF
+    # No more boot-blob packing step - stage2's own FAT32 reader
+    # (bios/fat.c) reads the kernel/initramfs.img/cmdline.txt already
+    # built above for the UEFI path DIRECTLY off the same canonical
+    # alpine-zfsboot FAT/ESP partition UEFI mode already uses (see
+    # bios/gpt.h's ZFSBOOT_ESP_TYPE_GUID and this project's own
+    # architecture-decision writeup) - nothing to repackage into a
+    # separate raw format any more. The alpine-installer repo's own
+    # `partition_disk()`/artifact-install step is what actually copies
+    # these loose files onto a real machine's FAT partition at install
+    # time, at EFI/ALPINE/{KERNEL,INITRD,CMDLINE}; see that repo.
 
     cp "$BUILD_DIR/bios/stage1.bin" "$OUT_DIR/alpine-zfsboot-${ARCH}-bios-stage1.bin"
     cp "$BUILD_DIR/bios/stage2.bin" "$OUT_DIR/alpine-zfsboot-${ARCH}-bios-stage2.bin"
     cp "$BUILD_DIR/bios/stage-iso.bin" "$OUT_DIR/alpine-zfsboot-${ARCH}-bios-stage-iso.bin"
-    cp "$BUILD_DIR/bios-bootblob.img" "$OUT_DIR/alpine-zfsboot-${ARCH}-bios-bootblob.img"
-    echo "built: $OUT_DIR/alpine-zfsboot-${ARCH}-bios-{stage1,stage2,stage-iso.bin,bootblob.img}"
-    echo "NOTE: legacy BIOS path (stage1/stage2, for a real disk) has no disk-partitioning/deploy() integration yet - lay these onto a GPT test disk by hand (protective MBR + BIOS boot partition + a dedicated boot-blob partition, see bios/gpt.h's type GUID) for now"
+    echo "built: $OUT_DIR/alpine-zfsboot-${ARCH}-bios-{stage1,stage2,stage-iso.bin}"
 fi
 
 # --- ISO wrapper -----------------------------------------------------------
 # Same .EFI, just wrapped so it's a valid boot target somewhere a bare
 # .EFI file isn't: BMC/IPMI virtual media, a real USB stick, a VM's
 # virtual CDROM. Pure packaging - see iso.sh's own header for why.
-# x86_64 also gets legacy-BIOS boot on the ISO itself (stage-iso.bin +
-# the same boot-blob just built above, both already on disk from the
-# BIOS section above) - aarch64 has no legacy-BIOS equivalent, so
-# iso.sh gets called with just the two required arguments there,
-# same as always.
+# x86_64 also gets legacy-BIOS boot on the ISO itself (stage-iso.bin,
+# already on disk from the BIOS section above, plus the same loose
+# kernel/initramfs.img/cmdline.txt already built above for the UEFI
+# path - iso.sh copies those onto the SAME appended FAT image the UEFI
+# entry uses, see its own header comment) - aarch64 has no legacy-BIOS
+# equivalent, so iso.sh gets called with just the two required
+# arguments there, same as always.
 if [ "$ARCH" = "x86_64" ]; then
     "$REPO_ROOT/iso.sh" "$OUT_FILE" "$ARCH" \
-        "$BUILD_DIR/bios/stage-iso.bin" "$BUILD_DIR/bios-bootblob.img"
+        "$BUILD_DIR/bios/stage-iso.bin" "$KERNEL" initramfs.img cmdline.txt
 else
     "$REPO_ROOT/iso.sh" "$OUT_FILE" "$ARCH"
 fi

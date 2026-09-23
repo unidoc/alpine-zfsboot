@@ -5,21 +5,22 @@
 
 /*
  * Minimal, classic MBR partition-table reading - a fallback for
- * stage2's own boot-blob lookup for a disk partitioned the older way
- * (fdisk/parted with an msdos label) instead of GPT (see gpt.h for
- * the primary, GPT-based version this project's own sgdisk-based
- * install instructions produce). Deliberately no extended/logical
- * partition chain support - kept to exactly the 4 fixed-size entries
- * the classic MBR itself holds, simple and complete for what this
- * project actually needs: one partition, found by a project-specific
- * type byte, the same role ZFSBOOT_BOOTBLOB_TYPE_GUID plays for GPT.
+ * stage2's own canonical-FAT-partition lookup for a disk partitioned
+ * the older way (fdisk/parted with an msdos label) instead of GPT
+ * (see gpt.h for the primary, GPT-based version this project's own
+ * sgdisk-based install instructions produce). Deliberately no
+ * extended/logical partition chain support - kept to exactly the 4
+ * fixed-size entries the classic MBR itself holds, simple and
+ * complete for what this project actually needs: one partition, found
+ * by a project-specific type byte, the same role ZFSBOOT_ESP_TYPE_GUID
+ * plays for GPT.
  *
  * stage1.S itself needs NO changes to support this: it already reads
  * stage2 from a fixed LBA (34) regardless of what partitioning scheme
  * is on the rest of the disk - the same "leave LBA 1-33 free" build-
  * time invariant (see stage1.S's own header comment) applies whether
- * the disk ends up GPT or MBR-labeled; only stage2's own boot-blob
- * partition *lookup* needs to know about both schemes.
+ * the disk ends up GPT or MBR-labeled; only stage2's own FAT-partition
+ * *lookup* needs to know about both schemes.
  */
 
 #define MBR_BOOT_SIGNATURE_OFFSET 510
@@ -28,15 +29,22 @@
 #define MBR_MAX_PARTITIONS 4
 
 /*
- * ZFSBOOT_BOOTBLOB_MBR_TYPE: an arbitrary, project-specific MBR
- * partition type byte, picked the same way ZFSBOOT_BOOTBLOB_TYPE_GUID
- * was for GPT (see gpt.h) - deliberately not one of the many already-
- * assigned values in the classic MBR partition-type list (0x83 Linux,
- * 0x82 swap, 0xEE GPT-protective, 0xEF EFI system, etc.), since
- * nothing except this project's own code (both the install-time write
- * and this lookup) ever needs to recognize it.
+ * ZFSBOOT_FAT_MBR_TYPE: an arbitrary, project-specific MBR partition
+ * type byte, picked the same way ZFSBOOT_ESP_TYPE_GUID was chosen for
+ * GPT's own standard ESP identity - unlike the GPT case, there is no
+ * single standard "EFI System Partition" MBR type byte in wide use
+ * (UEFI firmware itself never boots from an msdos-labeled disk at
+ * all), so this stays a project-owned value rather than reusing a
+ * borrowed one. Deliberately not one of the many already-assigned
+ * values in the classic MBR partition-type list (0x83 Linux, 0x82
+ * swap, 0xEE GPT-protective, 0xEF EFI system, etc.), since nothing
+ * except this project's own code (both the install-time write and
+ * this lookup) ever needs to recognize it. Value unchanged from this
+ * project's own former ZFSBOOT_BOOTBLOB_MBR_TYPE (0x2E) - only the
+ * name and what's stored at the partition it identifies changed (a
+ * FAT32 filesystem now, not a raw boot-blob).
  */
-#define ZFSBOOT_BOOTBLOB_MBR_TYPE 0x2E
+#define ZFSBOOT_FAT_MBR_TYPE 0x2E
 
 /*
  * Reads LBA 0, checks the 0x55AA boot signature, and scans the (up

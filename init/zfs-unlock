@@ -37,6 +37,18 @@ LIB_DIR="$(cd "$_dir" && pwd)"
 . "$LIB_DIR/pid-alive.sh"
 . "$LIB_DIR/zfs-unlock.sh"
 
+# Unlike boot-dataset.sh, this standalone wrapper has no trap of its
+# own to conflict with - registers zfs-unlock.sh's own
+# _zfs_unlock_cleanup_tempfiles() directly (see that function's own
+# comment for what it cleans up and why this file, not zfs-unlock.sh
+# itself, is the one that binds it as a trap). Closes a real gap a full
+# source audit found: an interrupt (Ctrl-C, a dropped SSH session) of
+# THIS specific entry point - menu.py's own "Unlock encrypted root"
+# action - mid-prompt used to leave the operator's plaintext passphrase
+# sitting in one of two mktemp files in tmpfs for the rest of the
+# rescue session, with nothing here to ever clean it up.
+trap _zfs_unlock_cleanup_tempfiles EXIT INT TERM HUP
+
 case "$ACTION" in
     unlock) zfs_unlock "$ENCRYPTIONROOT" ;;
     lock)   zfs_lock "$ENCRYPTIONROOT" ;;

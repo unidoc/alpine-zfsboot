@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -55,4 +56,204 @@ func TestDownloadRespectsClientTimeout(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected an error wrapping context.DeadlineExceeded (what http.Client.Timeout produces), got: %v", err)
 	}
+}
+
+func TestBIOSAssetName(t *testing.T) {
+	got := BIOSAssetName("x86_64")
+	want := BIOSAssetNames{
+		Stage1:  "alpine-zfsboot-x86_64-bios-stage1.bin",
+		Stage2:  "alpine-zfsboot-x86_64-bios-stage2.bin",
+		Kernel:  "alpine-zfsboot-x86_64-vmlinuz",
+		Initrd:  "alpine-zfsboot-x86_64-initramfs.img",
+		Cmdline: "alpine-zfsboot-x86_64-cmdline.txt",
+	}
+	if got != want {
+		t.Errorf("BIOSAssetName(x86_64) = %+v, want %+v", got, want)
+	}
+}
+
+func TestDownloadBIOS(t *testing.T) {
+	content := map[string]string{
+		"alpine-zfsboot-x86_64-bios-stage1.bin": "stage1-bytes",
+		"alpine-zfsboot-x86_64-bios-stage2.bin": "stage2-bytes",
+		"alpine-zfsboot-x86_64-vmlinuz":         "kernel-bytes",
+		"alpine-zfsboot-x86_64-initramfs.img":   "initrd-bytes",
+		"alpine-zfsboot-x86_64-cmdline.txt":     "cmdline-bytes",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Path[1:]
+		body, ok := content[name]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	origBase := baseURL
+	baseURL = srv.URL + "/"
+	defer func() { baseURL = origBase }()
+
+	dir := t.TempDir()
+	assets, err := DownloadBIOS("x86_64", dir)
+	if err != nil {
+		t.Fatalf("DownloadBIOS: %v", err)
+	}
+	defer assets.RemoveAll()
+
+	check := func(path, want string) {
+		t.Helper()
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s content = %q, want %q", path, got, want)
+		}
+	}
+	check(assets.Stage1, "stage1-bytes")
+	check(assets.Stage2, "stage2-bytes")
+	check(assets.Kernel, "kernel-bytes")
+	check(assets.Initrd, "initrd-bytes")
+	check(assets.Cmdline, "cmdline-bytes")
+}
+
+func TestDownloadBIOS_CleansUpOnPartialFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only stage1 succeeds - every other asset 404s, simulating a
+		// partial/broken release.
+		if r.URL.Path == "/alpine-zfsboot-x86_64-bios-stage1.bin" {
+			w.Write([]byte("stage1-bytes"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	origBase := baseURL
+	baseURL = srv.URL + "/"
+	defer func() { baseURL = origBase }()
+
+	dir := t.TempDir()
+	_, err := DownloadBIOS("x86_64", dir)
+	if err == nil {
+		t.Fatal("DownloadBIOS with a partially-broken release: want an error, got nil")
+	}
+
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("temp dir has %d leftover file(s) after a partial-failure cleanup, want 0: %v", len(entries), entries)
+	}
+}
+
+func TestSourceResolve_LocalFileWinsOverURL(t *testing.T) {
+	dir := t.TempDir()
+	localPath := dir + "/local.bin"
+	if err := os.WriteFile(localPath, []byte("local-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	src := Source{File: localPath, URL: "http://should-not-be-fetched.invalid/asset"}
+	got, err := src.resolve("http://also-should-not-be-fetched.invalid/asset", t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	content, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "local-content" {
+		t.Errorf("content = %q, want %q", content, "local-content")
+	}
+}
+
+func TestSourceResolve_ExplicitURLWinsOverDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/explicit" {
+			w.Write([]byte("explicit-content"))
+			return
+		}
+		w.Write([]byte("default-content"))
+	}))
+	defer srv.Close()
+
+	src := Source{URL: srv.URL + "/explicit"}
+	got, err := src.resolve(srv.URL+"/default", t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	content, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "explicit-content" {
+		t.Errorf("content = %q, want %q", content, "explicit-content")
+	}
+}
+
+func TestSourceResolve_FallsBackToDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("default-content"))
+	}))
+	defer srv.Close()
+
+	src := Source{} // nothing overridden at all
+	got, err := src.resolve(srv.URL+"/default", t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	content, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "default-content" {
+		t.Errorf("content = %q, want %q", content, "default-content")
+	}
+}
+
+func TestResolveBIOS_MixedSources(t *testing.T) {
+	dir := t.TempDir()
+	localStage1 := dir + "/my-stage1.bin"
+	if err := os.WriteFile(localStage1, []byte("local-stage1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("from-" + r.URL.Path[1:]))
+	}))
+	defer srv.Close()
+	origBase := baseURL
+	baseURL = srv.URL + "/"
+	defer func() { baseURL = origBase }()
+
+	src := BIOSSources{
+		Stage1: Source{File: localStage1},                   // local file override
+		Stage2: Source{URL: srv.URL + "/custom-stage2.bin"}, // explicit URL override
+		// Kernel/Initrd/Cmdline: no override, default to "latest GitHub release"
+	}
+	assets, err := ResolveBIOS(src, "x86_64", t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveBIOS: %v", err)
+	}
+	defer assets.RemoveAll()
+
+	check := func(path, want string) {
+		t.Helper()
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("content = %q, want %q", got, want)
+		}
+	}
+	check(assets.Stage1, "local-stage1")
+	check(assets.Stage2, "from-custom-stage2.bin")
+	check(assets.Kernel, "from-alpine-zfsboot-x86_64-vmlinuz")
+	check(assets.Initrd, "from-alpine-zfsboot-x86_64-initramfs.img")
+	check(assets.Cmdline, "from-alpine-zfsboot-x86_64-cmdline.txt")
 }

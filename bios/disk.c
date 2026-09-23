@@ -97,5 +97,26 @@ int disk_read_lba(uint64_t lba, uint16_t count, void *buf)
 		: "ah", "cc", "memory"
 	);
 
-	return failed ? -1 : 0;
+	if (failed)
+		return -1;
+
+	/*
+	 * Not every real BIOS updates the DAP's own sector-count field to
+	 * reflect a SHORT transfer (INT 13h/AH=42h's own documented
+	 * behavior leaves this implementation-defined - the carry flag is
+	 * the one universally-reliable signal, already checked above) -
+	 * but on the ones that DO, this is a real, free extra check: safe
+	 * either way, since dap.num_blocks was set to `count` as an INPUT
+	 * before the call, so a BIOS that never touches it leaves this
+	 * comparison trivially true. Reading it back here (rather than
+	 * trusting the local `count` parameter) is what actually proves
+	 * the read - a BIOS that reports success (CF clear) but silently
+	 * transferred fewer sectors than requested used to be
+	 * indistinguishable from a genuine full read, with the caller
+	 * treating a short/corrupt buffer as complete, real disk content.
+	 */
+	if (dap.num_blocks != count)
+		return -1;
+
+	return 0;
 }

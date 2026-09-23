@@ -1,5 +1,11 @@
 #!/bin/sh
 echo "mount $*" >> "${STUB_LOG:-/dev/null}"
+# For tests that need a real, separate process to be genuinely "stuck"
+# doing real work while holding some lock a moment earlier in the
+# script under test - see boot-dataset.sh's own boot-lock reclaim tests
+# in run-tests.sh for why a real sleep here (not a simulated one) is
+# what makes SIGKILLing that process a real, not simulated, test.
+[ -n "${STUB_MOUNT_SLEEP:-}" ] && sleep "$STUB_MOUNT_SLEEP"
 is_zfs=0
 for a in "$@"; do
     [ "$a" = "zfs" ] && is_zfs=1

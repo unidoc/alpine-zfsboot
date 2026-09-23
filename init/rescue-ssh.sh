@@ -188,7 +188,7 @@ start_rescue_ssh() {
     # regenerating one here just because the persistent key is missing
     # would defeat the entire point without ever telling anyone.
     if [ ! -s "$host_key_staged" ]; then
-        msg "authorized_keys is configured but no persistent ssh_host_ed25519_key was found on the ESP - refusing to start rescue SSH with a throwaway host identity (reinstall, or generate one by hand: dropbearkey -t ed25519 -f /EFI/alpine-zfsboot/ssh_host_ed25519_key)"
+        msg "authorized_keys is configured but no persistent ssh_host_ed25519_key was found on the ESP - refusing to start rescue SSH with a throwaway host identity (reinstall, or generate one by hand: dropbearkey -t ed25519 -f /EFI/ALPINE/ssh_host_ed25519_key)"
         return 1
     fi
     mkdir -p "$ROOTFS/etc/dropbear"
@@ -199,7 +199,7 @@ start_rescue_ssh() {
     if [ $? -ne 0 ]; then
         cat "$ROOTFS/tmp/host-key-check.log"
         rm -f "$host_key_path"
-        msg "persistent ssh_host_ed25519_key failed to validate - refusing to start rescue SSH with a throwaway replacement (regenerate it: dropbearkey -t ed25519 -f /EFI/alpine-zfsboot/ssh_host_ed25519_key)"
+        msg "persistent ssh_host_ed25519_key failed to validate - refusing to start rescue SSH with a throwaway replacement (regenerate it: dropbearkey -t ed25519 -f /EFI/ALPINE/ssh_host_ed25519_key)"
         return 1
     fi
     msg "rescue SSH host identity: $(printf '%s\n' "$host_key_info" | grep -i fingerprint)"

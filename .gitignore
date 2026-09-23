@@ -8,4 +8,7 @@ bios/*.elf
 bios/stage1.bin
 bios/stage2.bin
 bios/stage-iso.bin
+bios/build_id.h
+bios/tests/fat_host_test
+bios/tests/ata_atapi_host_test
 *.pyc

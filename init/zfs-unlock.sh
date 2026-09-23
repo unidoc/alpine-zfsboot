@@ -178,6 +178,40 @@ _zfs_tty_restore() {
     stty sane 2>/dev/null < "$ZFS_TTY"
 }
 
+# _zfs_unlock_cleanup_tempfiles - removes the two mktemp files that, for
+# a real window between being written and being read back, hold the
+# operator's plaintext passphrase: $dialog_err_file (dialog's own
+# stderr/answer capture, inside _zfs_prompt_once) and $prompt_out (the
+# OUT_FILE zfs_unlock()'s own loop passes it, holding the same content
+# copied out). A full source audit found NEITHER file had any signal
+# protection at all - an interrupt (Ctrl-C, a dropped SSH session)
+# landing in that window left a real plaintext secret sitting in tmpfs
+# for the rest of the rescue session, since every NORMAL rm -f site for
+# these two files only runs on the ordinary, uninterrupted control-flow
+# path. This function is deliberately just "rm -f whatever these two
+# variable names currently hold" (${x:-} under `set -u`, since neither
+# is assigned yet on a path that exits before ever reaching them) -
+# there is no `local` in this codebase's shell (plain POSIX sh, not
+# bash-only features), so both variables are already ordinary
+# process-global state by the time either mktemp call happens, exactly
+# like every other cross-function variable this file already relies on
+# (encryptionroot, stty_saved, ...) - no new tracking state needed, and
+# safe to call at any time, interrupted or not: `rm -f` on a path
+# that's already gone (the normal case) is a silent no-op.
+#
+# NOT registered as a trap directly inside this file - zfs-unlock.sh is
+# sourced by two different callers with two different trap situations:
+# boot-dataset.sh already registers its OWN EXIT/INT/TERM/HUP trap
+# (_on_exit_cleanup, see that file) BEFORE sourcing this one, and a
+# trap set here would silently REPLACE it (only one handler binds per
+# signal) - that caller's own _cleanup_secrets() calls this function
+# directly instead (see its own comment). The standalone `zfs-unlock`
+# wrapper has no competing trap of its own, and registers this function
+# directly as its own trap right after sourcing this file.
+_zfs_unlock_cleanup_tempfiles() {
+    rm -f "${dialog_err_file:-}" "${prompt_out:-}" 2>/dev/null
+}
+
 # _zfs_prompt_once ENCRYPTIONROOT ATTEMPT ATTEMPTS VERIFY_ONLY OUT_FILE -
 # ONE dialog passwordbox, with the full echo-suppression/restore/input-
 # flush discipline this project's own CAX testing required (see this
@@ -483,7 +517,34 @@ zfs_unlock() {
             return 0
         fi
         keylocation="$(zfs get -H -o value keylocation "$encryptionroot" 2>/dev/null)"
-        if [ "$keystatus" != "available" ] && [ "$keylocation" != "prompt" ]; then
+        # keylocation alone decides whether a human is involved at all -
+        # NOT keylocation combined with keystatus. A full source audit
+        # found this previously ALSO required `keystatus != available`
+        # to enter this branch, which meant an ALREADY-unlocked dataset
+        # with a non-prompt keylocation (file:// or https://) fell
+        # through to the interactive path below instead: verify_only
+        # became 1, a human was prompted for a "passphrase" that
+        # doesn't correspond to anything real for this keylocation
+        # class, and `zfs load-key -n` with no `-L` override reads the
+        # dataset's OWN configured keylocation, silently ignoring
+        # whatever was piped to it via stdin - so that check almost
+        # always "succeeds" (the real file/https key still loads fine)
+        # regardless of what the operator typed, and the OPERATOR'S
+        # TYPED TEXT then got staged as the "verified" kexec handoff
+        # secret. The target's own wrapper would later try that wrong
+        # secret via `-L file:///run/alpine-zfsboot/zfs-key`, fail, and
+        # fall back to a normal prompt - defeating the single-
+        # passphrase-boot property this file exists for, without ever
+        # actually verifying anything. The branch body just below
+        # already handles BOTH keystatus states correctly under an
+        # authoritative re-read of its own (available -> check handoff-
+        # readiness, give up gracefully with a clear log line if
+        # nothing to reacquire; not available -> a real load-key
+        # attempt) - the fix is simply to let it decide based on its
+        # own authoritative re-read, not gate entry on a stale
+        # keystatus peek that excluded exactly the case that needed it
+        # most.
+        if [ "$keylocation" != "prompt" ]; then
             # No human involved at all (file:// or https://) - safe to
             # do the whole thing as one short-lived transaction under
             # the lock, same as every other caller of the plain,
@@ -659,16 +720,34 @@ zfs_lock() {
 _zfs_lock_locked() {
     encryptionroot="$1"
     keystatus="$(zfs get -H -o value keystatus "$encryptionroot" 2>/dev/null)"
-    if [ "$keystatus" != "available" ]; then
-        # Already locked - still worth enforcing the invariant
-        # defensively (see this function's own header comment) in case
-        # something left a stale staged secret behind without going
-        # through this function (a killed process mid-zfs_unlock(),
-        # for instance).
+    if [ "$keystatus" = "unavailable" ]; then
+        # CONFIRMED already locked (the real, common no-op case: an
+        # operator locks an already-locked root) - still worth
+        # enforcing the invariant defensively (see this function's own
+        # header comment) in case something left a stale staged secret
+        # behind without going through this function (a killed process
+        # mid-zfs_unlock(), for instance).
         rm -f "$(zfs_key_stage_path "$encryptionroot")"
         zfs_unlock_msg "$encryptionroot is already locked"
         return 0
     fi
+    # Anything other than a CONFIRMED "unavailable" - "available", or a
+    # genuinely unexpected value from a `zfs get` failure (transient
+    # I/O error, pool momentarily busy, dataset briefly not visible) -
+    # falls through to a REAL `zfs unload-key` attempt below, never
+    # short-circuits to "already locked". A full source audit found
+    # this check previously written as `!= "available"`, which treated
+    # ANY unknown/failed read the exact same as a confirmed-locked
+    # state: it took the early return above, skipped `zfs unload-key`
+    # entirely, and reported success - while the key could still be
+    # fully loaded and the dataset still fully readable. `zfs
+    # unload-key`'s own exit status is the real, authoritative answer
+    # either way and already has its own failure handling below: it
+    # correctly errors out on a dataset that IS already unavailable
+    # (same failure path as any other unload-key error - a report to
+    # the operator, not a silent false success), and correctly unloads
+    # a key that genuinely was available. There is no "unknown" state
+    # left afterward the way there was with a plain `zfs get` read.
     # Cryptographically authoritative, not merely hierarchy-
     # authoritative: OpenZFS explicitly allows a clone to live ANYWHERE
     # in the pool's namespace while still using its origin's encryption

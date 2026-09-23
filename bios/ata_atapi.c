@@ -158,6 +158,53 @@ static void io_settle(uint16_t ctrl_base)
 }
 
 /*
+ * Advances *data_buf and *got_words by exactly one DRQ phase's worth
+ * (take words = take*2 bytes) - the ONLY place either counter moves in
+ * atapi_send_packet()'s data-phase loop. Deliberately pure C (no asm,
+ * no port I/O, no BIOS/hardware dependency of any kind) so it's
+ * host-buildable and unit-testable on its own, driven through a
+ * scripted multi-phase `take` sequence - see
+ * bios/tests/ata_atapi_host_test.c. This is what makes "did the
+ * pointer/counter arithmetic across N phases end up exactly right"
+ * checkable without real ATAPI hardware or a hypervisor that happens
+ * to split a transfer across phases (QEMU/SeaBIOS never do, which is
+ * exactly how a previous double-advance bug here went undetected for
+ * a whole session - see atapi_send_packet's own comment at its call
+ * site).
+ */
+void atapi_advance_after_phase(uint8_t **data_buf, uint16_t *got_words, uint16_t take)
+{
+	*data_buf += (uint32_t)take * 2;
+	*got_words += take;
+}
+
+/*
+ * atapi_transfer_complete GOT_WORDS WANT_WORDS - true (nonzero) only if
+ * the data phase actually delivered everything the CDB requested.
+ * Same reasoning and same host-testability goal as
+ * atapi_advance_after_phase above, extracted for the identical reason:
+ * a full source audit found atapi_send_packet()'s own data-phase loop
+ * trusted "the device says DRQ is clear now" (BSY=0/DRQ=0/ERR=0) as
+ * the ONLY completion signal, with nothing checking that got_words had
+ * actually reached want_words first. A device ending the data phase
+ * early, before delivering everything the CDB itself requested, is a
+ * genuine malfunction per the ATA/ATAPI PACKET command's own contract
+ * - but without this check, atapi_send_packet() returned SUCCESS
+ * regardless, leaving the destination buffer's own tail as whatever
+ * stale/uninitialized bytes were already there, silently treated as
+ * real kernel/initrd content by every caller. This one-line comparison
+ * has no asm/port I/O in it either, so - like the sibling function
+ * above - it's host-buildable and unit-testable without real ATAPI
+ * hardware, which the surrounding function's own real inb/outb/insw
+ * instructions are not (privileged x86 I/O instructions - they fault
+ * outright on a plain host process with no ATAPI device behind them).
+ */
+int atapi_transfer_complete(uint16_t got_words, uint16_t want_words)
+{
+	return got_words == want_words;
+}
+
+/*
  * The core ATAPI PACKET-command transaction: select-and-issue, wait
  * for the command/data request phase, push the 12-byte CDB, then (for
  * a data-in command) read back whatever the device reports it
@@ -301,17 +348,49 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 			 * about DF's state elsewhere in this stage.
 			 */
 			if (take > 0) {
+				/* asm_dst is a SCRATCH copy, deliberately separate from
+				 * data_buf: "+D"(asm_dst) below is a read-write operand
+				 * bound to EDI, and `rep insw` itself increments EDI by
+				 * 2 bytes per word transferred - GCC writes EDI back
+				 * into whatever C variable is bound to "+D" as part of
+				 * honoring that constraint. Binding that straight to
+				 * data_buf (this function's own previous shape) meant
+				 * data_buf was advanced ONCE by the asm block's own
+				 * side effect, invisibly - and a second, explicit
+				 * `data_buf += take * 2` after it (also this function's
+				 * own previous shape) double-advanced the pointer on
+				 * every phase after the first. Harmless for a single-
+				 * DRQ-phase transfer (the only shape ever exercised
+				 * under QEMU/SeaBIOS, which is why this went unnoticed
+				 * for a whole session), but on a real multi-phase
+				 * READ(10) it scatters phase N's data at 2x the correct
+				 * stride, eventually running the destination pointer
+				 * into whatever memory follows g_native_buf (this
+				 * driver's own port-base globals) and off the end of
+				 * the ES segment.
+				 *
+				 * The fix is architectural, not just deleting the extra
+				 * line: data_buf/got_words are now advanced in EXACTLY
+				 * ONE place, atapi_advance_after_phase() below - a
+				 * small, pure, host-testable function with no asm and
+				 * no port I/O in it at all - so the asm block's own
+				 * destructive EDI write-back can never again collide
+				 * with a second advance. See
+				 * bios/tests/ata_atapi_host_test.c, which drives that
+				 * function through a real multi-phase sequence (the
+				 * shape QEMU/SeaBIOS never exercises) and would have
+				 * caught this. */
+				uint8_t *asm_dst = data_buf;
 				uint16_t words = take;
 
 				__asm__ __volatile__(
 					"cld\n\t"
 					"addr32 rep insw"
-					: "+D"(data_buf), "+c"(words)
+					: "+D"(asm_dst), "+c"(words)
 					: "d"(io + ATA_REG_DATA)
 					: "memory"
 				);
-				data_buf += take * 2;
-				got_words += take;
+				atapi_advance_after_phase(&data_buf, &got_words, take);
 			}
 			/* Drain anything THIS PHASE reported beyond what's still
 			 * wanted - the phase isn't complete until every byte it
@@ -320,6 +399,12 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 			for (i = (int)take; i < (int)actual_words; i++)
 				(void)inw(io + ATA_REG_DATA);
 		}
+
+		/* See atapi_transfer_complete's own comment for the real gap
+		 * this closes - the loop's own exit condition alone never
+		 * proved the full requested transfer actually happened. */
+		if (!atapi_transfer_complete(got_words, want_words))
+			return -1;
 	}
 
 	return 0;

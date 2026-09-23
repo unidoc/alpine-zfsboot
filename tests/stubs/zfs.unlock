@@ -40,7 +40,7 @@ case "$1" in
                 cat "$STATE" 2>/dev/null || echo "unavailable"
                 ;;
             keylocation)
-                echo "prompt"
+                echo "${STUB_ZFS_UNLOCK_KEYLOCATION:-prompt}"
                 ;;
             mounted)
                 if [ -n "${STUB_ZFS_UNLOCK_BUSY:-}" ] && [ "$ds" = "$STUB_ZFS_UNLOCK_BUSY" ]; then
@@ -90,8 +90,18 @@ case "$1" in
             *)  ds="$2" ;;
         esac
         [ "$ds" = "$ROOT" ] || { echo "unexpected load-key target: $ds" >&2; exit 1; }
+        # Real OpenZFS semantics this stub must match to make the
+        # "verify-only reacquire staged the wrong secret" regression
+        # test below meaningful: `-n` with NO `-L` override reads the
+        # dataset's own CONFIGURED keylocation (file://.../https://...)
+        # - it does not touch stdin at all when that's not "prompt".
+        # Still consumed here either way (`cat`) so a real pipe never
+        # blocks/SIGPIPEs the caller, matching real `zfs`'s own behavior
+        # of accepting-and-ignoring stdin it has no use for.
         typed="$(cat)"
-        if [ "$typed" != "$CORRECT" ]; then
+        if [ "${STUB_ZFS_UNLOCK_KEYLOCATION:-prompt}" != "prompt" ] && [ "$2" = "-n" ]; then
+            : # succeeds regardless of $typed - the real, configured key still loads fine
+        elif [ "$typed" != "$CORRECT" ]; then
             echo "Key load error: Incorrect key provided for '$ROOT'." >&2
             exit 1
         fi

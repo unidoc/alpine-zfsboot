@@ -72,6 +72,40 @@ net_config_msg() {
     echo "alpine-zfsboot-net: $*"
 }
 
+# wait_for_global_ipv6 IFACE TIMEOUT_SECONDS - polls (bounded, not
+# indefinite) for a real global-scope IPv6 address on IFACE, returning
+# 0 as soon as one appears or 1 once TIMEOUT_SECONDS elapses. SLAAC has
+# no client process the way DHCP does - the kernel processes Router
+# Advertisements on its own schedule, entirely asynchronously - so
+# there's no exit-status equivalent to wait on; this is what a genuine
+# local-readiness check looks like for it instead. Link-local (fe80::)
+# addresses don't count - the kernel assigns one of those the instant
+# the link comes up, regardless of whether SLAAC (or anything else)
+# ever actually configures a usable global address, so counting it
+# would make this check just as vacuous as the bug it replaces.
+# Deliberately does NOT check reachability/a route/an actual ping
+# anywhere - "local configured-address" is the bar, not "the Internet
+# is reachable", same standard the DHCP fix uses.
+#
+# NET_CONFIG_POLL_INTERVAL (default 1, whole seconds - portable to a
+# busybox `sleep` that may not accept fractional arguments) exists so
+# tests can drive this loop with a near-zero interval instead of
+# actually sleeping for real; production never sets it.
+wait_for_global_ipv6() {
+    iface="$1"
+    timeout="$2"
+    poll_interval="${NET_CONFIG_POLL_INTERVAL:-1}"
+    waited=0
+    while [ "$waited" -lt "$timeout" ]; do
+        if ip -6 -o addr show dev "$iface" 2>/dev/null | grep -v " fe80:" | grep -q "inet6"; then
+            return 0
+        fi
+        sleep "$poll_interval"
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
 # net_config [IFACE] - IFACE defaults to eth0.
 net_config() {
     iface="${1:-eth0}"
@@ -167,18 +201,40 @@ net_config() {
     case "$ipv4_mode" in
         dhcp)
             net_config_msg "IPv4: dhcp on $iface"
-            # Unchanged from this project's original, pre-existing
-            # behavior on purpose - ifconfig+udhcpc, not `ip`+a
-            # different DHCP path, so a deployment relying on today's
-            # default keeps the exact same code path, byte for byte.
-            # Not verified synchronously (udhcpc is backgrounded, same
-            # as it always has been) - ipv4_ok=1 here means "the client
-            # was started", matching this mode's own pre-existing
-            # meaning of "success" throughout this project's history,
-            # not a new claim that a lease was actually obtained.
+            # ifconfig+udhcpc, not `ip`+a different DHCP path - unchanged
+            # from this project's original, pre-existing invocation shape
+            # on purpose, so a deployment relying on today's default
+            # keeps the exact same commands, byte for byte.
+            #
+            # NOW run in the FOREGROUND and its exit status checked - a
+            # full source audit found this used to background udhcpc
+            # (trailing `&`) and set ipv4_ok=1 unconditionally, the
+            # instant the client was merely STARTED, never checking
+            # whether a lease was actually obtained. That false signal
+            # fed straight into rescue-ssh.sh's own "is the network up
+            # enough to usefully start dropbear" decision, which in turn
+            # feeds /init's bootcheck gate for whether to stop retrying
+            # automatic boot at all - so "DHCP was started" could make a
+            # genuinely network-less machine look reachable enough to
+            # abandon retries on. `-n` (exit if no lease) and `-q` (exit
+            # once a lease IS obtained) were ALREADY being passed - they
+            # just weren't being waited on, which defeated their entire
+            # purpose. Backgrounding also already meant no lease-renewal
+            # daemon stays running either way (`-q` exits immediately on
+            # success) - foregrounding this changes NOTHING about
+            # long-term lease renewal, only whether the boot process
+            # waits to learn the real, local (no gateway/Internet
+            # reachability implied) answer before proceeding. Bounded by
+            # busybox udhcpc's own internal discover retry/timeout
+            # (config already in use elsewhere in this project), not an
+            # unbounded wait.
             ifconfig "$iface" up 2>/dev/null
-            udhcpc -i "$iface" -n -q 2>/tmp/udhcpc.log &
-            ipv4_ok=1
+            if udhcpc -i "$iface" -n -q 2>/tmp/udhcpc.log; then
+                ipv4_ok=1
+            else
+                cat /tmp/udhcpc.log
+                net_config_msg "IPv4: dhcp on $iface did not obtain a lease"
+            fi
             ;;
         static)
             if [ -z "${ALPINE_ZFSBOOT_IPV4_ADDRESS:-}" ]; then
@@ -258,15 +314,23 @@ net_config() {
 
     case "$ipv6_mode" in
         auto)
-            # Kernel-native SLAAC - nothing to run beyond the `ip link
-            # set up` already done above. accept_ra/autoconf are on by
+            # Kernel-native SLAAC - nothing to RUN beyond the `ip link
+            # set up` already done above (accept_ra/autoconf are on by
             # default for a fresh interface on a stock kernel; this
-            # project never disables either, so the interface picks up
-            # a real address from router advertisements on its own, no
-            # daemon involved. Not verified synchronously, same
-            # reasoning/precedent as IPv4 dhcp above.
+            # project never disables either), but a full source audit
+            # found this used to set ipv6_ok=1 unconditionally, the
+            # instant SLAAC was nominally "enabled" - never actually
+            # checking whether the kernel's own asynchronous RA
+            # processing produced a real address before boot proceeded.
+            # See wait_for_global_ipv6's own comment for why this is a
+            # bounded poll rather than either an instant assumption or
+            # an unbounded wait, and why link-local doesn't count.
             net_config_msg "IPv6: SLAAC (autoconf) on $iface"
-            ipv6_ok=1
+            if wait_for_global_ipv6 "$iface" 5; then
+                ipv6_ok=1
+            else
+                net_config_msg "IPv6: SLAAC on $iface produced no global address within 5s"
+            fi
             ;;
         dhcp)
             # DHCPv6 (udhcpc6) provides an address, NOT a default route -
@@ -286,8 +350,15 @@ net_config() {
             # here so a future change to accept_ra doesn't silently
             # break this mode's routing without anyone connecting the two.
             net_config_msg "IPv6: dhcp (udhcpc6) on $iface - default route depends on RA, not DHCPv6 itself"
-            udhcpc6 -i "$iface" -n -q 2>/tmp/udhcpc6.log &
-            ipv6_ok=1
+            # Foregrounded + exit status checked - same real bug and
+            # same fix as IPv4 dhcp above (udhcpc6 supports the
+            # identical -n/-q semantics udhcpc does).
+            if udhcpc6 -i "$iface" -n -q 2>/tmp/udhcpc6.log; then
+                ipv6_ok=1
+            else
+                cat /tmp/udhcpc6.log
+                net_config_msg "IPv6: dhcp (udhcpc6) on $iface did not obtain a lease"
+            fi
             ;;
         static)
             if [ -z "${ALPINE_ZFSBOOT_IPV6_ADDRESS:-}" ]; then

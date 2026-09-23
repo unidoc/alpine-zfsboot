@@ -1,10 +1,9 @@
 /*
- * stage2_entry - the very first instruction stage1 jumps to (far
- * jump, CS:IP = STAGE2_SEGMENT:0 - see stage1.S). Everything this
- * whole stage's C code assumes (a single flat segment covering all
- * of its own code+data, near pointers being plain offsets within it,
- * .bss actually being zero) is established right here, once, before
- * any C function ever runs.
+ * stage2_entry - the very first instruction control reaches this
+ * stage at. Everything this whole stage's C code assumes (a single
+ * flat segment covering all of its own code+data, near pointers being
+ * plain offsets within it, .bss actually being zero) is established
+ * right here, once, before any C function ever runs.
  *
  * .code16gcc (not plain .code16): this calls into gcc -m16 compiled C
  * (stage2_main) and must match its calling convention exactly - see
@@ -25,6 +24,80 @@
 	.global stage2_entry
 
 stage2_entry:
+	/*
+	 * A 2-byte `jmp short` past a 2-byte magic word, before anything
+	 * else - a full source audit found stage1.S's own fixed-LBA read
+	 * of this whole image had no way to tell "the BIOS reported success
+	 * (carry clear) but the bytes landed wrong anyway" (a real, if rare,
+	 * possibility: a BIOS bug, an unlucky disk-controller glitch, plain
+	 * corruption at that exact LBA range) from a genuine, correct
+	 * stage2 load - it would far-jump straight into whatever was
+	 * actually there and execute it as code regardless, for the single
+	 * most boot-critical handoff in this entire project. stage1.S now
+	 * checks this exact magic word (at STAGE2_SEGMENT:2, right where
+	 * this places it) before ever jumping in - see that file's own
+	 * comment for the read-side half of this fix. Harmless for the ISO/
+	 * El-Torito build too (SEG=0x7c0, entered directly by BIOS, no
+	 * stage1 of its own, nothing there ever reads this word) - the jump
+	 * still executes first either way, identical to before this fix,
+	 * just 4 bytes later in the file; nothing here changes any
+	 * link-time-computed offset's own MEANING, only its numeric value,
+	 * which every reference to it already resolves automatically.
+	 * 0x325A is arbitrary but deliberately not 0x0000/0xFFFF (both
+	 * common "uninitialized/erased flash" patterns that could
+	 * coincidentally already be sitting at this offset on a genuinely
+	 * corrupt/blank read, which would otherwise defeat the whole point
+	 * of this check).
+	 */
+	jmp past_stage2_magic
+	.word 0x325a
+past_stage2_magic:
+	/*
+	 * Explicit far jump to reload %cs = SEG, BEFORE anything else -
+	 * this stage OWNS the CS=SEG invariant every near call/jmp and
+	 * every "near pointer" (a plain link-time offset, e.g. a C
+	 * function passed as a callback) implicitly depends on, rather
+	 * than trusting whoever handed off control to have already set it
+	 * up correctly.
+	 *
+	 * Real, found-the-hard-way bug this closes: stage1.S's own
+	 * handoff to the disk build (STAGE2_SEGMENT=0x1000) IS a real far
+	 * jump with an explicit CS:IP = SEG:0 target (see stage1.S), so
+	 * %cs was already correct there - this instruction is a pure
+	 * no-op transition for that build, CS:IP goes from SEG:0 to
+	 * SEG:(next instruction), nothing changes. The ISO/El-Torito
+	 * build (SEG=0x7c0) has no stage1 of its own - BIOS hands off
+	 * directly to this exact symbol - and BIOS's El Torito
+	 * "no emulation" handoff uses the same convention as a classic
+	 * MBR boot sector: %cs:%ip = 0x0000:0x7c00, NOT 0x07c0:0x0000.
+	 * Both address the identical PHYSICAL byte, so every direct/
+	 * PC-relative call or jump in this whole stage kept working
+	 * completely normally (their displacements are self-relative,
+	 * entirely independent of what %cs actually is) - which is
+	 * exactly why this went unnoticed through GPT parsing, FAT mount,
+	 * file lookups, and the kernel-header read. It only broke the one
+	 * place code needs an ABSOLUTE near-pointer value (a link-time
+	 * offset baked in as a plain immediate, e.g. fat_read_range()'s
+	 * own `progress` callback argument in fat.c, passed as
+	 * `progress_dot` - just that function's own offset, 0x6c here)
+	 * to actually resolve against %cs: with %cs left at BIOS's 0x0000
+	 * instead of this stage's own SEG (0x7c0), `call progress_dot`'s
+	 * indirect near call jumped to physical 0x0000:0x006c - deep in
+	 * the real-mode IVT - instead of SEG:0x006c, hit whatever
+	 * garbage/IVT bytes happened to be there as "code", and can raise
+	 * #UD repeatedly from that point on. Confirmed at the CPU-register
+	 * level, not guessed: a breakpoint at this exact symbol's own
+	 * first byte, before this jump ever ran, showed %cs=0x0000 on the
+	 * ISO build; the disk build's own equivalent entry point already
+	 * showed %cs=SEG correctly, matching stage1.S's explicit far jump
+	 * there. A real hardware/loop-device build of the disk path
+	 * (STAGE2_SEGMENT=0x1000, unmodified) was used as the discriminator
+	 * that proved this was ISO-entry-specific, not a bug in fat.c/
+	 * switch32.S's shared logic - it completed a real, non-NULL-
+	 * callback kernel+initrd load end to end with no error at all.
+	 */
+	ljmp $SEG, $1f
+1:
 	/*
 	 * Deliberately NO `sti` here, unlike an earlier version of this
 	 * file - interrupts stay OFF for this entire stage's execution

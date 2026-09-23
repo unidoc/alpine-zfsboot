@@ -15,6 +15,35 @@ on:
   pull_request:
 
 jobs:
+  go-tests:
+    # cmd/tool + the repo-root zfscompat package (Go, not shell) - nothing
+    # else in this file exercises `go vet`/`go test` at all; build-x86_64/
+    # build-aarch64 only `go build` the tool as an input to build.sh, they
+    # never vet or test it.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # CGO_ENABLED=0 explicitly, not just relying on the runner's own
+      # default: release.yml's real shipped binaries are built this way
+      # (a static binary is part of this project's own boot/rescue
+      # self-containment contract - see cmd/tool/zfsnative.go's own header
+      # comment), so this job must build/vet/test under the SAME setting,
+      # not a possibly-different ambient default - otherwise a future
+      # dependency could pass here under an implicit cgo default and only
+      # fail once it reaches an actual release cross-build.
+      - run: CGO_ENABLED=0 go build ./...
+      - run: CGO_ENABLED=0 go vet ./...
+      - run: CGO_ENABLED=0 go test ./...
+
   unit-tests:
     # tests/run-tests.sh's own header comment: runs directly on the dev
     # host, no Alpine container, no real hardware - ubuntu-latest's own
@@ -78,6 +107,118 @@ jobs:
           kernel="$(find /tmp/kernel-extract/boot -maxdepth 1 -name 'vmlinuz-*' | sort -V | tail -1)"
           KERNEL_IMAGE="$kernel" BUSYBOX_BIN="$(command -v busybox)" ./tests/kernel-integration-test.sh
 
+  bios-iso-entry-test:
+    # tests/bios-iso-entry-test.sh's own header comment for the full
+    # why - boots the real El-Torito bios/stage-iso.bin in QEMU and
+    # proves a non-NULL fat_read_range() progress callback survives ISO
+    # entry, the regression guard for the %cs=SEG-at-entry bug this
+    # session found and fixed (stage2_entry.S's own explicit far jump).
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install xorriso, dosfstools, mtools, qemu
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y xorriso dosfstools mtools qemu-system-x86
+
+      - name: Run tests/bios-iso-entry-test.sh
+        run: ./tests/bios-iso-entry-test.sh
+
+  bios-iso-atapi-test:
+    # Same real QEMU boot as bios-iso-entry-test, but forces
+    # cdrom_disk.c's ATAPI backend (see that file's own comment on
+    # ZFSBOOT_FORCE_ATAPI) - QEMU/SeaBIOS's INT13h normally succeeds, so
+    # the plain bios-iso-entry-test job above never actually exercises
+    # the ATAPI driver at all. Added after a full source audit found (and
+    # this repo fixed) a real multi-phase-transfer buffer double-advance
+    # bug in ata_atapi.c that only manifests past the first DRQ phase -
+    # invisible to any test that never drives this backend for real.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install xorriso, dosfstools, mtools, qemu
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y xorriso dosfstools mtools qemu-system-x86
+
+      - name: Run tests/bios-iso-entry-test.sh (FORCE_ATAPI=1)
+        run: FORCE_ATAPI=1 ./tests/bios-iso-entry-test.sh
+
+  bios-hdd-entry-test:
+    # tests/bios-hdd-entry-test.sh's own header comment for the full
+    # why - boots the real raw-disk bios/stage1.bin + bios/stage2.bin as
+    # a classic MBR hard disk in QEMU (-drive format=raw, NOT -cdrom),
+    # the only automated coverage of disk.c's own disk_read_lba() and of
+    # stage1.S's own STAGE2_MAGIC/retry logic - neither is exercised by
+    # the ISO/El-Torito jobs above (those boot through cdrom_disk.c and
+    # stage2_entry.S directly, with no stage1 of their own involved at
+    # all). No xorriso needed here - this path never builds an ISO.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install dosfstools, mtools, qemu
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y dosfstools mtools qemu-system-x86
+
+      - name: Run tests/bios-hdd-entry-test.sh
+        run: ./tests/bios-hdd-entry-test.sh
+
+  ata-atapi-host-test:
+    # bios/tests/ata_atapi_host_test.c - regression guard for the same
+    # multi-phase-transfer double-advance bug bios-iso-atapi-test above
+    # covers end-to-end, but at the exact arithmetic level (see that
+    # test's own header comment) - proves the pointer/counter bookkeeping
+    # across a scripted multi-phase sequence QEMU/SeaBIOS never produces.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run bios/tests/run-ata-atapi-host-test.sh
+        run: ./bios/tests/run-ata-atapi-host-test.sh
+
+  fat-host-test:
+    # bios/tests/fat_host_test.c/build_fat_fixtures.py existed in the tree
+    # (added earlier this session as the regression guard for a real
+    # Floyd's-tortoise-and-hare FAT-table-cache thrashing bug fixed in
+    # bios/fat.c) but a full source audit found they were wired into
+    # NOTHING - no Makefile target, no Justfile recipe, no CI job, so the
+    # regression guard only ever ran when a human happened to type a gcc
+    # command by hand. This job (and the test-fat-host Justfile recipe it
+    # calls) closes that gap.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run bios/tests/run-fat-host-test.sh
+        run: ./bios/tests/run-fat-host-test.sh
+
   build-x86_64:
     # Same build.sh invocation release.yml uses for the real tag-
     # triggered release, run here on every push/PR instead so a break
@@ -94,14 +235,30 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build EFI image (x86_64)
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # build.sh bakes this straight into the image at /boot/alpine-zfsboot
+      # (see its own comment) and fails fast if it's missing - has to exist
+      # before build.sh runs, same as release.yml's own build-x86_64 job
+      # (there via downloading the build-tool job's artifact instead, since
+      # release.yml stamps a real tag into it; CI has no tag to stamp, so a
+      # plain local build with version.txt's own version - matching `just
+      # build-tool`'s own convention - is enough here).
+      - name: Build cmd/tool (x86_64)
         run: |
           set -e
           mkdir -p out
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=$(cat version.txt)" -o out/alpine-zfsboot-x86_64 ./cmd/tool
+
+      - name: Build EFI image (x86_64)
+        run: |
+          set -e
           docker run --rm \
             -v "$PWD:/work" -w /work \
             -e OUT_DIR=/work/out \
-            alpine:3.24 sh -c '
+            alpine:$(cat alpine-version.txt) sh -c '
               set -eu
               apk update
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
@@ -123,14 +280,25 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build EFI image (aarch64)
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # See build-x86_64's own comment on why this has to run before
+      # build.sh does.
+      - name: Build cmd/tool (aarch64)
         run: |
           set -e
           mkdir -p out
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version=$(cat version.txt)" -o out/alpine-zfsboot-aarch64 ./cmd/tool
+
+      - name: Build EFI image (aarch64)
+        run: |
+          set -e
           docker run --rm \
             -v "$PWD:/work" -w /work \
             -e OUT_DIR=/work/out \
-            alpine:3.24 sh -c '
+            alpine:$(cat alpine-version.txt) sh -c '
               set -eu
               apk update
               apk add --no-cache ca-certificates-bundle mkinitfs zfs zfs-lts linux-lts kexec-tools ncurses-terminfo-base xz dialog gnu-efi gnu-efi-dev gcc musl-dev make binutils python3 bash dropbear dropbear-dbclient xorriso dosfstools mtools sgdisk
