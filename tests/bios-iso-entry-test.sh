@@ -216,21 +216,41 @@ else
 fi
 
 echo "== booting under QEMU (El Torito, $backend_label, no acceleration assumed) =="
-# -serial file:$W/serial.log, not -serial none (F5): stage2 itself
-# never writes to the serial port (bios/console.c is VGA-text-only,
-# confirmed by reading it - grep for outb/0x3f8/serial/COM1 there
-# turns up nothing), but SeaBIOS's own boot-device probing does, by
-# default, and this is a genuinely independent capture channel from
-# the VGA-snapshot polling below (a plain byte stream to a file, no
-# polling/timing race) - see that review's own finding for why the
-# VGA-only view wasn't enough to diagnose a real failure: two real CI
-# timeouts both captured a completely BLANK VGA snapshot, which
-# doesn't match this test's own "loading kernel" slow-crawl theory
-# (a blank screen means stage2 never printed ITS OWN startup banner
-# either) and was left unexplained - a capture-mechanism gap, not a
-# root cause fix. This log is printed on every non-PASS outcome below
-# so the NEXT failure, whatever it turns out to be, is diagnosable
-# instead of another guess.
+qemu-system-x86_64 --version | head -1 >&2
+# -serial file:$W/serial.log, not -serial none: kept as a second,
+# independent capture channel (a plain byte stream to a file, no
+# polling/timing race), but its own claimed justification turned out
+# to be wrong - checked directly, this exact SeaBIOS 1.16.3/QEMU 8.2.2/
+# `-machine pc` combination writes NOTHING to the serial port on a
+# clean, fully successful local boot either (0 bytes, every time). So
+# an empty serial.log proves nothing either way; it's cheap insurance
+# against a future SeaBIOS/QEMU version that DOES use it, not
+# evidence today. stage2 itself never writes to the serial port
+# either (bios/console.c is VGA-text-only, confirmed by reading it).
+#
+# The real diagnostic gap this review flagged (F5): two real CI
+# timeouts both captured a completely BLANK VGA snapshot at the exact
+# moment of failure, which doesn't match this test's own "loading
+# kernel" slow-crawl theory on its face. But a real local
+# reproduction of that theory (this same pinned QEMU/SeaBIOS build,
+# synthetic host contention up to load ~97 on 4 cores) never once
+# produced a blank final screen - it always showed real, if slow,
+# forward progress (SeaBIOS banner within ~3s even under the heaviest
+# contention tried, "loading kernel"/"loading initrd" filling in
+# steadily after that) - and the CI timeout's own `info registers`
+# dump showed EIP already deep inside atapi_send_packet (past FAT
+# mount, past opening KERNEL/INITRD, several ATAPI commands in),
+# which cannot be reconciled with "the SeaBIOS banner itself hadn't
+# printed within 60s". Those two facts together (real, non-trivial
+# progress per the CPU state, nothing at all per the VGA read) point
+# at the pmemsave-based VGA capture itself misbehaving in the actual
+# CI environment at the instant of the snapshot, not at execution
+# genuinely never having started. This could not be confirmed further
+# without CI access, so instead of guessing again, the poll loop below
+# now logs a one-line summary of EVERY snapshot (not just the final
+# one) to $W/poll.log, printed on every non-PASS outcome - the next
+# failure, whatever it turns out to be, shows the real progression
+# instead of one single, possibly-misleading snapshot.
 qemu-system-x86_64 \
     -cdrom "$W/test.iso" \
     -m 256 -display none -no-reboot -no-shutdown -serial file:"$W/serial.log" -machine pc \
@@ -239,11 +259,13 @@ qemu-system-x86_64 \
 qemu_pid=$!
 trap 'kill -9 "$qemu_pid" 2>/dev/null || true; rm -rf "$W"' EXIT
 
-result="$(python3 - "$MONITOR_PORT" "$W/vga.bin" <<'PYEOF'
+result="$(python3 - "$MONITOR_PORT" "$W/vga.bin" "$W/poll.log" <<'PYEOF'
 import socket, sys, time
 
 port = int(sys.argv[1])
 vga_path = sys.argv[2]
+poll_log = open(sys.argv[3], "w")
+t_start = time.time()
 
 def snapshot():
     for _ in range(20):
@@ -270,6 +292,26 @@ def snapshot():
         )
         lines.append(line.rstrip())
     return "\n".join(lines)
+
+# unidoc-alip's PR #5 review (F5) found the old single end-of-run VGA
+# snapshot could not tell a genuine hang apart from a capture glitch:
+# a real local reproduction of the slow-crawl theory (this same pinned
+# QEMU/SeaBIOS build, host contention up to load ~97 on 4 cores) always
+# showed real forward progress on every poll, never a blank final
+# screen - the opposite of both real CI timeouts on record, which both
+# came back completely blank despite `info registers` proving execution
+# had already gotten well past FAT mount and into the ATAPI transfer
+# loop. Logging every poll (not just the last one) turns "was this
+# actually stuck, or did one snapshot just come back wrong" from a
+# guess into something the next failure's own log answers directly.
+def log_poll(elapsed, text):
+    if text is None:
+        poll_log.write(f"[{elapsed:6.1f}s] (monitor not connected yet)\n")
+        return
+    nonblank = [ln for ln in text.split("\n") if ln.strip()]
+    last = nonblank[-1] if nonblank else "(all blank)"
+    poll_log.write(f"[{elapsed:6.1f}s] nonblank_rows={len(nonblank)} last={last!r}\n")
+    poll_log.flush()
 
 # 60s - tight, and based on real measurement, not padding. History,
 # kept because it's the actual evidence this number rests on:
@@ -325,22 +367,36 @@ def snapshot():
 # a real successful boot, just ~10.6x less data moved.
 #
 # Measured (this exact 2MiB/1MiB payload, same CI-matching QEMU
-# 8.2.2/SeaBIOS 1.16.3 binaries used throughout this investigation):
+# 8.2.2/SeaBIOS 1.16.3 binaries used throughout this investigation) -
+# first round:
 #   idle host:                                          3.7s
-#   load ~26 (28x `yes`/4 cores - the SAME contention     5.1s
-#     level that took the OLD 32MB payload 173.6s)
-#   load ~48 (56x `yes`/4 cores - roughly double the      9.7s
-#     contention that made the OLD payload fail in CI)
-# 60s leaves >6x the worst of those real measurements, at a
-# contention level already well past what two real observed CI
-# failures needed to occur - tight enough that an actual regression
-# (a real hang, not just slow) is flagged in under a minute instead of
-# quietly eating up to 900s of CI time, and no longer built on "make
-# the number bigger and hope."
-deadline = time.time() + 60
+#   load ~26 (28x `yes`/4 cores)                         5.1s
+#   load ~48 (56x `yes`/4 cores)                         9.7s
+# 60s (>6x that worst case) still wasn't enough: it failed again in
+# real CI. A second, much harder round pushed contention far past what
+# the first round tried, on the same pinned QEMU/SeaBIOS build:
+#   load ~28 (28x `yes`/4 cores)                        13.1s
+#   load ~56 (56x `yes`/4 cores)                        26.8s
+#   load ~100 (100x `yes`/4 cores)                       53.7s
+#   load ~150 (150x `yes`/4 cores, host loadavg ~44-97)  73.9s
+# every one of these completed with real, continuous forward progress
+# (per-poll VGA text logged the whole way - see log_poll above) -
+# never a hang, never a blank final screen. That's the opposite of
+# both real CI timeouts on record, which came back completely blank at
+# 60s despite `info registers` proving execution had already gotten
+# well past FAT mount and deep into the ATAPI transfer loop by then -
+# a state that cannot coexist with "the SeaBIOS banner itself hadn't
+# printed yet" on a host merely running slow, only with a bad
+# snapshot. So this deadline bump is aimed at the genuine (if now
+# rarer) slow-crawl case this measurement rules 73.9s comfortably
+# inside of; it is deliberately NOT expected to fix a capture-artifact
+# blank screen if that's what actually recurs - see log_poll's own
+# comment and the FAIL message below for what to check if it does.
+deadline = time.time() + 150
 last = None
 while time.time() < deadline:
     text = snapshot()
+    log_poll(time.time() - t_start, text)
     if text is None:
         time.sleep(1)
         continue
@@ -378,15 +434,18 @@ while time.time() < deadline:
         sys.exit(0)
     time.sleep(2)
 
-# unidoc-alip's PR #5 review (F5): two real CI timeouts both captured
-# a completely BLANK VGA snapshot - inconsistent with this test's own
-# slow-crawl theory (a blank screen means stage2 never even printed
-# its own startup banner) and never explained. `info registers` here
-# is a second, independent signal at the exact moment of timeout: it
-# comes straight from the monitor, not from polling text-mode video
-# memory, so it still says something useful even if the VGA capture
-# itself is blank/wrong (an actual real vs. capture-artifact question
-# this test could not previously answer at all).
+# `info registers` here is a second, independent signal at the exact
+# moment of timeout: it comes straight from the monitor, not from
+# polling text-mode video memory, so it still says something useful
+# even if the VGA capture itself is blank/wrong - which is exactly
+# what happened both real times this test has timed out in CI (see
+# log_poll's own comment above): the VGA read came back blank, but
+# `info registers` showed EIP already deep inside atapi_send_packet,
+# proving real execution had gotten far past the point a blank screen
+# would imply. Real vs. capture-artifact is still not fully closed
+# without CI access to confirm it, but poll.log (printed below on
+# every non-PASS outcome) now records the FULL progression, not just
+# this one final sample.
 try:
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     time.sleep(0.2)
@@ -414,12 +473,16 @@ screen="$(echo "$result" | tail -n +2)"
 # -serial none and never printed $W/qemu.log, so a failure gave no
 # diagnostics beyond one VGA text snapshot - and that snapshot came
 # back completely blank on both real CI timeouts this review found,
-# which this test's own FAIL message couldn't explain. Print both
-# real, independent logs on every non-PASS outcome now.
+# which this test's own FAIL message couldn't explain. Print all
+# three real, independent logs on every non-PASS outcome now -
+# poll.log in particular is the one that actually answers "was this
+# genuinely stuck, or did one snapshot just come back wrong".
 print_diagnostics() {
+    echo "--- \$W/poll.log (every VGA snapshot taken during this run, not just the last one) ---" >&2
+    cat "$W/poll.log" >&2 2>/dev/null || echo "(no poll.log)" >&2
     echo "--- \$W/qemu.log (QEMU's own stdout/stderr) ---" >&2
     cat "$W/qemu.log" >&2 2>/dev/null || echo "(no qemu.log)" >&2
-    echo "--- \$W/serial.log (SeaBIOS + guest serial output, if any) ---" >&2
+    echo "--- \$W/serial.log (SeaBIOS + guest serial output, if any - see this run's own banner comment: empirically always empty with this exact build, so absence here proves nothing) ---" >&2
     cat "$W/serial.log" >&2 2>/dev/null || echo "(no serial.log)" >&2
 }
 
@@ -440,7 +503,7 @@ case "$status_line" in
     TIMEOUT)
         echo "$screen" >&2
         print_diagnostics
-        bad "boot never reached 'starting kernel' within the timeout - if the screen above is stuck at 'loading kernel' with no progress, this is the #cs=SEG-at-entry regression this test exists to catch; if the screen above is BLANK, see the qemu.log/serial.log just printed instead - a blank VGA snapshot means stage2 never even reached its own startup banner (or the VGA snapshot itself is the unreliable part - this is exactly the unresolved case unidoc-alip's PR #5 review flagged, see the hardening ledger)"
+        bad "boot never reached 'starting kernel' within the timeout - check poll.log above FIRST: if it shows steady forward progress (nonblank_rows climbing, 'loading kernel'/'loading initrd' with dots) this is genuine slow-crawl, most likely real host contention worse than this deadline's own measured margin (see this file's own deadline comment for the numbers that set it) - if it shows real progress that then goes BLANK partway through, or is blank from the very first poll, that's the still-open capture-artifact/real-hang question unidoc-alip's PR #5 review raised (see the hardening ledger) and is worth a fresh investigation, not another timeout bump"
         ;;
     *)
         echo "$result" >&2
