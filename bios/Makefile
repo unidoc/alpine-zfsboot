@@ -150,8 +150,14 @@ stage2.bin: stage2.elf
 # driver would otherwise never run during an automated boot test (see
 # cdrom_disk.c's own comment on ZFSBOOT_FORCE_ATAPI). Empty by default,
 # so a normal build is unaffected.
+#
+# TEST_SERIAL=1 make stage-iso.bin - mirrors every console_putc() byte
+# to COM1 too (see console.c's own ZFSBOOT_TEST_SERIAL comment) - a
+# second, VGA-independent capture path for tests/bios-iso-entry-test.sh
+# to poll, after `pmemsave 0xb8000` proved unreliable in real CI. Empty
+# by default, so a normal build is unaffected here too.
 iso_%.o: %.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h switch32.h ata_atapi.h stdint_local.h build_id.h
-	$(CC) $(CFLAGS) -DSTAGE2_SEGMENT=$(ISO_SEG) $(if $(FORCE_ATAPI),-DZFSBOOT_FORCE_ATAPI) -o $@ $<
+	$(CC) $(CFLAGS) -DSTAGE2_SEGMENT=$(ISO_SEG) $(if $(FORCE_ATAPI),-DZFSBOOT_FORCE_ATAPI) $(if $(TEST_SERIAL),-DZFSBOOT_TEST_SERIAL) -o $@ $<
 
 stage2_entry_iso.o: stage2_entry.S
 	$(AS) --32 --defsym SEG=$(ISO_SEG) -o $@ $<
