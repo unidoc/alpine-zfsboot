@@ -3442,6 +3442,102 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+echo "== menu.py: unlock_encrypted_root() offers to end the rescue-SSH session when handoff is READY, and Yes actually exits =="
+# Issue #7: before this, a successful/already-ready unlock showed a
+# plain dialog_msgbox with no way to leave from here - the operator
+# had to disconnect their own SSH client by hand. default_no=True
+# (same convention as every other real "are you sure" prompt in this
+# file) - falling through to a plain menu.dialog_yesno stub that
+# returns True proves the Yes path genuinely calls sys.exit(), not
+# just that the right dialog gets shown.
+d="$(fresh_env)"
+mkdir -p "$d/encfs" "$d/root/tmp"
+printf 'staged-secret' > "$d/root/tmp/zfs-key.zroot_ROOT_alpine"
+cat > "$d/encfs/zfs" <<'EOF'
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$ds:$prop" in
+            "zroot/ROOT/alpine:encryptionroot") echo "zroot/ROOT/alpine" ;;
+            "zroot/ROOT/alpine:keystatus") echo "available" ;;
+            *) echo "-" ;;
+        esac
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$d/encfs/zfs"
+PATH="$d/encfs:$PATH" STUB_LOG="$d/log" STUB_ROOT="$d/root" \
+    python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+
+yesno_calls = []
+menu.dialog_yesno = lambda title, text, default_no=True: (yesno_calls.append((title, text, default_no)), True)[1]
+
+try:
+    menu.unlock_encrypted_root()
+    print("returned normally - BUG, sys.exit() should have fired")
+except SystemExit:
+    print("SystemExit raised - correct")
+
+title, text, default_no = yesno_calls[0]
+print("dialog title:", title)
+print("dialog default_no:", default_no)
+print("dialog mentions READY:", "kexec handoff READY" in text)
+print("dialog asks to end session:", "End this rescue SSH session now?" in text)
+PYEOF
+if grep -qx "SystemExit raised - correct" "$d/out" \
+   && grep -qx "dialog default_no: True" "$d/out" \
+   && grep -qx "dialog mentions READY: True" "$d/out" \
+   && grep -qx "dialog asks to end session: True" "$d/out"; then
+    ok "unlock_encrypted_root() offers Yes/No to end the session (default No) and Yes really exits"
+else
+    cat "$d/out"; bad "unlock_encrypted_root() did not offer to end the session as expected"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== menu.py: unlock_encrypted_root() answering No returns to the main menu, exactly like the old plain dialog did =="
+d="$(fresh_env)"
+mkdir -p "$d/encfs" "$d/root/tmp"
+printf 'staged-secret' > "$d/root/tmp/zfs-key.zroot_ROOT_alpine"
+cat > "$d/encfs/zfs" <<'EOF'
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$ds:$prop" in
+            "zroot/ROOT/alpine:encryptionroot") echo "zroot/ROOT/alpine" ;;
+            "zroot/ROOT/alpine:keystatus") echo "available" ;;
+            *) echo "-" ;;
+        esac
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$d/encfs/zfs"
+PATH="$d/encfs:$PATH" STUB_LOG="$d/log" STUB_ROOT="$d/root" \
+    python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+menu.dialog_yesno = lambda title, text, default_no=True: False
+menu.unlock_encrypted_root()
+print("returned normally - correct")
+PYEOF
+if grep -qx "returned normally - correct" "$d/out"; then
+    ok "unlock_encrypted_root() answering No falls through and returns, same as before this feature"
+else
+    cat "$d/out"; bad "unlock_encrypted_root() did not return normally on No"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== menu.py: deploy() refuses to zpool create over an already-imported pool =="
 d="$(fresh_env)"
 cat > "$d/stub-zpool" <<'EOF'
