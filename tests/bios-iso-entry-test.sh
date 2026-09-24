@@ -501,9 +501,24 @@ try:
     status = read_until_prompt(s).decode("ascii", "replace")
     s.sendall(b"info registers\n")
     regs = read_until_prompt(s).decode("ascii", "replace")
+    # `info block` - QEMU's OWN view of the -cdrom backend, added after
+    # a real CI failure narrowed the stuck call to a specific
+    # wait_status_clear() inside the ATAPI data phase, with the guest's
+    # OWN status reads (both the primary status register AND the
+    # side-effect-free alt-status register, tried as two separate
+    # rounds) unable to explain why: alt-status read 0x58 (BSY clear,
+    # DRQ set - a healthy, ready device) immediately before the guest's
+    # next read of the same condition hung for the rest of the
+    # deadline anyway. Every diagnostic so far has been from the
+    # GUEST's side of the port I/O boundary - `info block` asks QEMU
+    # itself whether it considers this device's I/O request queue
+    # empty, stalled, or erroring, independent of anything the guest
+    # can observe through port reads at all.
+    s.sendall(b"info block\n")
+    block = read_until_prompt(s).decode("ascii", "replace")
     s.close()
 except OSError as e:
-    status = regs = f"(could not query monitor: {e})"
+    status = regs = block = f"(could not query monitor: {e})"
 
 print("TIMEOUT")
 print("--- serial.log at timeout ---")
@@ -514,6 +529,8 @@ print("--- info status at timeout ---")
 print(status)
 print("--- info registers at timeout ---")
 print(regs)
+print("--- info block at timeout ---")
+print(block)
 PYEOF
 )"
 
