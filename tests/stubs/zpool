@@ -7,5 +7,11 @@ case "$1" in
     status)
         echo "${STUB_POOL_HEALTH:-pool is healthy}"
         ;;
+    export)
+        if [ "${STUB_ZPOOL_EXPORT_FAIL:-}" = "1" ]; then
+            echo "cannot export '$2': pool is busy" >&2
+            exit 1
+        fi
+        ;;
 esac
 exit 0

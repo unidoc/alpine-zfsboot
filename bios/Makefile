@@ -37,7 +37,7 @@ CFLAGS := -m16 -march=i386 -mno-mmx -mno-sse -mno-sse2 \
           -ffreestanding -fno-pic -fno-stack-protector -fno-strict-aliasing \
           -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -c
 
-STAGE2_C_SRCS := stage2_main.c gpt.c mbr.c disk.c bootparams.c e820.c console.c
+STAGE2_C_SRCS := stage2_main.c gpt.c mbr.c fat.c disk.c bootparams.c e820.c console.c
 STAGE2_C_OBJS := $(STAGE2_C_SRCS:.c=.o)
 
 # stage-iso.bin: an alternative to stage1.bin+stage2.bin, for booting
@@ -56,7 +56,7 @@ STAGE2_C_OBJS := $(STAGE2_C_SRCS:.c=.o)
 # "no emulation" boot image, physical address 0x7c00, the same address
 # a normal MBR loads at - vs. 0x1000 for the stage1-loaded-stage2 case).
 ISO_SEG := 0x7c0
-STAGE2_ISO_C_SRCS := stage2_main.c gpt.c mbr.c cdrom_disk.c ata_atapi.c bootparams.c e820.c console.c
+STAGE2_ISO_C_SRCS := stage2_main.c gpt.c mbr.c fat.c cdrom_disk.c ata_atapi.c bootparams.c e820.c console.c
 STAGE2_ISO_C_OBJS := $(STAGE2_ISO_C_SRCS:%.c=iso_%.o)
 
 .PHONY: all clean build_id.h
@@ -110,7 +110,17 @@ stage1.bin: stage1.elf
 		echo "stage1.bin boot signature is $$sig, expected 55aa" >&2; exit 1; \
 	fi
 
-%.o: %.c bootblob.h bootparams.h console.h disk.h e820.h gpt.h mbr.h switch32.h stdint_local.h build_id.h
+# fat.c's own real-disk object gets a bigger FAT_IO_BATCH_SECTORS than
+# the shared default (see that file's own header comment on this
+# constant) - real INT13h/disk.c only, no ATAPI command-batching
+# ceiling to respect here, unlike iso_fat.o below (built by the generic
+# iso_%.o rule further down, at fat.c's own unmodified default).
+# check-bss-bounds (see stage2.elf's own recipe) is what actually
+# proves 64 is safe for THIS build - not asserted here, just applied.
+fat.o: fat.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h switch32.h stdint_local.h build_id.h
+	$(CC) $(CFLAGS) -DFAT_IO_BATCH_SECTORS=64 -o $@ $<
+
+%.o: %.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h switch32.h stdint_local.h build_id.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 stage2_entry.o: stage2_entry.S
@@ -121,6 +131,7 @@ switch32.o: switch32.S
 
 stage2.elf: stage2_entry.o $(STAGE2_C_OBJS) switch32.o link.ld
 	$(LD) -m elf_i386 -T link.ld -o $@ stage2_entry.o $(STAGE2_C_OBJS) switch32.o
+	@$(MAKE) --no-print-directory check-bss-bounds ELF=$@
 
 # Must fit within stage1.S's own STAGE2_SECTORS budget (64 sectors =
 # 32768 bytes) - checked here for real rather than trusting stage1's
@@ -134,8 +145,19 @@ stage2.bin: stage2.elf
 		echo "stage2.bin is $$size bytes, exceeds stage1.S's STAGE2_SECTORS budget ($$max bytes) - bump STAGE2_SECTORS in stage1.S to match" >&2; exit 1; \
 	fi
 
-iso_%.o: %.c bootblob.h bootparams.h console.h disk.h e820.h gpt.h mbr.h switch32.h ata_atapi.h stdint_local.h build_id.h
-	$(CC) $(CFLAGS) -DSTAGE2_SEGMENT=$(ISO_SEG) -o $@ $<
+# FORCE_ATAPI=1 make stage-iso.bin - forces cdrom_disk.c's ATAPI backend
+# even under QEMU/SeaBIOS, where INT13h normally succeeds and this whole
+# driver would otherwise never run during an automated boot test (see
+# cdrom_disk.c's own comment on ZFSBOOT_FORCE_ATAPI). Empty by default,
+# so a normal build is unaffected.
+#
+# TEST_SERIAL=1 make stage-iso.bin - mirrors every console_putc() byte
+# to COM1 too (see console.c's own ZFSBOOT_TEST_SERIAL comment) - a
+# second, VGA-independent capture path for tests/bios-iso-entry-test.sh
+# to poll, after `pmemsave 0xb8000` proved unreliable in real CI. Empty
+# by default, so a normal build is unaffected here too.
+iso_%.o: %.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h switch32.h ata_atapi.h stdint_local.h build_id.h
+	$(CC) $(CFLAGS) -DSTAGE2_SEGMENT=$(ISO_SEG) $(if $(FORCE_ATAPI),-DZFSBOOT_FORCE_ATAPI) $(if $(TEST_SERIAL),-DZFSBOOT_TEST_SERIAL) -o $@ $<
 
 stage2_entry_iso.o: stage2_entry.S
 	$(AS) --32 --defsym SEG=$(ISO_SEG) -o $@ $<
@@ -149,6 +171,89 @@ switch32_iso.o: switch32.S
 # (see link.ld's own header comment).
 stage-iso.elf: stage2_entry_iso.o $(STAGE2_ISO_C_OBJS) switch32_iso.o link.ld
 	$(LD) -m elf_i386 -T link.ld -o $@ stage2_entry_iso.o $(STAGE2_ISO_C_OBJS) switch32_iso.o
+	@$(MAKE) --no-print-directory check-bss-bounds ELF=$@
+
+# check-bss-bounds ELF=<path> - real-mode segment-boundary invariant,
+# not just a comment: every stage2 symbol (link.ld's own ORIGIN 0,
+# single-segment layout - see its header comment) is a plain 16-bit
+# offset from this stage's one fixed DS, and disk_read_lba()'s own
+# INT13h AH=0x42 DAP (see disk.c) passes buffer_segment=DS,
+# buffer_offset=that 16-bit offset directly. g_fat_io_buf (fat.c's own
+# batched I/O staging buffer - the thing this actually protects) is
+# the last and largest thing link.ld places before _bss_end, so "the
+# whole stage fits under offset 0x10000" bounds every possible
+# transfer's own offset range to [0, 0xFFFF].
+#
+# That alone only proves the transfer stays within ITS OWN segment -
+# "never crosses a 64KB-ALIGNED PHYSICAL boundary" (the real compat
+# rule some BIOSes care about for a DAP transfer, independent of
+# segment:offset reasoning) is a stronger claim, and it happens to
+# ALSO hold here, but only because of a second fact this check does
+# NOT verify and that is NOT a general property of real-mode segments:
+# STAGE2_SEGMENT=0x1000 (see stage2_entry.S) times 16 is exactly
+# 0x10000, itself already 64KB-aligned. So physical = 0x10000 + offset
+# for offset in [0, 0xFFFF] covers EXACTLY the one aligned block
+# [0x10000, 0x20000) - offset never crossing 0x10000 is therefore
+# equivalent to the physical transfer never crossing an aligned 64KB
+# boundary, for THIS specific segment value. (The ISO build's
+# SEG=0x7c0*16=0x7C00 is NOT 64KB-aligned - this equivalence does not
+# hold there, and its own existing FAT_IO_BATCH_SECTORS=36 default is
+# unchanged by any of this, not re-litigated here.) If STAGE2_SEGMENT
+# for the real-disk build ever changes from 0x1000, this reasoning -
+# not just this check - needs redoing.
+#
+# A SECOND, DISTINCT invariant this same check enforces: stage2_entry.S
+# sets %sp = 0xfff0 as its very first act, once, and never moves it -
+# there is no separate stack segment or guard page in real mode, so
+# the stack simply grows DOWN from 0xfff0 into whatever memory happens
+# to be there. If _bss_end ever crept up to meet or pass 0xfff0, the
+# stack's own first pushes (stage2_main()'s call frame, pushed
+# immediately on entry - see stage2_entry.S) would silently overwrite
+# live .bss data (g_fat_io_buf and everything else placed there),
+# corrupting it out from under the very code still using it - with no
+# crash, no error, just quietly wrong bytes. This was a REAL, live gap
+# until this check was added: the old threshold here was 0x10000, a
+# full 16 bytes ABOVE 0xfff0, so a build could pass this check with
+# _bss_end sitting mere bytes below the stack's own starting point and
+# zero real margin for the stack to operate in - confirmed by actually
+# building it that way (temporarily inflating a .bss buffer): the
+# linker happily accepted a build with _bss_end == 0xffea, six bytes
+# below 0xfff0, while the OLD (>= 65536) check would have reported
+# that as fine. The threshold below is tightened to 0xfff0 itself,
+# plus STAGE2_STACK_MARGIN bytes of real headroom for the stack to
+# actually run in - not just "doesn't literally overlap yet".
+# STAGE2_STACK_MARGIN=2048 is a conservative, documented estimate, not
+# a precise stack-depth proof: the deepest real call chain in this
+# stage (stage2_main -> gpt_find_partition/fat_mount/fat_open/
+# fat_read_range -> disk_read_lba/atapi_send_packet -> the real-mode
+# BIOS interrupt) is well under a dozen frames, and the largest
+# per-frame locals are stage2_main()'s own struct gpt_header/
+# fat_volume/setup_header (under 500 bytes combined, in ONE frame, not
+# repeated across the chain) - every other frame's locals are small
+# fixed structs (struct disk_address_packet, struct fat_chain_walk,
+# a handful of small buffers under 20 bytes). 2KB is generous headroom
+# over any realistic sum of that, while still catching the kind of
+# near-zero-margin build this check exists to prevent. Both current
+# real builds pass with room to spare (disk build's own _bss_end is
+# comfortably low; the tighter ISO build's real _bss_end leaves ~3.6KB
+# below 0xfff0 today) - if a future change to either build ever erodes
+# that margin below STAGE2_STACK_MARGIN, this check is what is
+# supposed to catch it, not a real-hardware stack-corruption bug report.
+STAGE2_STACK_TOP := 65520
+STAGE2_STACK_MARGIN := 2048
+check-bss-bounds:
+	@bss_end_hex=$$(nm "$(ELF)" | awk '$$3 == "_bss_end" {print $$1}'); \
+	if [ -z "$$bss_end_hex" ]; then \
+		echo "check-bss-bounds: could not find _bss_end in $(ELF)" >&2; exit 1; \
+	fi; \
+	bss_end=$$((0x$$bss_end_hex)); \
+	if [ "$$bss_end" -ge 65536 ]; then \
+		echo "check-bss-bounds: $(ELF) _bss_end is $$bss_end (0x$$bss_end_hex), >= 0x10000 - stage2's data area no longer fits in one real-mode segment, disk_read_lba()'s DAP buffer_offset math (see disk.c) is no longer safe" >&2; exit 1; \
+	fi; \
+	limit=$$(($(STAGE2_STACK_TOP) - $(STAGE2_STACK_MARGIN))); \
+	if [ "$$bss_end" -gt "$$limit" ]; then \
+		echo "check-bss-bounds: $(ELF) _bss_end is $$bss_end (0x$$bss_end_hex), within $(STAGE2_STACK_MARGIN) bytes of the stack's own start (sp=0x$$(printf '%x' $(STAGE2_STACK_TOP)), set once in stage2_entry.S and never moved) - .bss and the downward-growing real-mode stack are no longer guaranteed not to collide; shrink a .bss buffer or raise STAGE2_STACK_MARGIN only after re-checking the worst-case call depth this comment describes" >&2; exit 1; \
+	fi
 
 # Budget matches stage2.bin's own (32768 bytes) - not tied to anything
 # El Torito itself imposes (its own -boot-load-size cap is far larger,

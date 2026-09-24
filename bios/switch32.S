@@ -45,6 +45,29 @@ enable_a20:
 	pushl %eax
 	pushw %ds
 	/*
+	 * %ebp/%esi/%edi also saved/restored around the INT 15h call below
+	 * (F18, unidoc-alip's PR #5 review) - the same real hardware
+	 * finding console.c's own console_putc() and e820.c's own INT 15h
+	 * call already carry a detailed comment about: a BIOS's own
+	 * interrupt handler is free to use, and not restore, any general-
+	 * purpose register internally. This is a hand-written assembly
+	 * FUNCTION (called from C via `call enable_a20`), not inline asm
+	 * inside a C statement, so there's no GCC clobber-list/register-
+	 * budget constraint to work around here at all (unlike
+	 * cdrom_disk.c's own int13_extensions_present(), which genuinely
+	 * ran out of registers trying to close its own, narrower version
+	 * of this same class of gap) - simply saving every register a
+	 * standard i386 cdecl-style caller would expect this function to
+	 * preserve (ebp/esi/edi/ebx, alongside the eax/ds already handled)
+	 * costs a few real-mode push/pop instructions in a function called
+	 * exactly once per boot, in exchange for correctness regardless of
+	 * what the calling C code happens to keep live in them.
+	 */
+	pushl %ebx
+	pushl %ebp
+	pushl %esi
+	pushl %edi
+	/*
 	 * INT 15h, AX=2401h ("enable A20 gate") - a real BIOS service
 	 * (SeaBIOS: src/system.c's handle_15 case 0x2401), not a fast-A20
 	 * chipset trick; some BIOSes clobber %ds across INT 15h calls
@@ -55,6 +78,10 @@ enable_a20:
 	 */
 	movw $0x2401, %ax
 	int $0x15
+	popl %edi
+	popl %esi
+	popl %ebp
+	popl %ebx
 	popw %ds
 	/*
 	 * Fast A20 via System Control Port A (port 0x92, bit 1) - keep bit
@@ -95,6 +122,27 @@ unreal_copy:
 	movl 12(%ebp), %esi  /* src: near pointer, still DS-relative - DS is untouched by this whole function */
 	movl 16(%ebp), %ecx  /* len, bytes */
 
+	/*
+	 * pushfl before cli - NOT a bare cli - so the trailing popfl below
+	 * restores the CALLER's own interrupt-flag state exactly, whatever
+	 * it was, instead of unconditionally forcing IF=1. A full source
+	 * audit found this function used to end with a bare `sti`
+	 * (confirmed the hard way, from an even earlier version of this
+	 * same file's own history) - harmless on its own the very first
+	 * time this is called mid-stage, but WRONG the instant a caller
+	 * that already had interrupts disabled for its own reasons (this
+	 * whole stage does, for its entire remaining execution, from the
+	 * moment stage2_entry.S hands off - see that file's own comment)
+	 * calls this function even once: the unconditional `sti` silently
+	 * re-enabled interrupts for everything AFTER that first call,
+	 * destroying the exact invariant this function's own comment below
+	 * spends a full paragraph explaining why it depends on. pushfl/popfl
+	 * is the standard idiom for "disable, do work, restore exactly what
+	 * was there before" - it makes no assumption about what the caller's
+	 * IF was, so it is correct whether this is ever called with
+	 * interrupts already off (every real call site, today) or on.
+	 */
+	pushfl
 	cli
 	lgdt unreal_gdt_ptr
 	movl %cr0, %eax
@@ -151,15 +199,27 @@ unreal_copy:
 	cld
 	addr32 rep movsb
 
-	popw %es
 	/*
-	 * sti moved here (after %es is back to its normal real-mode
-	 * value) rather than right after the CR0.PE=0 above - see this
-	 * function's own comment further up for why interrupts must stay
-	 * disabled for the entire window %es holds the flat descriptor,
-	 * not just around the CR0 toggle itself.
+	 * The saved flags are popped into %eax FIRST, then %es, then pushed
+	 * back and popfl'd - NOT a plain "popw %es; popfl" - because pushfl
+	 * happened AFTER pushw %es above (chronologically the LAST push
+	 * before the unreal-mode window), so strict stack LIFO order
+	 * requires popping it FIRST, before %es. But the actual EFLAGS
+	 * restore (the instruction that can set IF back to 1) must not
+	 * happen until AFTER %es is back to its normal real-mode value -
+	 * see the pushfl site's own comment for why. %eax is free to use
+	 * here as scratch: this function never preserves the CALLER's own
+	 * %eax (only ecx/esi/edi/es are saved/restored - %eax is already
+	 * used internally above for the %cr0 toggle, confirming it was
+	 * never in the "must restore for the caller" set to begin with).
+	 * This shuffle satisfies both constraints at once: every stack read
+	 * happens in the exact order things were pushed, and IF only
+	 * changes after %es is already restored.
 	 */
-	sti
+	popl %eax
+	popw %es
+	pushl %eax
+	popfl
 	popl %edi
 	popl %esi
 	popl %ecx

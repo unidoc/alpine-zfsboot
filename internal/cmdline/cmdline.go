@@ -81,20 +81,80 @@ func Read(path string) (Info, error) {
 	return parse(arch, raw, path)
 }
 
-// parse is Read()'s actual logic, split out so it's testable without
-// a real PE fixture file - only the section bytes and the
-// already-resolved arch matter from here on.
-func parse(arch string, raw []byte, path string) (Info, error) {
-	// NUL-terminated ASCII C string (see build.sh's own
-	// cmdline.section construction, and efi/cmdline.c which reads it
-	// the same way at boot) - objcopy pads the section's raw data out
-	// to file alignment past that NUL with more zero bytes, so
-	// cutting at the first one is always correct and never truncates
-	// real content.
+// ReadSection returns the raw, undecoded bytes of path's own PE
+// section named name - build.sh's UEFI stub embeds the kernel and
+// initrd as their OWN sections too (".linux"/".initrd", alongside
+// ".cmdline" - see that file's own "Section order is .cmdline,
+// .initrd, .linux" comment), copied in verbatim by objcopy with no
+// transformation, so a caller that already knows how to parse a
+// standalone vmlinuz/initrd file (internal/kernelinfo,
+// internal/initrdinfo) can feed those exact same bytes in here
+// instead of needing a second, PE-aware implementation.
+func ReadSection(path, name string) ([]byte, error) {
+	f, err := pe.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening %s as a PE/EFI file: %w", path, err)
+	}
+	defer f.Close()
+
+	sect := f.Section(name)
+	if sect == nil {
+		return nil, fmt.Errorf("%s has no %s section", path, name)
+	}
+	data, err := sect.Data()
+	if err != nil {
+		return nil, fmt.Errorf("reading %s section of %s: %w", name, path, err)
+	}
+	return data, nil
+}
+
+// ParseText parses a raw alpine-zfsboot kernel cmdline directly, for a
+// caller that already has the text some way OTHER than a PE .cmdline
+// section - specifically cmd/tool's own BIOS path, which reads a plain
+// EFI/ALPINE/CMDLINE text file on the FAT payload, not a PE-embedded
+// one. Shares Read()'s own field extraction (valueOf/consoleFromCmdline)
+// so both paths agree on what each alpine-zfsboot.* option means, but
+// does NOT require alpine-zfsboot.buildstamp= to be present the way
+// Read() does - a plain text file has no PE-section-shaped guarantee of
+// ever having been written by this project's own build.sh, so treating
+// a missing buildstamp as a hard error here would be over-strict for a
+// caller that only wants one field (e.g. Pool). No Arch (not derivable
+// from text alone) and no error return - an all-empty Info is a valid,
+// non-error result for an empty/absent input.
+func ParseText(raw []byte) Info {
+	line := firstLine(raw)
+	return Info{
+		Console:    consoleFromCmdline(line),
+		Version:    valueOf(line, "alpine-zfsboot.version"),
+		BuildStamp: valueOf(line, "alpine-zfsboot.buildstamp"),
+		Pool:       valueOf(line, "alpine-zfsboot.pool"),
+		Timeout:    valueOf(line, "alpine-zfsboot.timeout"),
+		Raw:        line,
+	}
+}
+
+// firstLine cuts raw at its first NUL or newline, whichever comes
+// first - the one line real cmdline content ever occupies, whether it
+// arrived as a NUL-padded PE section (objcopy pads past the first NUL
+// with more zero bytes) or a plain text file (which a human editing
+// EFI/ALPINE/CMDLINE by hand might leave a trailing newline, or even
+// stray extra lines, in).
+func firstLine(raw []byte) string {
 	line := string(raw)
 	if i := strings.IndexByte(line, 0); i >= 0 {
 		line = line[:i]
 	}
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	return line
+}
+
+// parse is Read()'s actual logic, split out so it's testable without
+// a real PE fixture file - only the section bytes and the
+// already-resolved arch matter from here on.
+func parse(arch string, raw []byte, path string) (Info, error) {
+	line := firstLine(raw)
 
 	info := Info{
 		Arch:       arch,

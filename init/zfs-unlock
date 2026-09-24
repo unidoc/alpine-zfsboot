@@ -37,6 +37,41 @@ LIB_DIR="$(cd "$_dir" && pwd)"
 . "$LIB_DIR/pid-alive.sh"
 . "$LIB_DIR/zfs-unlock.sh"
 
+# Unlike boot-dataset.sh, this standalone wrapper has no trap of its
+# own to conflict with - registers zfs-unlock.sh's own
+# _zfs_unlock_cleanup_tempfiles() directly (see that function's own
+# comment for what it cleans up and why this file, not zfs-unlock.sh
+# itself, is the one that binds it as a trap). Closes a real gap a full
+# source audit found: an interrupt (Ctrl-C, a dropped SSH session) of
+# THIS specific entry point - menu.py's own "Unlock encrypted root"
+# action - mid-prompt used to leave the operator's plaintext passphrase
+# sitting in one of two mktemp files in tmpfs for the rest of the
+# rescue session, with nothing here to ever clean it up.
+#
+# EXIT alone, not EXIT INT TERM HUP together (F3-equivalent gap in
+# this file, found the same way unidoc-alip's PR #5 review found it in
+# boot-dataset.sh): a single trap command for a signal doesn't
+# terminate a POSIX sh script on its own - it runs the handler and then
+# RESUMES right after it, so a signal here used to clean up the
+# plaintext-passphrase temp files and then carry on straight into
+# zfs_unlock()/zfs_lock() as if nothing happened, instead of actually
+# stopping. Unlike boot-dataset.sh, this file is never PID 1 (menu.py
+# always shells out to it as a real subprocess - see this file's own
+# header comment), so there is no PID-1-must-never-exit case to guard
+# here at all: every invocation can safely terminate for real.
+#
+# _zfs_unlock_release_held_lock (F3, unidoc-alip's PR #5 follow-up
+# review): a signal landing mid zfs_unlock()/zfs_lock() - after
+# zfs_op_lock() has succeeded but before that same call has reached its
+# own zfs_op_unlock() - used to leave the per-encryptionroot lock held
+# with nothing here to ever release it, recoverable only via N4/F11's
+# own dead-pid reclaim path once another session next tried. See that
+# function's own comment (zfs-unlock.sh) for the full reasoning.
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles' EXIT
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 129' HUP
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 130' INT
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 143' TERM
+
 case "$ACTION" in
     unlock) zfs_unlock "$ENCRYPTIONROOT" ;;
     lock)   zfs_lock "$ENCRYPTIONROOT" ;;

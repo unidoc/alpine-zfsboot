@@ -1,0 +1,138 @@
+name: Check Alpine version
+
+# Semi-automatic, same pattern as unidoc-aports' own check-updates.yml:
+# finds a newer Alpine stable release and opens a PR bumping
+# alpine-version.txt - never merges anything itself.
+#
+# ci.yml's own go-tests/build-x86_64/build-aarch64/unit-tests do NOT
+# automatically run on this PR - a full source audit caught this: GitHub
+# suppresses `push`/`pull_request`-triggered workflow runs for commits or
+# PRs authored by the default GITHUB_TOKEN (a documented anti-loop
+# measure), and both the Contents-API push (commit-verified.sh) and `gh pr
+# create` below authenticate as GITHUB_TOKEN. An earlier version of this
+# comment (and the PR body below) claimed otherwise - that was wrong. This
+# job runs `go build`/`go vet`/`go test` itself before committing, which
+# catches a broken zfscompat.go edit (see the zfs-compat paragraph below),
+# but NOT a broken Alpine package set - actually proving build.sh still
+# succeeds against the new Alpine release needs the real Docker-based
+# build-x86_64/build-aarch64 jobs, which this workflow does not replicate.
+# The PR body says so explicitly and asks the reviewer to trigger that
+# manually (push an empty commit, or re-run ci.yml) before merging.
+#
+# alpine-version.txt is the ONLY place the Alpine build container's version
+# lives (Justfile, ci.yml, release.yml's docker invocations, and
+# release.yml's own release-body prose all read it) - bumping this one file
+# is the whole fix, unlike unidoc-aports' own check-alpine job, which has to
+# sed several hardcoded occurrences because that repo never consolidated
+# them the same way.
+#
+# Also runs check-zfs-compat.py against the NEW alpine-version.txt value
+# before committing anything, and folds whatever it changes into the same
+# commit/PR. Without this, an Alpine bump that crosses an OpenZFS release
+# line (e.g. Alpine ships zfs 2.5.x for the first time) would merge with no
+# vendored zfs-compatibility.d/openzfs-2.5 and no zfscompat.go entry for it
+# - `status`/`verify` would silently start reporting "Boot compatible:
+# UNKNOWN" for every real install, and nothing in go-tests would catch it
+# (the tests only assert against release lines already in the map). Running
+# the check here, synchronously, before the PR opens - not relying on
+# check-zfs-compat.yml's own separate weekly schedule to eventually notice
+# - is what keeps the two files from drifting out of sync on the one day it
+# would matter. If check-zfs-compat.py itself fails (e.g. no matching
+# upstream openzfs/zfs tag yet), this job fails too, on purpose, rather
+# than opening a half-updated PR.
+on:
+  schedule:
+    - cron: "0 6 * * *" # once a day, 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  check-alpine:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check alpine-version.txt against Alpine's own latest-stable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          current="$(cat alpine-version.txt)"
+
+          # latest-stable is Alpine's own self-maintained pointer to
+          # whichever branch is current - the same authoritative source
+          # https://dl-cdn.alpinelinux.org/alpine/ itself resolves against,
+          # not a guess based on Docker Hub tag sort order. Matches
+          # unidoc-aports' own check-alpine job exactly.
+          latest="$(curl -fsSL \
+            https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml \
+            | sed -n 's/^  branch: v//p' | head -1)"
+
+          if [ "$current" = "$latest" ]; then
+            echo "alpine-version.txt: up to date ($current)"
+            exit 0
+          fi
+          echo "alpine-version.txt: $current -> $latest"
+
+          echo "$latest" > alpine-version.txt
+
+          # Runs against the alpine-version.txt just written above, not the
+          # old one - if $latest ships a new OpenZFS release line, this
+          # vendors it (or fails loudly - see this workflow's own header
+          # comment) BEFORE anything gets committed.
+          zfs_compat_out="$(python3 .github/scripts/check-zfs-compat.py)"
+          echo "$zfs_compat_out"
+          changed_files="alpine-version.txt"
+          zfs_compat_line="$(printf '%s\n' "$zfs_compat_out" | grep '^CHANGED_FILES=' || true)"
+          if [ -n "$zfs_compat_line" ]; then
+            changed_files="$changed_files ${zfs_compat_line#CHANGED_FILES=}"
+          fi
+          new_release_lines="$(printf '%s\n' "$zfs_compat_out" | grep '^NEW_RELEASE_LINES=' | sed 's/^NEW_RELEASE_LINES=//' || true)"
+
+          # Real validation of whatever zfs-compat just changed (if
+          # anything) - see this workflow's own header comment for why
+          # this runs HERE rather than relying on ci.yml's go-tests job.
+          go build ./...
+          go vet ./...
+          go test ./...
+
+          branch="bump-alpine-$latest"
+          # shellcheck disable=SC2086 # changed_files is a script-built list
+          # of repo-relative paths, not attacker input.
+          .github/scripts/commit-verified.sh "$branch" \
+            "ci: bump Alpine to $latest" $changed_files
+
+          body="Alpine's own latest-stable branch is now v$latest (this repo's builder was pinned to $current). go build/vet/test already ran in this same job and passed."
+          body="$(printf '%s\n\n%s' "$body" "**This PR has NOT been validated against a real Alpine $latest container.** ci.yml's build-x86_64/build-aarch64 jobs - which actually \`apk add\` \`zfs\`/\`zfs-lts\`/\`linux-lts\`/\`mkinitfs\`/\`gnu-efi\`/\`dropbear\` and friends from the new Alpine branch and run build.sh - do NOT automatically trigger on this PR (GitHub does not run push/pull_request workflows for GITHUB_TOKEN-authored commits/PRs). Push an empty commit to this branch, or re-run ci.yml manually, and read those two jobs' logs before merging - an Alpine bump is a real package-set boundary, not just a version number.")"
+          if [ "$changed_files" != "alpine-version.txt" ]; then
+            body="$(printf '%s\n\n%s' "$body" "Alpine's own zfs package also moved as part of this - zfs-compatibility.d/ (and, if it crossed into a release line this repo hadn't seen before, zfscompat.go) got re-vendored in the same commit, verbatim from the matching openzfs/zfs tag. See .github/scripts/check-zfs-compat.py's own comment for the provenance guarantee.")"
+          fi
+          if [ -n "$new_release_lines" ]; then
+            body="$(printf '%s\n\n**New OpenZFS release line(s): %s.** Read the zfscompat.go diff yourself before approving - go build/vet/test (already run above) catches a build break but not a semantic one.' "$body" "$new_release_lines")"
+          fi
+
+          # F15 (unidoc-alip's PR #5 review): `... || echo "..."` here
+          # used to turn ANY gh pr create failure into a green job -
+          # "a PR is already open" is the one real reason to expect a
+          # nonzero exit, but the same swallow also hid a genuine
+          # failure (the most plausible: this repo/org setting "Allow
+          # GitHub Actions to create and approve pull requests" being
+          # off) - the branch gets pushed, no PR opens, and nobody
+          # finds out Alpine moved on until someone happens to notice.
+          # Check for an existing PR explicitly first; only skip for
+          # that specific, expected reason, and let a real gh pr create
+          # failure fail this job for real otherwise.
+          if [ "$(gh pr list --head "$branch" --json number --jq length)" -gt 0 ]; then
+              echo "PR already open for $branch - nothing to do"
+          else
+              gh pr create --title "ci: bump Alpine to $latest" --body "$body" \
+                --head "$branch" --base master
+          fi

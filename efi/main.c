@@ -43,17 +43,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
 		return status;
 	}
 
-	status = pe_find_section(loaded_image->ImageBase, (CHAR8 *)".linux", &linux_sec);
+	status = pe_find_section(loaded_image->ImageBase, (UINTN)loaded_image->ImageSize, (CHAR8 *)".linux", &linux_sec);
 	if (EFI_ERROR(status)) {
 		Print(L"alpine-zfsboot: no .linux section found: %r\n", status);
 		return status;
 	}
-	status = pe_find_section(loaded_image->ImageBase, (CHAR8 *)".initrd", &initrd_sec);
+	status = pe_find_section(loaded_image->ImageBase, (UINTN)loaded_image->ImageSize, (CHAR8 *)".initrd", &initrd_sec);
 	if (EFI_ERROR(status)) {
 		Print(L"alpine-zfsboot: no .initrd section found: %r\n", status);
 		return status;
 	}
-	status = pe_find_section(loaded_image->ImageBase, (CHAR8 *)".cmdline", &cmdline_sec);
+	status = pe_find_section(loaded_image->ImageBase, (UINTN)loaded_image->ImageSize, (CHAR8 *)".cmdline", &cmdline_sec);
 	if (EFI_ERROR(status)) {
 		Print(L"alpine-zfsboot: no .cmdline section found: %r\n", status);
 		return status;

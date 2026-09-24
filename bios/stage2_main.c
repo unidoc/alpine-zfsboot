@@ -1,11 +1,11 @@
 #include "stdint_local.h"
 
-#include "bootblob.h"
 #include "bootparams.h"
 #include "build_id.h"
 #include "console.h"
 #include "disk.h"
 #include "e820.h"
+#include "fat.h"
 #include "gpt.h"
 #include "mbr.h"
 #include "switch32.h"
@@ -40,45 +40,27 @@
 #define INITRD_LOAD_ADDR 0x04000000u
 
 /*
- * How much of the boot-blob's kernel/initrd sections this stage reads
- * per disk_read_lba()+unreal_copy() cycle - a multiple of the sector
- * size so every non-final chunk maps to a whole number of sectors
- * with nothing left over; see load_to_high()'s own comment for why
- * the final, possibly-shorter chunk needs no special handling either.
- *
- * Raised from an original 8192 (16 sectors = 4 native ATAPI blocks):
- * confirmed the hard way that THIS constant, not cdrom_disk.c's own
- * NATIVE_BATCH, was the real ceiling on ATAPI command batching for
- * the whole kernel/initrd load - disk_read_lba() never sees a `count`
- * bigger than sectors_for(CHUNK_SIZE) from this file, regardless of
- * how many native blocks its own internal buffer could otherwise
- * batch per command, so NATIVE_BATCH raised on its own (an earlier
- * attempt at this same performance problem) changed nothing real: it
- * had headroom to batch far more than it was ever actually asked for.
- * disk_read_lba()'s own loop already issues as many NATIVE_BATCH-sized
- * ATAPI commands as a request needs, so CHUNK_SIZE and NATIVE_BATCH
- * are independent knobs, not required to match - this one just needed
- * to actually be raised.
- */
-#define CHUNK_SIZE 18432
-
-/*
- * Sanity ceilings on blob_hdr.kernel_size/initrd_size, checked before
- * ANY of the sector-count/LBA arithmetic below runs - not just
+ * Sanity ceilings on the kernel/initramfs files' own recorded sizes,
+ * checked before ANY size-derived arithmetic below runs - not just
  * generous headroom over a realistic kernel+initrd, but a real
- * security boundary: kernel_size/initrd_size come straight off disk
- * with no other independent check that they're sane before being fed
- * into sectors_for()'s own `(bytes + 511) / 512` (a 32-bit add that
- * genuinely overflows for a value near UINT32_MAX - confirmed by
- * reasoning through the arithmetic, not just asserted) and then used
- * as a physical-memory copy length in load_to_high(). MAX_KERNEL_SIZE
- * is deliberately small enough that KERNEL_LOAD_ADDR + MAX_KERNEL_SIZE
- * stays well clear of INITRD_LOAD_ADDR - the two destinations can
- * never overlap as long as this holds, independent of whatever the
- * boot-blob partition's own size (blob_sectors) claims.
+ * security boundary against a corrupt or hostile FAT directory entry.
+ * MAX_KERNEL_SIZE is deliberately small enough that KERNEL_LOAD_ADDR +
+ * MAX_KERNEL_SIZE stays well clear of INITRD_LOAD_ADDR - the two
+ * destinations can never overlap as long as this holds.
  */
 #define MAX_KERNEL_SIZE (48u * 1024 * 1024)
 #define MAX_INITRD_SIZE (512u * 1024 * 1024)
+
+/*
+ * The kernel command line, read as a plain text file
+ * (/EFI/ALPINE/CMDLINE - see fat_open()'s own namespace comment) -
+ * generous for any realistic cmdline, with room left over for this
+ * file's own defensive NUL terminator (and a stripped trailing
+ * newline, a real hazard for a file that started life as a plain text
+ * file rather than this project's own former packed-and-NUL-included
+ * boot-blob format).
+ */
+#define CMDLINE_BUF_SIZE 512
 
 /*
  * Confirmed the hard way, on real hardware: a disk read can come back
@@ -105,12 +87,12 @@
  */
 #define GPT_RETRY_ATTEMPTS 10
 
-static uint8_t g_chunk[CHUNK_SIZE];
 static uint8_t g_boot_params[BOOT_PARAMS_SIZE];
-static uint8_t g_cmdline[ZFSBOOT_BOOTBLOB_SECTOR_SIZE];
+static uint8_t g_cmdline[CMDLINE_BUF_SIZE];
+static uint8_t g_header_buf[SETUP_HEADER_FILE_OFFSET + sizeof(struct setup_header)];
 static struct boot_e820_entry g_e820[BOOT_PARAMS_E820_MAX_ENTRIES];
 
-static const uint8_t bootblob_type_guid[16] = ZFSBOOT_BOOTBLOB_TYPE_GUID_BYTES;
+static const uint8_t esp_type_guid[16] = ZFSBOOT_ESP_TYPE_GUID_BYTES;
 
 static uint32_t phys_of(const void *p)
 {
@@ -126,59 +108,107 @@ static void die(const char *msg)
 		__asm__ __volatile__("hlt");
 }
 
-static uint32_t sectors_for(uint32_t bytes)
+/*
+ * a20_verify() - the classic, textbook A20 test (the same technique
+ * GRUB/syslinux both use): with A20 gated OFF, physical address bit 20
+ * is masked to 0, so a write to (some low address + 1MB) silently
+ * ALIASES back onto that same low address instead of landing 1MB away
+ * - this writes a known pattern to a low probe variable, then uses the
+ * ALREADY-PROVEN unreal_copy() to write a DIFFERENT pattern to the
+ * address exactly 1MB above it, then checks whether the low probe's
+ * own value changed. If A20 is truly enabled, the high write lands at
+ * a genuinely different physical address and the low probe is
+ * untouched; if A20 is still gated off, the high write silently
+ * corrupts the low probe instead.
+ *
+ * A full source audit found enable_a20() (switch32.S) tried both the
+ * documented BIOS service (INT 15h/AX=2401h) and the port-0x92 fast-
+ * A20 fallback, but never actually verified either one WORKED before
+ * returning - on a real chipset where neither method is honored (rare,
+ * but the entire reason this file's own comment calls the two methods
+ * "belt-and-suspenders" rather than assuming either one alone is
+ * enough), every subsequent unreal_copy() to a >=1MB destination
+ * (KERNEL_LOAD_ADDR is exactly 1MB) would silently wrap back down to
+ * physical address 0, corrupting the IVT/BDA and leaving the kernel
+ * never actually loaded where the CPU is told to jump to - a silent,
+ * catastrophic failure with no error message at all, the single worst
+ * possible outcome this loader can produce. This closes that gap: if
+ * A20 genuinely isn't enabled, die() here with a real, actionable
+ * message instead of proceeding into silent memory corruption.
+ *
+ * phys_of(), not a bare pointer cast - low_probe's REAL physical
+ * address must account for this stage's own nonzero segment base
+ * (STAGE2_SEGMENT<<4), exactly the same reasoning phys_of()'s own
+ * existing callers already depend on; a bare cast would only give the
+ * in-segment offset and silently test the wrong pair of addresses.
+ */
+static int a20_verify(void)
 {
-	return (bytes + (ZFSBOOT_BOOTBLOB_SECTOR_SIZE - 1)) / ZFSBOOT_BOOTBLOB_SECTOR_SIZE;
+	static volatile uint32_t low_probe = 0x58601216u; /* an arbitrary, non-zero, non-repeating pattern */
+	uint32_t overwrite = 0xa1cf9e73u;                  /* a different arbitrary pattern */
+	uint32_t high_phys = phys_of((const void *)&low_probe) + 0x00100000u;
+
+	unreal_copy(high_phys, &overwrite, sizeof(overwrite));
+
+	return low_probe == 0x58601216u;
+}
+
+/* One dot per MiB actually transferred - cheap, real feedback on a
+ * large FAT read (a 50+MB initrd over real BIOS disk I/O takes long
+ * enough that silent output reads as a hang, not progress). fat.c
+ * itself has no notion of "a MiB" or "a dot" - this is deliberately
+ * the one place that policy lives (see fat.h's own fat_progress_fn
+ * comment); fat_read_range() just reports raw byte counts as they
+ * complete. */
+#define PROGRESS_DOT_BYTES (1024u * 1024u)
+
+struct progress_state {
+	uint32_t since_dot;
+};
+
+static void progress_dot(void *ctx, uint32_t bytes_done)
+{
+	struct progress_state *st = (struct progress_state *)ctx;
+
+	st->since_dot += bytes_done;
+	while (st->since_dot >= PROGRESS_DOT_BYTES) {
+		console_putc('.');
+		st->since_dot -= PROGRESS_DOT_BYTES;
+	}
 }
 
 /*
- * Reads total_bytes starting at start_lba (whole sectors only, as
- * every disk_read_lba() call is) through the low, real-mode-
- * addressable g_chunk staging buffer, moving each chunk up to its
- * final destination dst_phys via unreal_copy() (see switch32.h) -
- * the standard "stage through low memory, then move up" pattern any
- * real-mode loader needs once data has to end up above 1MB. The
- * final chunk may read a little more than total_bytes' own remainder
- * (rounded up to the next whole sector) but this always copies
- * exactly the requested number of real bytes out of that chunk, never
- * the trailing sector-padding past it - only relevant on the very
- * last chunk, which has no next iteration for a stray few extra bytes
- * to ever matter to.
+ * fat_mount()/fat_open() already validate everything they read (BPB
+ * geometry/signature, directory-entry type match) - a bad/stale read
+ * fails their own return code, so retrying the WHOLE call (not just
+ * the underlying disk_read_lba()) is exactly the same "retry the
+ * validated step" discipline GPT_RETRY_ATTEMPTS's own comment
+ * describes, applied to the FAT path instead of the GPT path.
  */
-static void load_to_high(uint64_t start_lba, uint32_t total_bytes, uint32_t dst_phys)
+static int fat_mount_retry(struct fat_volume *vol, uint64_t partition_lba, uint64_t partition_sectors)
 {
-	uint32_t remaining = total_bytes;
-	uint64_t lba = start_lba;
-	/*
-	 * A dot every 64 chunks (~1.1MB at this CHUNK_SIZE) instead of a
-	 * whole numbered line
-	 * every 4MB - plain progress feedback ("something is still
-	 * happening"), not a debugging aid: the numbered-line version and
-	 * the per-chunk RDTSC timing that used to be here both did their
-	 * job (localizing a real crash, then a real ATAPI phase-timing
-	 * question) and neither is needed now that both are understood/
-	 * fixed - see git history for that investigation, not this
-	 * function.
-	 */
-	uint32_t chunk_num = 0;
+	int i;
 
-	while (remaining > 0) {
-		uint32_t this_chunk = remaining < CHUNK_SIZE ? remaining : CHUNK_SIZE;
-		uint32_t sectors = sectors_for(this_chunk);
-
-		if (disk_read_lba(lba, (uint16_t)sectors, g_chunk) != 0)
-			die("disk_read_lba failed loading kernel/initrd");
-
-		unreal_copy(dst_phys, g_chunk, this_chunk);
-
-		lba += sectors;
-		dst_phys += this_chunk;
-		remaining -= this_chunk;
-
-		chunk_num++;
-		if ((chunk_num & 63) == 0)
-			console_putc('.');
+	for (i = 0; i < GPT_RETRY_ATTEMPTS; i++) {
+		if (fat_mount(vol, partition_lba, partition_sectors) == 0)
+			return 0;
+		console_puts("alpine-zfsboot-bios: FAT mount failed, retrying\n");
 	}
+	return -1;
+}
+
+static int fat_open_retry(const struct fat_volume *vol, const char *path, struct fat_file *file)
+{
+	int i;
+
+	for (i = 0; i < GPT_RETRY_ATTEMPTS; i++) {
+		if (fat_open(vol, path, file) == 0)
+			return 0;
+		console_puts("alpine-zfsboot-bios: FAT lookup failed for ");
+		console_puts(path);
+		console_puts(", retrying\n");
+	}
+	return -1;
 }
 
 /*
@@ -192,11 +222,12 @@ static void load_to_high(uint64_t start_lba, uint32_t total_bytes, uint32_t dst_
 void stage2_main(uint8_t drive_number)
 {
 	struct gpt_header hdr;
-	uint64_t blob_lba, blob_sectors;
-	struct zfsboot_bootblob_header blob_hdr;
+	struct fat_volume vol;
+	struct fat_file kernel_file, initrd_file, cmdline_file;
+	uint64_t esp_lba, esp_sectors;
 	struct setup_header kernel_hdr;
-	uint32_t real_mode_sectors, real_mode_bytes, protected_mode_size;
-	uint64_t kernel_lba, initrd_lba, cmdline_lba;
+	uint32_t real_mode_sectors, real_mode_bytes, protected_mode_size, header_len;
+	uint32_t cmdline_len;
 	uint8_t e820_count;
 	int i;
 
@@ -215,20 +246,6 @@ void stage2_main(uint8_t drive_number)
 	console_puts("\n");
 
 	/*
-	 * Retrying here (not just inside disk_read_lba()'s own retry loop)
-	 * matters for a real, distinct failure mode confirmed on real
-	 * hardware: a read that reports success (no error at all) but
-	 * whose CONTENT is still wrong - silently, with nothing for a
-	 * lower layer to even notice. gpt_read_header()'s own
-	 * signature+CRC32 check (and gpt_find_partition()'s "did we
-	 * actually find the partition" check, and the boot-blob/kernel
-	 * magic checks below) are the ONLY things that can catch that:
-	 * retrying the ENTIRE read+validate step, at THIS level, until it
-	 * comes out to real content (or genuinely giving up), not just
-	 * retrying a failure-flagged transfer that never got the chance to
-	 * look wrong in the first place.
-	 */
-	/*
 	 * GPT first (this project's own sgdisk-based install instructions
 	 * always produce one), falling back to a classic MBR partition
 	 * table only if no valid GPT is found at all - not per-attempt:
@@ -237,7 +254,12 @@ void stage2_main(uint8_t drive_number)
 	 * ATTEMPTS loop gets a fair chance at a real GPT before this stage
 	 * ever falls back to treating the disk as MBR-labeled instead. See
 	 * mbr.h's own header comment for why stage1.S itself needs no
-	 * changes to support this - only this lookup does.
+	 * changes to support this - only this lookup does. Finds the
+	 * canonical alpine-zfsboot FAT/ESP partition - the SAME partition
+	 * UEFI firmware itself boots from on a UEFI install, and the one
+	 * /init reads config/authorized_keys/ssh_host_ed25519_key from
+	 * after boot (see fat.h's own header comment) - not a
+	 * BIOS-specific partition of any kind.
 	 */
 	{
 		int have_gpt = 0;
@@ -268,12 +290,12 @@ void stage2_main(uint8_t drive_number)
 
 		if (have_gpt) {
 			for (i = 0; i < GPT_RETRY_ATTEMPTS; i++) {
-				if (gpt_find_partition(&hdr, bootblob_type_guid, &blob_lba, &blob_sectors) == 0)
+				if (gpt_find_partition(&hdr, esp_type_guid, &esp_lba, &esp_sectors) == 0)
 					break;
-				console_puts("alpine-zfsboot-bios: boot-blob partition lookup failed, retrying\n");
+				console_puts("alpine-zfsboot-bios: FAT/ESP partition lookup failed, retrying\n");
 			}
 			if (i == GPT_RETRY_ATTEMPTS)
-				die("boot-blob partition not found");
+				die("FAT/ESP partition not found");
 		} else {
 			/*
 			 * Stated as plain fact, not failure language - on a
@@ -284,107 +306,72 @@ void stage2_main(uint8_t drive_number)
 			 */
 			console_puts("alpine-zfsboot-bios: no GPT found, using MBR\n");
 			for (i = 0; i < GPT_RETRY_ATTEMPTS; i++) {
-				if (mbr_find_partition(ZFSBOOT_BOOTBLOB_MBR_TYPE, &blob_lba, &blob_sectors) == 0)
+				if (mbr_find_partition(ZFSBOOT_FAT_MBR_TYPE, &esp_lba, &esp_sectors) == 0)
 					break;
-				console_puts("alpine-zfsboot-bios: MBR boot-blob partition lookup failed, retrying\n");
+				console_puts("alpine-zfsboot-bios: MBR FAT partition lookup failed, retrying\n");
 			}
 			if (i == GPT_RETRY_ATTEMPTS)
-				die("boot-blob partition not found (no valid GPT or MBR)");
+				die("FAT/ESP partition not found (no valid GPT or MBR)");
 		}
 	}
-
-	for (i = 0; i < GPT_RETRY_ATTEMPTS; i++) {
-		int j;
-		int magic_ok;
-
-		if (disk_read_lba(blob_lba, 1, g_chunk) != 0) {
-			console_puts("alpine-zfsboot-bios: boot-blob header read failed, retrying\n");
-			continue;
-		}
-		{
-			const uint8_t *src = g_chunk;
-			uint8_t *dst = (uint8_t *)&blob_hdr;
-			for (j = 0; j < (int)sizeof(blob_hdr); j++)
-				dst[j] = src[j];
-		}
-		magic_ok = 1;
-		for (j = 0; j < ZFSBOOT_BOOTBLOB_MAGIC_LEN; j++) {
-			if (blob_hdr.magic[j] != ZFSBOOT_BOOTBLOB_MAGIC[j])
-				magic_ok = 0;
-		}
-		if (magic_ok && blob_hdr.header_size == sizeof(blob_hdr))
-			break;
-		console_puts("alpine-zfsboot-bios: boot-blob header invalid, retrying\n");
-	}
-	if (i == GPT_RETRY_ATTEMPTS)
-		die("boot-blob magic mismatch");
-	if (blob_hdr.cmdline_size == 0 || blob_hdr.cmdline_size > sizeof(g_cmdline))
-		die("boot-blob cmdline_size out of range");
 	/*
-	 * See MAX_KERNEL_SIZE/MAX_INITRD_SIZE's own comment above - this
-	 * must happen before kernel_lba/initrd_lba/cmdline_lba below are
-	 * computed at all, since sectors_for() applied to an unbounded
-	 * value is exactly the operation these caps make safe.
+	 * esp_sectors is GPT/MBR's own real, external answer to "how big
+	 * is this partition" - the actual trust boundary fat_mount() now
+	 * checks its own BPB-claimed total_sectors against (a full source
+	 * audit found this used to be discarded here entirely, trusting
+	 * the volume's own self-reported size unconditionally - see
+	 * fat_mount()'s own comment on why a BPB that is merely internally
+	 * self-consistent is not enough on its own).
 	 */
-	if (blob_hdr.kernel_size == 0 || blob_hdr.kernel_size > MAX_KERNEL_SIZE)
-		die("boot-blob kernel_size out of range");
-	if (blob_hdr.initrd_size == 0 || blob_hdr.initrd_size > MAX_INITRD_SIZE)
-		die("boot-blob initrd_size out of range");
+	console_puts("alpine-zfsboot-bios: mounting FAT partition\n");
+	if (fat_mount_retry(&vol, esp_lba, esp_sectors) != 0)
+		die("FAT mount failed - not a valid FAT32 volume?");
 
-	kernel_lba = blob_lba + 1;
-	initrd_lba = kernel_lba + sectors_for(blob_hdr.kernel_size);
-	cmdline_lba = initrd_lba + sectors_for(blob_hdr.initrd_size);
+	if (fat_open_retry(&vol, "/EFI/ALPINE/KERNEL", &kernel_file) != 0)
+		die("EFI/ALPINE/KERNEL not found on FAT partition");
+	if (fat_open_retry(&vol, "/EFI/ALPINE/INITRD", &initrd_file) != 0)
+		die("EFI/ALPINE/INITRD not found on FAT partition");
+	if (fat_open_retry(&vol, "/EFI/ALPINE/CMDLINE", &cmdline_file) != 0)
+		die("EFI/ALPINE/CMDLINE not found on FAT partition");
+
+	if (kernel_file.size == 0 || kernel_file.size > MAX_KERNEL_SIZE)
+		die("kernel file size out of range");
+	if (initrd_file.size == 0 || initrd_file.size > MAX_INITRD_SIZE)
+		die("initrd file size out of range");
+	if (cmdline_file.size == 0 || cmdline_file.size > CMDLINE_BUF_SIZE - 1)
+		die("cmdline file size out of range");
 
 	console_puts("alpine-zfsboot-bios: kernel_size=");
-	console_puts_hex32(blob_hdr.kernel_size);
+	console_puts_hex32(kernel_file.size);
 	console_puts(" initrd_size=");
-	console_puts_hex32(blob_hdr.initrd_size);
+	console_puts_hex32(initrd_file.size);
 	console_puts(" initrd_end=");
-	console_puts_hex32(INITRD_LOAD_ADDR + blob_hdr.initrd_size);
+	console_puts_hex32(INITRD_LOAD_ADDR + initrd_file.size);
 	console_puts("\n");
-
-	/*
-	 * The boot-blob partition's OWN declared size (blob_sectors, from
-	 * gpt_find_partition()) must actually cover everything the header
-	 * claims is inside it - header + kernel + initrd + cmdline,
-	 * sector-padded exactly like the packer writes them (see
-	 * bootblob.h). Without this, a corrupted header (bit rot, a bad
-	 * block - not even necessarily anything adversarial) claiming
-	 * sizes that overrun the partition's real extent would have every
-	 * subsequent disk_read_lba() below silently read from whatever
-	 * happens to follow the partition on disk instead of failing
-	 * cleanly right here.
-	 */
-	if (1 + sectors_for(blob_hdr.kernel_size) + sectors_for(blob_hdr.initrd_size) +
-	        sectors_for(blob_hdr.cmdline_size) >
-	    blob_sectors)
-		die("boot-blob header claims more data than its own partition holds");
 
 	console_puts("alpine-zfsboot-bios: reading kernel header\n");
 	/*
 	 * setup_header itself is 123 bytes (see bootparams.h), starting at
 	 * SETUP_HEADER_FILE_OFFSET (0x1f1 = byte 497 of the kernel file) -
-	 * its own end (byte 620) is past the first 512-byte sector, so a
-	 * few of its LATER fields (header/"HdrS" at 0x202, and everything
-	 * after) land in the SECOND sector. Reading only 1 sector here
-	 * left those fields reading as zero (g_chunk's own untouched,
-	 * .bss-cleared tail) rather than the kernel's real bytes - not a
-	 * disk-read or GPT-lookup bug (confirmed the hard way: blob_lba/
-	 * kernel_lba and the first 16 bytes actually read - a real "MZ"
-	 * EFI-stub signature - were both exactly right), just genuinely
-	 * not enough of the file read to begin with. sectors_for() (this
-	 * file's own helper, already used for kernel_size/initrd_size
-	 * below) does the same ceiling-division here.
+	 * its own end (byte 620) is past the first 512-byte sector, so
+	 * reading fewer bytes than header_len here would leave its LATER
+	 * fields (header/"HdrS" at 0x202, and everything after) reading as
+	 * whatever g_header_buf's own stale/zeroed content was rather than
+	 * the kernel's real bytes.
 	 */
+	header_len = SETUP_HEADER_FILE_OFFSET + sizeof(kernel_hdr);
+	if (header_len > kernel_file.size)
+		die("kernel file smaller than its own setup header");
+
 	for (i = 0; i < GPT_RETRY_ATTEMPTS; i++) {
 		int j;
 
-		if (disk_read_lba(kernel_lba, (uint16_t)sectors_for(SETUP_HEADER_FILE_OFFSET + sizeof(kernel_hdr)), g_chunk) != 0) {
+		if (fat_read_range(&vol, &kernel_file, 0, header_len, phys_of(g_header_buf), 0, 0) != 0) {
 			console_puts("alpine-zfsboot-bios: kernel header read failed, retrying\n");
 			continue;
 		}
 		{
-			const uint8_t *src = g_chunk + SETUP_HEADER_FILE_OFFSET;
+			const uint8_t *src = g_header_buf + SETUP_HEADER_FILE_OFFSET;
 			uint8_t *dst = (uint8_t *)&kernel_hdr;
 			for (j = 0; j < (int)sizeof(kernel_hdr); j++)
 				dst[j] = src[j];
@@ -408,49 +395,67 @@ void stage2_main(uint8_t drive_number)
 	 * only setup_header, read out of it above, is ever used.
 	 */
 	real_mode_sectors = (kernel_hdr.setup_sects == 0 ? 4 : kernel_hdr.setup_sects) + 1;
-	real_mode_bytes = real_mode_sectors * ZFSBOOT_BOOTBLOB_SECTOR_SIZE;
-	if (real_mode_bytes >= blob_hdr.kernel_size)
+	real_mode_bytes = real_mode_sectors * 512u;
+	if (real_mode_bytes >= kernel_file.size)
 		die("kernel file smaller than its own reported real-mode portion");
-	protected_mode_size = blob_hdr.kernel_size - real_mode_bytes;
+	protected_mode_size = kernel_file.size - real_mode_bytes;
 
 	/*
 	 * Must happen before the first copy to any address >= 1MB
 	 * (KERNEL_LOAD_ADDR is exactly 0x100000 - bit 20 is the only set
 	 * bit): with A20 gated off, that write silently aliases back to
 	 * physical 0, corrupting the IVT/BDA instead of actually landing
-	 * at 1MB - a real, separate bug from the CD-ROM read issue this
-	 * stage has otherwise been chasing, confirmed via SeaBIOS's own
-	 * source: SeaBIOS unconditionally enables A20 for the DURATION of
-	 * its own INT13h calls (see src/stacks.c's call32_prep()) and
-	 * restores whatever it was before on return - it is NOT left on
-	 * afterward just because a disk read happened to run. This
-	 * project's own code before this point never asked for A20 itself.
-	 * Called once, here, rather than inside unreal_copy() on every
-	 * chunk: A20 has no "off" path anywhere after this in the whole
-	 * boot (nothing re-disables it), so enabling it repeatedly per
-	 * 8KB chunk would just be a wasted INT15h call every time.
+	 * at 1MB. Called once, here, rather than before every fat_read_
+	 * range() call above (all of which targeted g_header_buf, a
+	 * low/near address well under 1MB - unreal_copy() to a low
+	 * destination never wraps regardless of A20 state, see switch32.h's
+	 * own comment) - A20 has no "off" path anywhere after this in the
+	 * whole boot, so enabling it any earlier would just be wasted work.
 	 */
 	enable_a20();
+	if (!a20_verify())
+		die("A20 line did not enable - cannot safely load above 1MB");
 
-	console_puts("alpine-zfsboot-bios: loading kernel");
-	load_to_high(kernel_lba + sectors_for(real_mode_bytes), protected_mode_size, KERNEL_LOAD_ADDR);
+	console_puts("alpine-zfsboot-bios: loading kernel ");
+	{
+		struct progress_state st = { 0 };
+		if (fat_read_range(&vol, &kernel_file, real_mode_bytes, protected_mode_size, KERNEL_LOAD_ADDR,
+		                    progress_dot, &st) != 0)
+			die("FAT read failed loading kernel");
+	}
 	console_puts(" done\n");
 
-	console_puts("alpine-zfsboot-bios: loading initrd");
+	console_puts("alpine-zfsboot-bios: loading initrd ");
 	/*
 	 * initrd_addr_max: the highest physical address the kernel says
 	 * the initrd may safely occupy (older kernels report a value
 	 * well under 4GB) - checked for real here rather than just
 	 * assumed to always clear INITRD_LOAD_ADDR + its own size.
 	 */
-	if ((uint64_t)INITRD_LOAD_ADDR + blob_hdr.initrd_size > kernel_hdr.initrd_addr_max)
+	if ((uint64_t)INITRD_LOAD_ADDR + initrd_file.size > kernel_hdr.initrd_addr_max)
 		die("initrd would exceed kernel's own initrd_addr_max");
-	load_to_high(initrd_lba, blob_hdr.initrd_size, INITRD_LOAD_ADDR);
+	{
+		struct progress_state st = { 0 };
+		if (fat_read_range(&vol, &initrd_file, 0, initrd_file.size, INITRD_LOAD_ADDR,
+		                    progress_dot, &st) != 0)
+			die("FAT read failed loading initrd");
+	}
 	console_puts(" done\n");
 
-	if (disk_read_lba(cmdline_lba, (uint16_t)sectors_for(blob_hdr.cmdline_size), g_cmdline) != 0)
-		die("could not read cmdline");
-	g_cmdline[sizeof(g_cmdline) - 1] = '\0'; /* defensive - the packer already NUL-terminates within cmdline_size, this just bounds worst case */
+	if (fat_read_range(&vol, &cmdline_file, 0, cmdline_file.size, phys_of(g_cmdline), 0, 0) != 0)
+		die("FAT read failed loading cmdline");
+	/*
+	 * The cmdline file is a plain text file (unlike this project's own
+	 * former packed boot-blob format, which included its own NUL in
+	 * cmdline_size) - strip one trailing newline if present (a common
+	 * side effect of how such a file tends to get written/edited), then
+	 * NUL-terminate for real. cmdline_file.size was already checked
+	 * against CMDLINE_BUF_SIZE-1 above, so this NUL always fits.
+	 */
+	cmdline_len = cmdline_file.size;
+	if (cmdline_len > 0 && g_cmdline[cmdline_len - 1] == '\n')
+		cmdline_len--;
+	g_cmdline[cmdline_len] = '\0';
 
 	e820_count = e820_get_map(g_e820, BOOT_PARAMS_E820_MAX_ENTRIES);
 	if (e820_count == 0)
@@ -458,7 +463,7 @@ void stage2_main(uint8_t drive_number)
 
 	for (i = 0; i < (int)BOOT_PARAMS_SIZE; i++)
 		g_boot_params[i] = 0;
-	bootparams_build(g_boot_params, &kernel_hdr, INITRD_LOAD_ADDR, blob_hdr.initrd_size,
+	bootparams_build(g_boot_params, &kernel_hdr, INITRD_LOAD_ADDR, initrd_file.size,
 	                  phys_of(g_cmdline), g_e820, e820_count);
 
 	console_puts("alpine-zfsboot-bios: starting kernel\n");

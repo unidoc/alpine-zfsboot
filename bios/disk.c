@@ -84,6 +84,19 @@ int disk_read_lba(uint64_t lba, uint16_t count, void *buf)
 	 * barely optimizes at all) never actually exercised this bug,
 	 * which is why it went unnoticed until built the same way the
 	 * real Makefile does.
+	 *
+	 * "ebp" clobber (F18, unidoc-alip's PR #5 review): the same real
+	 * hardware finding console.c's own console_putc() and e820.c's own
+	 * INT 0x15 call already carry a clobber for - a BIOS's own
+	 * interrupt handler is free to use, and not restore, EBP
+	 * internally, a plain GPR here under -fomit-frame-pointer. "esi"
+	 * is deliberately NOT also added - unlike e820.c's case, this asm
+	 * already explicitly preserves it itself (push/pop around the
+	 * call), a stronger guarantee than a clobber would add (the real
+	 * original value survives, not just "GCC no longer trusts it").
+	 * Confirmed to compile cleanly at this file's own real -O2 build
+	 * flags and boot for real under QEMU (tests/bios-hdd-entry-test.sh)
+	 * - not just reasoned about.
 	 */
 	__asm__ __volatile__(
 		"push %%si\n\t"
@@ -94,8 +107,29 @@ int disk_read_lba(uint64_t lba, uint16_t count, void *buf)
 		"pop %%si\n\t"
 		: "=q"(failed)
 		: "r"(dap_off), "d"(g_drive_number)
-		: "ah", "cc", "memory"
+		: "ah", "ebp", "cc", "memory"
 	);
 
-	return failed ? -1 : 0;
+	if (failed)
+		return -1;
+
+	/*
+	 * Not every real BIOS updates the DAP's own sector-count field to
+	 * reflect a SHORT transfer (INT 13h/AH=42h's own documented
+	 * behavior leaves this implementation-defined - the carry flag is
+	 * the one universally-reliable signal, already checked above) -
+	 * but on the ones that DO, this is a real, free extra check: safe
+	 * either way, since dap.num_blocks was set to `count` as an INPUT
+	 * before the call, so a BIOS that never touches it leaves this
+	 * comparison trivially true. Reading it back here (rather than
+	 * trusting the local `count` parameter) is what actually proves
+	 * the read - a BIOS that reports success (CF clear) but silently
+	 * transferred fewer sectors than requested used to be
+	 * indistinguishable from a genuine full read, with the caller
+	 * treating a short/corrupt buffer as complete, real disk content.
+	 */
+	if (dap.num_blocks != count)
+		return -1;
+
+	return 0;
 }

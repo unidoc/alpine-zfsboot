@@ -97,21 +97,121 @@
 /*
  * How many native (2048-byte) sectors this file fetches in a single
  * read command (either backend). Not the full ATAPI_MAX_READ_BLOCKS
- * (31, see ata_atapi.h's own comment for why not 32) - checked
- * directly by building at several values and reading back the
- * linker's own _bss_end: this whole stage's code+rodata+every one of
- * its own buffers+stack all share a single 64KB real-mode segment
- * (see link.ld/stage2_entry.S), unlike the UEFI path's flat 32-bit
- * address space, which has no such ceiling at all - a structural limit
- * of real-mode boot code, not a driver inefficiency. 16 (32768 bytes
- * per command) leaves a comfortable ~9KB of stack headroom, confirmed
- * via the same build+_bss_end check; NATIVE_BATCH stays at the same
- * value regardless of which backend is active, both for that same
- * stack-headroom reason and so a future timing comparison between the
- * two backends is never muddied by also comparing different batch
- * sizes.
+ * (31, see ata_atapi.h's own comment for why not 32) - this whole
+ * stage's code+rodata+every one of its own buffers+stack all share a
+ * single 64KB real-mode segment (see link.ld/stage2_entry.S), unlike
+ * the UEFI path's flat 32-bit address space, which has no such
+ * ceiling at all - a structural limit of real-mode boot code, not a
+ * driver inefficiency. NATIVE_BATCH stays at the same value
+ * regardless of which backend is active, both so neither backend's
+ * own command-count/overhead is muddied by also comparing different
+ * batch sizes, and because this budget is shared: this file's own
+ * g_native_buf and fat.c's g_fat_io_buf (FAT_IO_BATCH_SECTORS below)
+ * are the two large buffers competing for the same headroom.
+ *
+ * An earlier version of this comment claimed 16 "leaves a comfortable
+ * ~9KB of stack headroom" while the actual constant next to it was
+ * 11 - a real discrepancy a later audit caught and re-verified for
+ * real (built at every value 11-31, `nm`-inspected `_bss_end` each
+ * time, this exact codebase - the 9KB/16 claim was already stale by
+ * the time it was written, most likely left over from an earlier,
+ * smaller build of this stage rather than ever having been true of
+ * this code).
+ *
+ * That table itself went stale in turn: fat.c grew a second, separate
+ * FAT-sector cache (g_fat_table_cache2 - see that file's own comment
+ * on why: fat_chain_advance()'s Floyd hare/tortoise cycle detection
+ * was sharing ONE cache between both pointers, so once a chain got
+ * long enough hare and tortoise were usually in different FAT
+ * sectors and kept evicting each other's cache line - measured on a
+ * realistic ~72MB kernel+initrd payload at 20,827 total INT13h/ATAPI
+ * calls before the fix, 2,824 after; giving tortoise its own 512-byte
+ * cache slot fixed it, a 7.4x reduction). That extra 512 bytes of
+ * .bss, plus this project's own later hardening-pass growth, ate most
+ * of NATIVE_BATCH=11's documented ~4.4KB margin - confirmed for real
+ * on a genuinely different toolchain (Alpine's own gcc 15.2.0,
+ * musl-based build host, not this sandbox's Debian gcc cross build):
+ * the exact same source built there landed _bss_end 26 bytes PAST
+ * check-bss-bounds's own limit and failed the real build, while this
+ * sandbox's own gcc build still passed with only 1286 bytes to spare
+ * - a toolchain-to-toolchain swing of ~1.3KB on identical source, all
+ * by itself most of the remaining margin. Re-measured the same way
+ * the original table was built (every value, `nm`-inspected
+ * `_bss_end`, this sandbox's toolchain, FAT_IO_BATCH_SECTORS still at
+ * its current 36):
+ *
+ *   NATIVE_BATCH  _bss_end  margin to check-bss-bounds's own limit
+ *        11        0xf2ea    1286 bytes  <- was "current", now too
+ *                                            tight (see above - a
+ *                                            different real toolchain
+ *                                            already failed here)
+ *        10        0xeaea    3334 bytes
+ *         9        0xe2ea    5382 bytes  <- current, this file
+ *         8        0xdaea    7430 bytes
+ *         7        0xd2ea    9478 bytes
+ *
+ * Each step is exactly 2048 bytes (NATIVE_SECTOR_SIZE), as expected -
+ * g_native_buf is by far this build's largest single .bss consumer.
+ * 9 is the new deliberate choice: 5382 bytes of margin in THIS
+ * (sandbox) toolchain is enough headroom that even the ~1.3KB
+ * toolchain swing just observed firsthand (not a hypothetical) leaves
+ * comfortably more than the original ~4.4KB design intent behind 11
+ * used to provide, without guessing at how much bigger some future
+ * toolchain might run.
+ *
+ * UPDATE (F22, unidoc-alip's PR #5 follow-up review, correcting a
+ * transcription error in the FIRST review's own re-measurement): re-
+ * measured against the REAL Alpine gcc 15.2.0 CI toolchain this
+ * project actually ships with (not this sandbox's own Debian cross-
+ * compiler, the toolchain every number in the table above was built
+ * with) - _bss_end there is 0xe84a, 4006 bytes of margin at
+ * NATIVE_BATCH=9. Still real, still comfortable headroom (over the
+ * ~4.4KB original design intent behind NATIVE_BATCH=11, and nowhere
+ * near check-bss-bounds's own limit) - just a third real data point
+ * (sandbox gcc: 5382B, Alpine gcc 15.2.0: 4006B) worth keeping
+ * alongside the table above rather than letting it silently stand in
+ * as if it were the number that matters for the toolchain real builds
+ * actually use.
+ *
+ * Costs a real, modest thing in return: the ATAPI-fallback
+ * native-sector backend (cdrom_disk.c's own atapi_read_native() path
+ * - only ever used when a BIOS lacks working INT13h extensions on
+ * optical media, see this file's own int13_extensions_present()) now
+ * issues roughly 11/9 (~22%) more read commands for the same payload
+ * than before. Accepted deliberately: this is the fallback path, not
+ * the common one (see int13_read_native() above, tried first), and a
+ * stack/.bss collision on real hardware is a silent-corruption bug,
+ * not a recoverable slow boot - the same trade-off this whole
+ * check-bss-bounds gate exists to enforce.
+ *
+ * Separately, real-mode-segment-offset safety (bss_end < 0x10000,
+ * checked at build time by check-bss-bounds - see ../Makefile) is NOT
+ * the same claim as "never crosses a 64KB-ALIGNED PHYSICAL boundary"
+ * for this build specifically - see ../Makefile's own check-bss-bounds
+ * comment for why the two only coincide when the segment's own
+ * physical base is itself 64KB-aligned, which STAGE2_SEGMENT=0x1000
+ * (the real-disk build) is and ISO_SEG=0x7c0 (this build, physical
+ * base 0x7c00) is NOT. Verified directly for this file's own transfer
+ * buffer: the one 64KB-aligned physical address reachable at all from
+ * this segment (offset range [0,0x10000) only, since nothing here
+ * exceeds that) is physical 0x10000, which is segment offset
+ * 0x10000-0x7c00 = 0x8400. g_native_buf sits at a fixed offset - 0x9ae0
+ * today (re-verified via `nm` alongside the table above; grew from an
+ * earlier-documented 0x9660 once fat.c's own g_fat_table_cache2 was
+ * added ahead of it in link order - see that comment above), with
+ * FAT_IO_BATCH_SECTORS=36, independent of NATIVE_BATCH itself -
+ * everything ahead of it in link order is unaffected by this
+ * constant, only BY this constant's own size is what comes AFTER it
+ * (nothing, it's last) - already past that point for every value in
+ * the table above, so its own transfer buffer never straddles that
+ * boundary - confirmed by inspection, not assumed from the
+ * segment-offset check alone. This would need re-checking by hand
+ * (not just re-running check-bss-bounds) if FAT_IO_BATCH_SECTORS's
+ * own size, or anything else placed before g_native_buf in this
+ * file's object, ever changed enough to move g_native_buf's start
+ * below offset 0x8400.
  */
-#define NATIVE_BATCH 11
+#define NATIVE_BATCH 9
 #define NATIVE_BATCH_BYTES (NATIVE_BATCH * NATIVE_SECTOR_SIZE)
 
 static uint8_t g_native_buf[NATIVE_BATCH_BYTES];
@@ -165,7 +265,21 @@ static int int13_read_native(uint32_t native_lba, uint16_t native_count, void *b
 	dap.buffer_segment = ds_seg;
 	dap.start_lba = native_lba;
 
-	/* See disk.c's own identical comment for the "memory" clobber. */
+	/* See disk.c's own identical comment for the "memory" clobber, and
+	 * e820.c's own comment for why "ebp" (F18, unidoc-alip's PR #5
+	 * review - the same real hardware finding console.c's own
+	 * console_putc() and e820.c's own INT 0x15 call already carry a
+	 * clobber for: a BIOS's own interrupt handler is free to use, and
+	 * not restore, EBP internally, a plain GPR here under
+	 * -fomit-frame-pointer). "esi" is deliberately NOT also added -
+	 * unlike e820.c's case, this asm already explicitly preserves it
+	 * itself (push/pop around the call), a stronger guarantee than a
+	 * clobber would add (the real original value survives, not just
+	 * "GCC no longer trusts it"). Confirmed to compile cleanly at this
+	 * file's own real -O2 build flags and boot for real under QEMU
+	 * (tests/bios-iso-entry-test.sh, both the plain INT13h and forced-
+	 * ATAPI paths, and tests/bios-hdd-entry-test.sh for disk.c's own
+	 * identical fix) - not just reasoned about. */
 	__asm__ __volatile__(
 		"push %%si\n\t"
 		"mov %1, %%si\n\t"
@@ -175,10 +289,20 @@ static int int13_read_native(uint32_t native_lba, uint16_t native_count, void *b
 		"pop %%si\n\t"
 		: "=q"(failed)
 		: "r"(dap_off), "d"(g_drive_number)
-		: "ah", "cc", "memory"
+		: "ah", "ebp", "cc", "memory"
 	);
 
-	return failed ? -1 : 0;
+	if (failed)
+		return -1;
+
+	/* See disk.c's own identical comment for why this is a real,
+	 * free-either-way check - not every real BIOS updates this field
+	 * on a short transfer, but reading it back here catches the ones
+	 * that do, and is a no-op for the ones that don't. */
+	if (dap.num_blocks != native_count)
+		return -1;
+
+	return 0;
 }
 
 /*
@@ -192,6 +316,39 @@ static int int13_read_native(uint32_t native_lba, uint16_t native_count, void *b
  * check reported. disk_init() below treats this as a cheap first
  * filter only, always followed by one real, functional test read
  * before trusting this backend for the whole rest of the boot.
+ *
+ * F18 (unidoc-alip's PR #5 review, closed by the follow-up review):
+ * this asm passes g_drive_number in via a plain "d" (DX) input
+ * constraint, and AH=0x41's own real BIOS return convention can leave
+ * DH holding data this code never reads - a bare input operand doesn't
+ * tell GCC DX's contents are redefined afterward, so in principle some
+ * OTHER live value the compiler happened to also be keeping in DX
+ * around this call could be silently corrupted, the same class of
+ * finding that got "ebp" added to this file's own int13_read_native()
+ * above and to e820.c's INT 0x15 call. Unlike those two, a GCC-level
+ * fix (a real "+d" capture operand telling GCC DX is destroyed) does
+ * NOT fit here - confirmed empirically, not just reasoned, that adding
+ * either "dx" to the clobber list (invalid - a register can't be both
+ * a constraint operand and a clobber) or a "+d" scratch capture
+ * operand both fail this file's own real -O2 build with "asm operand
+ * has impossible constraints or there are not enough registers", the
+ * identical register-exhaustion failure e820.c's own comment already
+ * documents for its unrelated "edi" case - this function's tightly-
+ * packed 4-operand set (carry/bx/cx/dx) genuinely has no register
+ * budget left for a fifth.
+ *
+ * The actual fix needs no extra operand at all: push %dx onto the
+ * stack as the asm block's own first instruction (BEFORE anything
+ * could touch it), pop it back as its second-to-last (after int $0x13
+ * returns, before setc reads the carry flag - `pop` does not itself
+ * touch EFLAGS, so this ordering is safe). GCC is never told DX
+ * changed because, from its own point of view, it genuinely didn't:
+ * whatever value it handed this asm block in DX is exactly what comes
+ * back out, regardless of what the BIOS did to DH/DL internally in
+ * between - the same class of protection "ebp" gets elsewhere in this
+ * file, achieved here via the stack instead of a constraint, at the
+ * cost of 2 bytes of stack space for the asm block's own duration and
+ * nothing else.
  */
 static int int13_extensions_present(void)
 {
@@ -199,9 +356,11 @@ static int int13_extensions_present(void)
 	uint8_t carry;
 
 	__asm__ __volatile__(
+		"pushw %%dx\n\t"
 		"movw $0x55aa, %%bx\n\t"
 		"movb $0x41, %%ah\n\t"
 		"int $0x13\n\t"
+		"popw %%dx\n\t"
 		"setc %0\n\t"
 		: "=q"(carry), "=b"(result_bx), "=c"(result_cx)
 		: "d"(g_drive_number)
@@ -228,6 +387,7 @@ void disk_init(uint8_t drive_number)
 	 * empty/unused at this point in boot either way, so overwriting
 	 * it here for a test read costs nothing.
 	 */
+#ifndef ZFSBOOT_FORCE_ATAPI
 	if (int13_extensions_present() && int13_read_native(0, 1, g_native_buf) == 0) {
 		g_use_int13 = 1;
 		console_puts("alpine-zfsboot-bios: CD-ROM backend=INT13h drive_number=");
@@ -235,7 +395,21 @@ void disk_init(uint8_t drive_number)
 		console_putc('\n');
 		return;
 	}
-
+#endif
+	/*
+	 * ZFSBOOT_FORCE_ATAPI (a build-time -D, not a runtime flag) skips
+	 * the INT13h attempt above entirely, unconditionally exercising the
+	 * ATAPI backend even under QEMU/SeaBIOS, where INT13h normally
+	 * succeeds and this whole driver would otherwise never run during
+	 * an automated boot test. Real hardware naturally always ends up
+	 * here anyway (this project's own real-hardware testing: INT13h has
+	 * no working read path at all for a "no emulation" El Torito boot
+	 * drive on the firmware this was tested against - see ata_atapi.h's
+	 * own header comment) - this flag exists purely so that same code
+	 * path can be verified with a real QEMU boot on demand (`make
+	 * stage-iso.bin ZFSBOOT_FORCE_ATAPI=1`, or see the Justfile's
+	 * test-iso-atapi recipe), not to change real boot behavior.
+	 */
 	console_puts("alpine-zfsboot-bios: CD-ROM backend=INT13h unavailable, using ATAPI\n");
 	g_use_int13 = 0;
 	g_atapi_ready = (atapi_init() == 0);

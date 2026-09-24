@@ -23,7 +23,7 @@
 # reasoning for why its aarch64 job needs one).
 # =============================================================================
 
-alpine_version := "3.24"
+alpine_version := `cat alpine-version.txt`
 out_dir := env_var_or_default("OUT_DIR", "./out")
 # Extra words appended to the built-in kernel cmdline (see build.sh) -
 # for debugging boot problems (e.g. `nokaslr`, `efi=debug`) without
@@ -35,7 +35,15 @@ default: (build "x86_64")
 # just build ARCH
 # EXTRA_CMDLINE=... just build ARCH  adds words to the kernel cmdline
 # for this build only.
-build ARCH:
+#
+# Depends on build-tool: cmd/tool's own CLI binary gets baked straight
+# into the rescue initramfs now (see build.sh's alpine-zfsboot.files
+# entry for /boot/alpine-zfsboot and the cp just above it) rather
+# than relying on `apk add alpine-zfsboot` at rescue-shell runtime,
+# which would pull whatever version unidoc-aports last happened to
+# package - this way the CLI baked into a given image is always built
+# from the exact same commit as the image itself, no version-lag risk.
+build ARCH: build-tool
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p "{{out_dir}}"
@@ -59,10 +67,31 @@ build-all:
 # cmd/tool (the install-time version/update helper) - plain Go
 # cross-compilation, no Docker/Alpine container needed at all, same
 # as release.yml's own build-tool job.
+#
+# CGO_ENABLED=0 on both - amd64 is this host's own likely native arch
+# on most dev machines, so without this it can silently cgo-link
+# against the HOST's glibc instead of coming out static (confirmed via
+# `file` on a real build: a plain `go build GOOS=linux GOARCH=amd64`
+# here produced a dynamically-linked ELF needing
+# /lib64/ld-linux-x86-64.so.2). Every real place this binary runs -
+# the rescue initramfs `build ARCH` now bakes it into (see build.sh),
+# any musl-based Alpine target OS - is musl, not glibc, so a
+# dynamically-linked build would just fail to execute there outright.
+# -X main.version=$(cat version.txt) - the same repo version.txt
+# build.sh already threads into every OTHER artifact (/etc/alpine-
+# zfsboot-version, cmdline.txt's alpine-zfsboot.version=, bios/
+# Makefile's own ZFSBOOT_VERSION) - this recipe was the one place that
+# never did, so `alpine-zfsboot --version` on a build produced this
+# way (including the copy build.sh now bakes into the rescue image
+# itself - see build.sh's own /boot/alpine-zfsboot comment) printed
+# "dev" instead of anything real. A real git tag (release.yml's own
+# build-tool job, `-X main.version=$GITHUB_REF_NAME`) still wins for
+# an actual tagged release - this is specifically for everything else
+# that isn't one, same as version.txt already is for the C/EFI side.
 build-tool:
     mkdir -p "{{out_dir}}"
-    GOOS=linux GOARCH=amd64 go build -o "{{out_dir}}/alpine-zfsboot-x86_64" ./cmd/tool
-    GOOS=linux GOARCH=arm64 go build -o "{{out_dir}}/alpine-zfsboot-aarch64" ./cmd/tool
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=$(cat version.txt)" -o "{{out_dir}}/alpine-zfsboot-x86_64" ./cmd/tool
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version=$(cat version.txt)" -o "{{out_dir}}/alpine-zfsboot-aarch64" ./cmd/tool
 
 clean:
     rm -rf "{{out_dir}}"
@@ -89,6 +118,51 @@ test:
 # then: KERNEL_IMAGE=/tmp/kernel-extract/boot/vmlinuz-* just test-kernel
 test-kernel:
     ./tests/kernel-integration-test.sh
+
+# The BIOS ISO-entry QEMU integration test (see that script's own
+# header comment for the full why) - boots the real El-Torito
+# bios/stage-iso.bin in QEMU and proves it can load a kernel+initrd
+# through a non-NULL fat_read_range() progress callback, the regression
+# guard for the %cs=SEG-at-entry bug found and fixed this same session
+# (stage2_entry.S's own far jump). Needs xorriso, dosfstools
+# (mkfs.vfat), mtools (mmd/mcopy), qemu-system-x86_64, python3, on top
+# of what bios/Makefile already needs (gcc/binutils) - on Debian/Ubuntu:
+#   sudo apt-get install -y xorriso dosfstools mtools qemu-system-x86 python3
+test-iso-entry:
+    ./tests/bios-iso-entry-test.sh
+
+# just test-iso-atapi  - same real QEMU boot as test-iso-entry, but forces
+# cdrom_disk.c's ATAPI backend (see cdrom_disk.c's own comment on
+# ZFSBOOT_FORCE_ATAPI) - QEMU/SeaBIOS's INT13h normally succeeds, so a
+# plain test-iso-entry run never actually exercises the ATAPI driver.
+test-iso-atapi:
+    FORCE_ATAPI=1 ./tests/bios-iso-entry-test.sh
+
+# just test-hdd-entry  - real QEMU boot of the raw-disk path
+# (bios/stage1.bin + bios/stage2.bin as a classic MBR hard disk, NOT
+# the El-Torito ISO test-iso-entry exercises) - the only automated
+# coverage of disk.c's own disk_read_lba() (distinct from
+# cdrom_disk.c's ISO-only int13_read_native()) and of stage1.S's own
+# STAGE2_MAGIC/retry logic (which has no ISO equivalent at all - the
+# ISO build enters directly at stage2_entry.S, no stage1 of its own).
+# Also exercises stage2_main.c's GPT-then-MBR fallback for real (this
+# disk has no GPT header at all). Needs dosfstools (mkfs.vfat), mtools
+# (mmd/mcopy), qemu-system-x86_64, python3, on top of what
+# bios/Makefile already needs.
+test-hdd-entry:
+    ./tests/bios-hdd-entry-test.sh
+
+# just test-ata-atapi-host  - host-native regression test for
+# ata_atapi.c's own multi-phase transfer bookkeeping (see
+# ata_atapi_host_test.c's own header comment).
+test-ata-atapi-host:
+    ./bios/tests/run-ata-atapi-host-test.sh
+
+# just test-fat-host  - host-native (no -m16/-ffreestanding) build+run of
+# fat.c's own regression suite (bios/tests/fat_host_test.c) - needs only
+# gcc + python3, no Docker/Alpine container.
+test-fat-host:
+    ./bios/tests/run-fat-host-test.sh
 
 # ── Release ──────────────────────────────────────────────────────────────────
 #

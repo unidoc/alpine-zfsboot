@@ -1,3 +1,22 @@
 #!/bin/sh
 echo "umount $*" >> "${STUB_LOG:-/dev/null}"
+# STUB_UMOUNT_REALLY_UNMOUNT (unset by default - every existing test
+# keeps today's no-op behavior unchanged): when set, actually hides the
+# LAST argument's content by renaming it aside, so a caller that reads
+# a path under it AFTER this call genuinely sees it gone - the same gap
+# a real `umount` closes and this stub's own default no-op cannot.
+# Added for a real regression (N2, unidoc-alip's PR #5 follow-up
+# review): init/boot-dataset.sh's own bootcheck confirm-service check
+# used to run its file tests through $ROOTFS/mnt/root AFTER umounting
+# it, silently reading "not present" from every real installation
+# forever - undetectable against a umount stub that never actually
+# removes anything. `mv`, not `rm -rf`: the caller/test still owns
+# cleaning its own fixture dir up afterward, same as every other test.
+if [ -n "${STUB_UMOUNT_REALLY_UNMOUNT:-}" ]; then
+    target="$*"
+    for target; do :; done
+    if [ -e "$target" ]; then
+        mv "$target" "$target.stub-unmounted.$$"
+    fi
+fi
 exit 0

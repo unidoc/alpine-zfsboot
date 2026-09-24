@@ -190,7 +190,35 @@ PCI_DEVICES_ROOT = os.environ.get("STUB_ROOT", "") + "/sys/bus/pci/devices"
 # - /init's own alpine-zfsboot.timeout= cmdline option, the exact same value
 # that used to gate a separate pre-menu prompt before this project
 # moved to always showing the menu (see /init's header comment).
-MENU_TIMEOUT = int(os.environ.get("ALPINE_ZFSBOOT_MENU_TIMEOUT", "10") or "10")
+#
+# Parsed through _parse_menu_timeout() rather than a bare int(...) at
+# module scope - a full source audit found that a bare int(...) here
+# raises ValueError at IMPORT time on any non-numeric value, and this
+# value comes from /init's own MENU_TIMEOUT shell variable (init:426,
+# `MENU_TIMEOUT="${kv#alpine-zfsboot.timeout=}"`, zero validation there
+# either), which in turn can come from a PERSISTENT source - a hand-
+# edited alpine-zfsboot.timeout= line in EFI/ALPINE/config - not just a
+# one-boot kernel cmdline typo. An import-time exception here happens
+# before main()'s own try/except (further down) exists to catch
+# anything, so one bad character in that config file killed menu.py on
+# EVERY subsequent boot, on every console: no recovery shell, no
+# console switch, no previous-boot diagnostics, no unlock screen - the
+# entire rescue menu, permanently gone, with /init's own fallback being
+# straight to automatic boot (see /init's own "menu.py exited... falling
+# back to automatic boot" log line). _parse_menu_timeout() can never
+# raise - an unparseable value falls back to the same documented
+# default a missing/empty value already used, and says so on stderr
+# (captured in /init's own boot log) instead of failing silently.
+def _parse_menu_timeout():
+    raw = os.environ.get("ALPINE_ZFSBOOT_MENU_TIMEOUT", "10") or "10"
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"menu.py: alpine-zfsboot.timeout={raw!r} is not a whole number - using the default (10s) instead", file=sys.stderr)
+        return 10
+
+
+MENU_TIMEOUT = _parse_menu_timeout()
 # Which real tty /init actually attached this process to (see /init's
 # own select_console()) - switch_console() below needs to know this to
 # compute "the other one(s)". Empty/wrong over SSH - dropbear's own
@@ -281,45 +309,143 @@ DIALOG_COMMON = ["dialog", "--ascii-lines", "--backtitle", BACKTITLE]
 # just has no reason to also set DIALOGRC to the same path GLOBALRC
 # already resolves to on its own.
 
-# A real, freshly generated random UUID, specific to this project -
-# see /init's own identical EFIVAR_GUID/EFIVAR_NAME comment for the
-# full reasoning (real UEFI NVRAM, the same mechanism systemd-boot/
-# GRUB use to persist a choice across reboots). Read here too (not
-# just written) so switch_console() can compute "the other console"
-# without needing /init to pass its own read_console_pref() result
-# through the environment.
+# True on real UEFI firmware - the same test /init itself uses
+# elsewhere (its own efi_pstore probe). Decides which of the two
+# backing stores write_console_pref() below actually writes to - see
+# its own docstring for why these are two genuinely different
+# concepts, not two implementations of the same one.
+IS_UEFI = os.path.isdir("/sys/firmware/efi")
+
+# Same GUID/name /init's own read_efivar_console_pref() reads (see
+# that function's own comment for the full reasoning - operator's
+# persisted runtime choice, UEFI only, same mechanism systemd-boot's
+# LoaderEntryDefault / GRUB's grubenv use).
 EFIVAR_GUID = "ce0e7d88-f5ad-45e9-a195-680f5140efa5"
 EFIVAR_NAME = "AlpineZfsBootConsole"
 EFIVAR_PATH = f"/sys/firmware/efi/efivars/{EFIVAR_NAME}-{EFIVAR_GUID}"
 
-
-def read_console_pref():
-    """See /init's own read_console_pref() - same file, same format
-    (4 attribute bytes, then the raw value), reimplemented here in
-    Python rather than shelling out to /init's shell function (which
-    isn't reachable from a separate process anyway)."""
-    try:
-        with open(EFIVAR_PATH, "rb") as f:
-            return f.read()[4:].rstrip(b"\x00").decode("ascii", "replace")
-    except OSError:
-        return ""
+# Which device /init already confirmed is the canonical alpine-zfsboot
+# FAT/ESP partition (its own disambiguated LABEL=EFI scan, done once -
+# see /init's own ESP-discovery comment for the full "exactly one
+# candidate" reasoning) - empty if /init never found one (or found more
+# than one and refused to guess). Only consulted on BIOS - see
+# write_console_pref()'s own docstring.
+ZFSBOOT_ESP_DEV = os.environ.get("ALPINE_ZFSBOOT_ESP_DEV", "")
+ESP_CONFIG_MOUNT = "/tmp/esp-console-pref"
 
 
-def write_console_pref(tty):
-    """Attributes + value in ONE write() - efivarfs's own write
-    handler needs the whole thing at once (see /init's identical
-    comment for the exact attribute bits and why). Python's raw binary
-    file I/O sidesteps the one real risk the shell version has (a
-    printf embedding a NUL byte, then possibly not writing the rest of
-    the format string in the same call) entirely - `f.write(bytes)` is
-    one write() syscall of exactly those bytes, no NUL-terminated-
-    string interpretation anywhere in the path.
+def _write_efivar_console_pref(tty):
+    """Attributes + value in ONE write() - efivarfs's own write handler
+    needs the whole thing at once (see /init's read_efivar_console_pref()
+    for the exact attribute bits and why). Python's raw binary file I/O
+    sidesteps the one real risk a shell printf would have here (embedding
+    a NUL byte, then possibly not writing the rest of the format string in
+    the same call) entirely - f.write(bytes) is one write() syscall of
+    exactly those bytes, no NUL-terminated-string interpretation anywhere
+    in the path. Best-effort: a write failure here is silently swallowed,
+    same posture as the FAT-config path below.
     """
     try:
         with open(EFIVAR_PATH, "wb") as f:
             f.write(b"\x07\x00\x00\x00" + tty.encode("ascii"))
     except OSError:
-        pass  # best-effort - see /init's identical comment
+        pass
+
+
+def _write_fat_console_pref(tty):
+    """Read-modify-write against EFI/ALPINE/config on the
+    canonical FAT/ESP partition, preserving every other line untouched -
+    this is the one persisted setting menu.py itself ever writes into
+    that file (everything else in it is written once, at install time,
+    by alpine-install-zfs.sh), so blowing away unrelated settings here
+    would be a real regression, not a hypothetical one. Best-effort: if
+    the ESP is missing, unwritable, or anything else goes wrong, this
+    boot's LIVE console switch (the sys.exit(42) relaunch right after
+    this call - see switch_console()) still happens regardless; only
+    the "remember this for next reboot" part is lost.
+
+    The actual write is transactional - temp file in the SAME
+    directory, fsync the file, os.rename() over the real target, then
+    fsync the directory too - not a plain truncate-in-place (an
+    earlier version of this function did exactly that: open config_path
+    directly in "w" mode, write, fsync the file descriptor only). A
+    crash between truncate and the new content landing could leave
+    config truncated or half-written, and even a clean file-fsync alone
+    doesn't guarantee the rename's own directory-entry metadata is
+    durable on every filesystem - real hardening for a file that also
+    carries rescue-SSH/network settings, not just the console
+    preference. Same semantics internal/espconfig.WriteFile implements
+    in Go for the new alpine-zfsboot CLI's own writers - not shared
+    code (different runtime), but the same contract.
+    """
+    if not ZFSBOOT_ESP_DEV:
+        return
+    subprocess.run(["mkdir", "-p", ESP_CONFIG_MOUNT], capture_output=True)
+    subprocess.run(["umount", ESP_CONFIG_MOUNT], capture_output=True)
+    mounted = subprocess.run(["mount", "-t", "vfat", ZFSBOOT_ESP_DEV, ESP_CONFIG_MOUNT],
+                              capture_output=True)
+    if mounted.returncode != 0:
+        return
+    try:
+        config_dir = os.path.join(ESP_CONFIG_MOUNT, "EFI", "ALPINE")
+        config_path = os.path.join(config_dir, "config")
+        os.makedirs(config_dir, exist_ok=True)
+        lines = []
+        if os.path.exists(config_path):
+            with open(config_path, "r", errors="replace") as f:
+                lines = [ln.rstrip("\r\n") for ln in f]
+        lines = [ln for ln in lines if not ln.startswith("alpine-zfsboot.console=")]
+        lines.append(f"alpine-zfsboot.console={tty}")
+
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".alpine-zfsboot-write-", dir=config_dir)
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                f.write("\n".join(lines) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_path, config_path)
+        except OSError:
+            os.unlink(tmp_path)
+            raise
+        dir_fd = os.open(config_dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass  # best-effort - see this function's own docstring
+    finally:
+        subprocess.run(["umount", ESP_CONFIG_MOUNT], capture_output=True)
+
+
+def write_console_pref(tty):
+    """Persists the operator's chosen console as their own runtime
+    preference - UEFI NVRAM on UEFI hosts (the mechanism this project
+    used originally), EFI/ALPINE/config on the canonical FAT/ESP
+    partition on BIOS hosts (which have no NVRAM to persist anything
+    into at all).
+
+    Deliberately NOT the same storage either way. The FAT config file
+    is the canonical, firmware-neutral MACHINE CONFIG/DEFAULT (set once
+    at install time, by alpine-install-zfs.sh, same file rescue-SSH/
+    network settings live in) - an operator's own "I prefer tty0 on
+    THIS box" choice, made live from this menu, is a different concept,
+    and on UEFI hosts it has a real, existing, firmware-native place to
+    live that does that job well. An earlier version of this function
+    routed BOTH cases through the FAT config file uniformly, on the
+    reasoning that one storage mechanism everywhere is simpler - true,
+    but it silently discarded a real UEFI capability (a persisted
+    choice independent of whatever the installed machine config
+    says) for no actual gain, since the FAT-config path was only ever
+    NEEDED for BIOS (UEFI already had a working mechanism). Restored on
+    review: see /init's own select_console() for the full four-layer
+    precedence (cmdline > UEFI NVRAM > FAT config > kernel default) this
+    split is designed around.
+    """
+    if IS_UEFI:
+        _write_efivar_console_pref(tty)
+    else:
+        _write_fat_console_pref(tty)
 
 
 def zfs_list(dataset_root):
@@ -709,8 +835,9 @@ def switch_console():
     marked and pre-highlighted, and lets the user pick explicitly -
     not just a blind cycle-to-next-one (an earlier version of this did
     that, with no indication anywhere of what the current default even
-    was). Persists the choice via the same UEFI NVRAM variable
-    read_console_pref/write_console_pref use, then asks /init to
+    was). Persists the choice via write_console_pref() (UEFI NVRAM or
+    the canonical FAT/ESP partition's own config file, depending on
+    firmware - see that function's own docstring), then asks /init to
     relaunch this whole menu attached to it - a real, live switch
     within THIS boot (FreeBSD-loader-style: flip between video/serial
     on demand), not just "takes effect next reboot". Exit code 42 is a
@@ -1280,6 +1407,22 @@ def deploy():
     # `zfs-send(8)` behavior, not assumed.
     subprocess.run(["zfs", "set", "org.alpinezfsboot:bootcheck=armed:0", target_dataset])
 
+    # Same carryover gap, same fix, for org.alpinezfsboot:commandline: a
+    # full source audit found this property was NOT reset here, even
+    # though `zfs send -R` (see the comment just above) carries it over
+    # from the source exactly like bootcheck used to - if an operator
+    # ever set a custom boot cmdline override on the GOLDEN IMAGE itself
+    # (menu.py's own "edit cmdline & persist" action, elsewhere in this
+    # file), every future deploy() from it would silently inherit that
+    # override onto a brand-new machine's very first real boot
+    # (boot-dataset.sh reads this property directly), with nobody here
+    # ever reviewing or even being told it exists. `zfs inherit` (not
+    # `zfs set ...=""`) so the deployed target starts from the SAME
+    # "no override, use the build-time default" state a fresh install
+    # would - this project's own edit-cmdline menu action already uses
+    # exactly this call for the same "clear it back to default" case.
+    subprocess.run(["zfs", "inherit", "org.alpinezfsboot:commandline", target_dataset])
+
     # Personalize: mount rw briefly, fix up exactly the things that
     # must be unique per-machine - nothing else.
     mnt = "/mnt/deploy"
@@ -1376,14 +1519,34 @@ def chroot_be():
         dialog_msgbox("Chroot failed", f"mount of {dataset} failed.")
         return
 
-    # Bind the rescue environment's own live /proc /sys /dev /tmp in,
-    # rather than expecting the BE to mount them itself - it's a
-    # dormant filesystem, not a running system, so nothing would ever
-    # mount them for it.
-    for sub in ("proc", "sys", "dev", "tmp"):
+    # Bind the rescue environment's own live /proc /sys /dev in, rather
+    # than expecting the BE to mount them itself - it's a dormant
+    # filesystem, not a running system, so nothing would ever mount
+    # them for it. /tmp does NOT get the same treatment - see below.
+    for sub in ("proc", "sys", "dev"):
         target = f"{mnt}/{sub}"
         subprocess.run(["mkdir", "-p", target])
         subprocess.run(["mount", "--bind", f"/{sub}", target])
+
+    # /tmp gets a FRESH, empty tmpfs instead of a bind-mount of this
+    # rescue environment's own live /tmp - a real, confirmed secret-
+    # exposure gap a full source audit found: this rescue session's own
+    # /tmp is exactly where zfs-unlock.sh stages a plaintext encryption
+    # passphrase (zfs-key.*), boot-dataset.sh's own boot/operation
+    # locks live, and rescue-ssh.sh's own pidfile lives - bind-mounting
+    # it straight into a BE's chroot meant anything running inside that
+    # chroot (a script the operator runs, a compromised/malicious BE)
+    # could read a currently-staged passphrase belonging to a
+    # completely different boot operation, or interfere with this
+    # rescue session's own lock state, neither of which chroot_be()'s
+    # own stated purpose ("fixing something inside a dormant BE") ever
+    # needed access to. A plain empty tmpfs still gives anything running
+    # inside the chroot a real, writable /tmp (the actual functional
+    # need this bind-mount served) without exposing this rescue
+    # session's own state at all.
+    target = f"{mnt}/tmp"
+    subprocess.run(["mkdir", "-p", target])
+    subprocess.run(["mount", "-t", "tmpfs", "tmpfs", target])
 
     # bash -> sh -> busybox: a target BE is a real installed Alpine
     # system, which may or may not have bash installed - fall back
@@ -2217,7 +2380,22 @@ def _items():
     console" with no indication anywhere in the menu of what pressing
     it would actually do; Network follows the identical reasoning).
     """
-    ip = _network_status()
+    # _network_addresses(), not _network_status() - a full source audit
+    # found this menu label used the IPv4-only helper, which meant a
+    # machine reachable ONLY over IPv6 (the exact, documented,
+    # real-world Hetzner CAX rescue scenario _network_addresses()'s own
+    # comment already calls out) showed "Network: not connected" in the
+    # main menu the entire session, despite the operator actively being
+    # connected right now, over this exact interface, via the very SSH
+    # session showing them that label. _network_status() itself stays
+    # unchanged (its two OTHER callers genuinely need IPv4-only: the
+    # DHCP bring-up flow and its own "is up"/"still has no address"
+    # confirmation dialogs, where an IPv6 address would be a real, not
+    # merely cosmetic, false positive) - this is the one caller that
+    # actually needs the honest overall picture, same reasoning as the
+    # Diagnostics cockpit's own existing use of this same helper.
+    addrs = _network_addresses()
+    ip = addrs[0] if addrs else None
     # Same live-state-in-the-label convention as Switch console/Network
     # below - encryption state used to only ever become visible as a
     # side effect of picking a kernel or chrooting in; showing it here

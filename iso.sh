@@ -1,21 +1,25 @@
 #!/bin/sh
-# iso.sh EFI_FILE ARCH [BIOS_STAGE_ISO_BIN BOOTBLOB_IMG] -> a plain
-# bootable ISO wrapping that exact .EFI, next to it (same name, .iso
-# instead of .EFI). No boot logic here at all - this is packaging
-# only, for anywhere a bare .EFI file isn't a valid boot target on its
-# own: BMC/IPMI virtual media, a real USB stick, a VM's virtual CDROM.
+# iso.sh EFI_FILE ARCH [BIOS_STAGE_ISO_BIN KERNEL INITRD CMDLINE] -> a
+# plain bootable ISO wrapping that exact .EFI, next to it (same name,
+# .iso instead of .EFI). No boot logic here at all - this is
+# packaging only, for anywhere a bare .EFI file isn't a valid boot
+# target on its own: BMC/IPMI virtual media, a real USB stick, a VM's
+# virtual CDROM.
 #
-# The two extra arguments (x86_64 only - build.sh never passes them
+# The four extra arguments (x86_64 only - build.sh never passes them
 # for aarch64, which has no legacy-BIOS equivalent at all) add a
 # SECOND, independent way to boot the same ISO: legacy BIOS, via an
 # El Torito "no emulation" boot catalog entry pointing at
 # bios/stage-iso.bin (see that file's own header comment in
-# bios/Makefile) - the exact same GPT-lookup/kernel-load code the
-# real-disk BIOS path uses, reading the exact same boot-blob format,
-# just loaded by BIOS directly off the CD instead of a partitioned
-# disk. The UEFI path below is completely unmodified either way -
-# these two boot methods are independent catalog entries, neither
-# aware of the other.
+# bios/Makefile). stage-iso.bin's own FAT32 reader (bios/fat.c) finds
+# KERNEL/INITRD/CMDLINE on the SAME appended FAT image the UEFI entry
+# below already uses (efiboot.img, appended once as GPT partition 2) -
+# alpine-zfsboot's own unified storage architecture applies here too:
+# one FAT filesystem, one partition, both firmware paths, not two
+# separate images/formats the way an earlier version of this project
+# (a raw, filesystem-less "boot blob" partition for BIOS only) used to
+# need. The UEFI path below is otherwise unmodified - these two boot
+# methods are independent catalog entries, neither aware of the other.
 #
 # The xorrisofs invocation below is deliberately NOT a from-scratch
 # read of the documentation - it mirrors archiso's own
@@ -99,10 +103,13 @@
 # build-iso recipe and release.yml).
 set -eu
 
-EFI_FILE="${1:?usage: iso.sh EFI_FILE ARCH [BIOS_STAGE_ISO_BIN BOOTBLOB_IMG]}"
-ARCH="${2:?usage: iso.sh EFI_FILE ARCH [BIOS_STAGE_ISO_BIN BOOTBLOB_IMG]}"
+usage="usage: iso.sh EFI_FILE ARCH [BIOS_STAGE_ISO_BIN KERNEL INITRD CMDLINE]"
+EFI_FILE="${1:?$usage}"
+ARCH="${2:?$usage}"
 BIOS_STAGE_ISO_BIN="${3:-}"
-BOOTBLOB_IMG="${4:-}"
+KERNEL_FILE="${4:-}"
+INITRD_FILE="${5:-}"
+CMDLINE_FILE="${6:-}"
 [ -f "$EFI_FILE" ] || { echo "$EFI_FILE not found" >&2; exit 1; }
 ISO_FILE="${EFI_FILE%.EFI}.iso"
 
@@ -118,17 +125,27 @@ if [ -n "$BIOS_STAGE_ISO_BIN" ] && [ "$ARCH" != "x86_64" ]; then
 fi
 if [ -n "$BIOS_STAGE_ISO_BIN" ]; then
     [ -f "$BIOS_STAGE_ISO_BIN" ] || { echo "$BIOS_STAGE_ISO_BIN not found" >&2; exit 1; }
-    [ -f "$BOOTBLOB_IMG" ] || { echo "$BOOTBLOB_IMG not found" >&2; exit 1; }
+    [ -f "$KERNEL_FILE" ] || { echo "$KERNEL_FILE not found" >&2; exit 1; }
+    [ -f "$INITRD_FILE" ] || { echo "$INITRD_FILE not found" >&2; exit 1; }
+    [ -f "$CMDLINE_FILE" ] || { echo "$CMDLINE_FILE not found" >&2; exit 1; }
 fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# FAT image sized to the .EFI plus headroom for the filesystem's own
-# overhead and directory entries, rounded up to a whole MiB (mkfs.vfat
-# wants a MiB-aligned size).
+# FAT image sized to everything it needs to hold - the .EFI, plus (when
+# a BIOS entry is present) the loose kernel/initrd/cmdline stage-iso.bin's
+# own FAT reader loads directly off this same image - plus headroom for
+# the filesystem's own overhead and directory entries, rounded up to a
+# whole MiB (mkfs.vfat wants a MiB-aligned size). 8MiB of headroom, not
+# the previous 4MiB: this image can now carry a real kernel+initrd, not
+# just a bare .EFI stub.
 efi_size=$(wc -c < "$EFI_FILE")
-img_size_mb=$(( (efi_size / 1024 / 1024) + 4 ))
+payload_size=$efi_size
+if [ -n "$BIOS_STAGE_ISO_BIN" ]; then
+    payload_size=$(( payload_size + $(wc -c < "$KERNEL_FILE") + $(wc -c < "$INITRD_FILE") + $(wc -c < "$CMDLINE_FILE") ))
+fi
+img_size_mb=$(( (payload_size / 1024 / 1024) + 8 ))
 
 # The ISO9660 tree carries no copy of the .EFI itself - the appended
 # partition below is the only one, and El Torito points straight at it
@@ -142,9 +159,21 @@ img_size_mb=$(( (efi_size / 1024 / 1024) + 4 ))
 mkdir -p "$WORK/iso/EFI"
 
 dd if=/dev/zero of="$WORK/efiboot.img" bs=1M count="$img_size_mb" status=none
-mkfs.vfat -n ZFSBOOT "$WORK/efiboot.img" >/dev/null
+mkfs.vfat -F32 -n ZFSBOOT "$WORK/efiboot.img" >/dev/null
 mmd -i "$WORK/efiboot.img" ::EFI ::EFI/BOOT
 mcopy -i "$WORK/efiboot.img" "$EFI_FILE" "::EFI/BOOT/$BOOT_NAME"
+if [ -n "$BIOS_STAGE_ISO_BIN" ]; then
+    # Short, 8.3-safe path components on purpose - stage-iso.bin's own
+    # FAT reader (bios/fat.c) never parses VFAT long-filename entries,
+    # deliberately, to stay small in this boot-critical code. See
+    # bios/fat.h's own header comment for the full reasoning; this
+    # must stay byte-for-byte in sync with the path stage2_main.c
+    # actually opens.
+    mmd -i "$WORK/efiboot.img" ::EFI/ALPINE
+    mcopy -i "$WORK/efiboot.img" "$KERNEL_FILE" ::EFI/ALPINE/KERNEL
+    mcopy -i "$WORK/efiboot.img" "$INITRD_FILE" ::EFI/ALPINE/INITRD
+    mcopy -i "$WORK/efiboot.img" "$CMDLINE_FILE" ::EFI/ALPINE/CMDLINE
+fi
 
 # --- optional legacy-BIOS El Torito entry (x86_64, when the caller
 # built the BIOS artifacts - see build.sh) --------------------------
@@ -167,24 +196,27 @@ if [ -n "$BIOS_STAGE_ISO_BIN" ]; then
         exit 1
     fi
 
-    # ZFSBOOT_BIOS_BOOT_GUID (labeling only, same convention as the
-    # real-disk BIOS path's own stage1+stage2 partition - see
-    # bios/gpt.h's own comment; nothing looks this partition up by
-    # type, BIOS finds stage-iso.bin via the El Torito catalog
-    # instead) and ZFSBOOT_BOOTBLOB_GUID (the SAME type GUID gpt.c
-    # already scans for on a real disk - see bios/gpt.h - so
-    # stage-iso.bin's own gpt.c call, completely unmodified, finds this
-    # boot-blob on the ISO's own xorriso-written GPT exactly the way
-    # it finds it on a real GPT disk).
-    bios_append_args="-append_partition 3 21686148-6449-6E6F-744E-656564454649 $BIOS_STAGE_ISO_BIN -append_partition 4 F5BD658B-EEE4-402F-BE5B-D939C082B649 $BOOTBLOB_IMG"
+    # 21686148-6449-6E6F-744E-656564454649: GRUB's own "BIOS boot
+    # partition" GUID, labeling only (same convention as the real-disk
+    # BIOS path's own stage1+stage2 partition - see bios/gpt.h's own
+    # comment) - nothing looks this partition up by type, BIOS finds
+    # stage-iso.bin via the El Torito catalog instead.
+    #
+    # No separate bootblob partition any more - stage-iso.bin's own
+    # gpt.c call (completely unmodified) finds the SAME appended
+    # partition 2 (efiboot.img, ESP-GUID-typed, already declared above)
+    # that the UEFI entry uses, and reads KERNEL/INITRD/CMDLINE off it
+    # via bios/fat.c - one FAT partition on this ISO's own
+    # xorriso-written GPT, exactly as on a real GPT disk.
+    bios_append_args="-append_partition 3 21686148-6449-6E6F-744E-656564454649 $BIOS_STAGE_ISO_BIN"
     bios_boot_args="-b --interval:appended_partition_3:all:: -no-emul-boot -boot-load-size $boot_load_size"
 fi
 
-# shellcheck disable=SC2086 - bios_append_args/bios_boot_args are
+# shellcheck disable=SC2086 # bios_append_args/bios_boot_args are
 # deliberately unquoted (each expands to zero or several separate
-# xorriso arguments, never one with embedded spaces - $BIOS_STAGE_ISO_BIN/
-# $BOOTBLOB_IMG are this project's own build output paths, not
-# untrusted/arbitrary input).
+# xorriso arguments, never one with embedded spaces - $BIOS_STAGE_ISO_BIN
+# is this project's own build output path, not untrusted/arbitrary
+# input).
 xorriso -as mkisofs \
     -iso-level 3 -full-iso9660-filenames \
     -volid ALPINE_ZFSBOOT \

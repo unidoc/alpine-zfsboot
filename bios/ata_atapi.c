@@ -50,31 +50,69 @@
 /*
  * A plain iteration count, not a real time unit - deliberately NOT
  * the BIOS tick counter at 0040:006C this file used before: that
- * counter only advances while the timer IRQ is serviced, which
- * requires interrupts enabled (IF=1) for the ENTIRE time this code
- * might be waiting - and this whole stage runs with interrupts
- * enabled from the moment stage2_entry.S hands off to C (see that
- * file's own `sti`), for its entire remaining execution, not just
- * around this driver's own operations. That's a real, confirmed-the-
- * hard-way hazard, not a theoretical one: a real boot showed a struct
- * field (GPT header_size, written by a byte-copy loop immediately
- * before being compared) reading back as mismatched at the exact
- * comparison instruction, then reading back CORRECTLY moments later
- * from the SAME memory - with the actual compiled instruction proven
- * (via disassembly) to be a single direct memory-operand comparison,
- * not a cached register value a compiler could have hoisted. The only
- * remaining explanation is an asynchronous timer IRQ landing on this
- * stage's own stack between the two reads, since interrupts are left
- * enabled for the whole rest of this boot stage's own execution - the
- * BIOS's own default IRQ0 handler runs ON WHATEVER STACK WAS ACTIVE AT
- * THE TIME, which is this stage's own SS:SP, not a separate one. A
- * plain spin count needs no interrupts serviced at all to advance,
- * closing that whole window off entirely for every wait loop in this
- * file. Generous (tens of millions of port reads - each one taking at
- * least one full PCI/ISA bus cycle) for a PIO handshake that normally
- * completes in well under a millisecond.
+ * counter only advances while the timer IRQ is actually serviced,
+ * which requires interrupts enabled (IF=1).
+ *
+ * UPDATE (F22, unidoc-alip's PR #5 review, catching a stale claim):
+ * this comment used to say interrupts are left enabled for this
+ * stage's entire execution, citing an `sti` in stage2_entry.S - that
+ * `sti` is gone. stage2_entry.S's own current header comment states
+ * plainly: interrupts stay OFF for this stage's entire execution now
+ * (switch32.S's own brief pushfl/cli/popfl - not a plain cli/sti pair,
+ * see that file's own comment on why popfl and not a bare sti - around
+ * its unreal-mode transition is the one deliberate, narrowly-scoped
+ * exception). So the tick counter is unusable here for an even more
+ * direct reason than before: with IF=0, it simply never advances at
+ * all, not just
+ * "advancing it would be hazardous."
+ *
+ * The real incident below is kept, not deleted - it's what a plain
+ * spin count was ORIGINALLY chosen to close, and it's the reason
+ * stage2_entry.S's own later "interrupts stay off" decision exists in
+ * the first place; both fixes now independently prevent the same
+ * class of hazard, and a spin count needs no interrupts serviced at
+ * all to advance regardless of what a future change to this stage's
+ * own IF policy might do. A real boot showed a struct field (GPT
+ * header_size, written by a byte-copy loop immediately before being
+ * compared) reading back as mismatched at the exact comparison
+ * instruction, then reading back CORRECTLY moments later from the
+ * SAME memory - with the actual compiled instruction proven (via
+ * disassembly) to be a single direct memory-operand comparison, not a
+ * cached register value a compiler could have hoisted. The only
+ * remaining explanation, at the time (before interrupts were turned
+ * off for the whole stage), was an asynchronous timer IRQ landing on
+ * this stage's own stack between the two reads - the BIOS's own
+ * default IRQ0 handler runs ON WHATEVER STACK WAS ACTIVE AT THE TIME,
+ * which is this stage's own SS:SP, not a separate one. Generous (tens
+ * of millions of port reads - each one taking at least one full
+ * PCI/ISA bus cycle) for a PIO handshake that normally completes in
+ * well under a millisecond.
  */
 #define ATA_TIMEOUT_SPINS 20000000UL
+
+#ifdef ZFSBOOT_TEST_SERIAL
+/*
+ * Test-only, bounded to well under the CI harness's own 150s deadline
+ * - never used in a real build (gated behind the same macro as every
+ * other TEST_SERIAL diagnostic in this file). The real 20,000,000-spin
+ * budget above exists to tolerate real hardware; on a real CI failure
+ * it has NEVER been observed to return at all - the harness's own
+ * external deadline always kills QEMU first, meaning wait_status_clear()
+ * either genuinely never exits, or takes long enough that nothing
+ * downstream (a retry banner, a FATAL message) ever gets the chance to
+ * print and prove which. Bounding THIS build's own internal wait to a
+ * small fraction of that lets a real CI failure return control to
+ * atapi_send_packet()'s own caller quickly - onto the SAME retry path
+ * gpt_read_header() already has ("GPT header invalid, retrying"),
+ * which then reports what wait_status_clear() saw right at its own
+ * cutoff, and does so again on the next real retry attempt, instead of
+ * the harness's outer 150s kill being the only thing that ever ends
+ * the wait.
+ */
+#define ATA_TIMEOUT_SPINS_ACTIVE 500000UL
+#else
+#define ATA_TIMEOUT_SPINS_ACTIVE ATA_TIMEOUT_SPINS
+#endif
 
 static uint16_t g_io_base;
 static uint16_t g_ctrl_base;
@@ -108,9 +146,33 @@ static inline uint16_t inw(uint16_t port)
 static int wait_status_clear(uint16_t io_base, uint8_t mask)
 {
 	unsigned long spins;
+	uint8_t status;
 
-	for (spins = 0; spins < ATA_TIMEOUT_SPINS; spins++) {
-		if (!(inb(io_base + ATA_REG_STATUS) & mask))
+	/*
+	 * A periodic status print INSIDE this loop (one per ~0x100000
+	 * iterations, gated behind ZFSBOOT_TEST_SERIAL) was tried and
+	 * reverted here - not because printing itself is unsafe in
+	 * general (this whole project prints from far deeper call chains
+	 * elsewhere without issue), but because a real, reproduced-locally
+	 * bug appeared the moment it actually executed: the boot would run
+	 * one real ATAPI command successfully, then reprint its own
+	 * startup banner and restart stage2_main from the top, repeatedly
+	 * - confirmed via `-d int,cpu_reset` to NOT be a real CPU reset,
+	 * and confirmed via a clean A/B (disable the print, same binary
+	 * otherwise: passes; re-enable it: reproduces every time) to be
+	 * caused by executing this specific print, not by anything else
+	 * changed alongside it. The exact mechanism was never pinned down
+	 * (stack depth at this specific nesting point is the leading
+	 * suspect, not confirmed) - the fix is "don't call console output
+	 * from inside this exact loop", not a deeper one. See console.c's
+	 * own ZFSBOOT_TEST_SERIAL comment for a DIFFERENT, real bug this
+	 * same investigation found and fixed (ES not saved/restored around
+	 * INT 0x10) - that fix is real and stays, but did NOT resolve this
+	 * one; the two are not the same bug.
+	 */
+	for (spins = 0; spins < ATA_TIMEOUT_SPINS_ACTIVE; spins++) {
+		status = inb(io_base + ATA_REG_STATUS);
+		if (!(status & mask))
 			return 0;
 		/*
 		 * `pause` - the standard x86 spin-wait hint (encodes as `rep
@@ -134,6 +196,22 @@ static int wait_status_clear(uint16_t io_base, uint8_t mask)
 		 */
 		__asm__ __volatile__("pause");
 	}
+#ifdef ZFSBOOT_TEST_SERIAL
+	/*
+	 * ONE print, after the loop, not inside it - the same shape as
+	 * every other diagnostic in this file that has actually shipped
+	 * safely across real CI runs (the pre-loop alt-status snapshot,
+	 * the call-site trace), not the shape that reproduced a real bug
+	 * above. Reports exactly what status this build's own bounded
+	 * cutoff saw, so a real CI failure - which now returns here well
+	 * within the 150s deadline instead of the harness having to kill
+	 * QEMU mid-spin - leaves a concrete, comparable value instead of
+	 * silence.
+	 */
+	console_puts("TO status=");
+	console_puts_hex32(status);
+	console_putc(' ');
+#endif
 	return -1;
 }
 
@@ -158,6 +236,53 @@ static void io_settle(uint16_t ctrl_base)
 }
 
 /*
+ * Advances *data_buf and *got_words by exactly one DRQ phase's worth
+ * (take words = take*2 bytes) - the ONLY place either counter moves in
+ * atapi_send_packet()'s data-phase loop. Deliberately pure C (no asm,
+ * no port I/O, no BIOS/hardware dependency of any kind) so it's
+ * host-buildable and unit-testable on its own, driven through a
+ * scripted multi-phase `take` sequence - see
+ * bios/tests/ata_atapi_host_test.c. This is what makes "did the
+ * pointer/counter arithmetic across N phases end up exactly right"
+ * checkable without real ATAPI hardware or a hypervisor that happens
+ * to split a transfer across phases (QEMU/SeaBIOS never do, which is
+ * exactly how a previous double-advance bug here went undetected for
+ * a whole session - see atapi_send_packet's own comment at its call
+ * site).
+ */
+void atapi_advance_after_phase(uint8_t **data_buf, uint16_t *got_words, uint16_t take)
+{
+	*data_buf += (uint32_t)take * 2;
+	*got_words += take;
+}
+
+/*
+ * atapi_transfer_complete GOT_WORDS WANT_WORDS - true (nonzero) only if
+ * the data phase actually delivered everything the CDB requested.
+ * Same reasoning and same host-testability goal as
+ * atapi_advance_after_phase above, extracted for the identical reason:
+ * a full source audit found atapi_send_packet()'s own data-phase loop
+ * trusted "the device says DRQ is clear now" (BSY=0/DRQ=0/ERR=0) as
+ * the ONLY completion signal, with nothing checking that got_words had
+ * actually reached want_words first. A device ending the data phase
+ * early, before delivering everything the CDB itself requested, is a
+ * genuine malfunction per the ATA/ATAPI PACKET command's own contract
+ * - but without this check, atapi_send_packet() returned SUCCESS
+ * regardless, leaving the destination buffer's own tail as whatever
+ * stale/uninitialized bytes were already there, silently treated as
+ * real kernel/initrd content by every caller. This one-line comparison
+ * has no asm/port I/O in it either, so - like the sibling function
+ * above - it's host-buildable and unit-testable without real ATAPI
+ * hardware, which the surrounding function's own real inb/outb/insw
+ * instructions are not (privileged x86 I/O instructions - they fault
+ * outright on a plain host process with no ATAPI device behind them).
+ */
+int atapi_transfer_complete(uint16_t got_words, uint16_t want_words)
+{
+	return got_words == want_words;
+}
+
+/*
  * The core ATAPI PACKET-command transaction: select-and-issue, wait
  * for the command/data request phase, push the 12-byte CDB, then (for
  * a data-in command) read back whatever the device reports it
@@ -167,12 +292,40 @@ static void io_settle(uint16_t ctrl_base)
  * and atapi_init()'s own readiness check) is deciding what to do
  * next, not this function's.
  */
+#ifdef ZFSBOOT_TEST_SERIAL
+/*
+ * Test-only call-site trace for atapi_send_packet()'s five internal
+ * wait_status_clear() calls, gated exactly like console.c's own serial
+ * mirror (never defined by a real build). Exists because a real
+ * register dump at a CI timeout cannot tell these five calls apart:
+ * `io + ATA_REG_STATUS` is the same loop-invariant address at every one
+ * of them, so EIP/registers alone only say "stuck somewhere in this
+ * function", not which wait. Prints a single letter right before each
+ * call (no matching "site done" after a hang, by construction) plus the
+ * CDB's opcode byte at entry, so the NEXT CI failure's serial.log names
+ * the exact stuck call instead of leaving it ambiguous.
+ */
+static void trace_site(char c)
+{
+	console_putc(c);
+}
+#else
+#define trace_site(c) ((void)0)
+#endif
+
 static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t data_len)
 {
 	uint16_t io = g_io_base;
 	int i;
 	uint8_t st;
 
+#ifdef ZFSBOOT_TEST_SERIAL
+	console_puts("PKT op=");
+	console_puts_hex32(cdb[0]);
+	console_putc(' ');
+#endif
+
+	trace_site('a');
 	if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 		return -1;
 
@@ -184,6 +337,7 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 	 * follows it rather than relying on that latching detail). */
 	outb(io + ATA_REG_DEVHEAD, g_dev_select);
 	io_settle(g_ctrl_base);
+	trace_site('b');
 	if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 		return -1;
 
@@ -209,6 +363,7 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 	/* Command phase: BSY clears, then the device raises DRQ to ask
 	 * for the CDB (or sets ERR if it's rejecting the command
 	 * outright). */
+	trace_site('c');
 	if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 		return -1;
 	st = inb(io + ATA_REG_STATUS);
@@ -227,8 +382,12 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 	if (data_len == 0) {
 		/* No data phase (TEST UNIT READY) - just the completion
 		 * status. */
+		trace_site('d');
 		if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 			return -1;
+#ifdef ZFSBOOT_TEST_SERIAL
+		console_puts("ok\n");
+#endif
 		return (inb(io + ATA_REG_STATUS) & ATA_STATUS_ERR) ? -1 : 0;
 	}
 
@@ -252,6 +411,38 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 		for (;;) {
 			uint16_t actual_len, actual_words, remaining_want, take;
 
+#ifdef ZFSBOOT_TEST_SERIAL
+			/*
+			 * The previous round's version of this diagnostic read
+			 * io+ATA_REG_STATUS (the PRIMARY status register) here,
+			 * right before wait_status_clear()'s own first read of
+			 * that exact same register - reasoning that an extra
+			 * read of the same register wait_status_clear() was
+			 * about to do anyway couldn't change anything. That
+			 * reasoning was wrong: reading the primary status
+			 * register (unlike alt-status, at ctrl_base) is NOT
+			 * side-effect-free on real ATA/ATAPI controllers - it
+			 * acknowledges the device's pending interrupt/phase
+			 * condition. io_settle() already only ever reads
+			 * alt-status for exactly this reason. The result came
+			 * back "st0=0x58 alt=0x58" (BSY clear, DRQ set - a
+			 * healthy, ready device) immediately before
+			 * wait_status_clear() then hung for the full CI deadline
+			 * anyway - consistent with that extra primary-status
+			 * read itself having advanced the device's own state
+			 * machine past the DRQ phase with no insw ever having
+			 * happened, leaving nothing left for the loop to
+			 * observe. This round drops that read entirely and
+			 * checks ONLY alt-status (side-effect-free, the same
+			 * register io_settle() already trusts) so this
+			 * diagnostic can no longer be the thing perturbing the
+			 * exact race it exists to observe.
+			 */
+			console_puts("alt=");
+			console_puts_hex32(inb(g_ctrl_base));
+			console_putc(' ');
+#endif
+			trace_site('e');
 			if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 				return -1;
 			st = inb(io + ATA_REG_STATUS);
@@ -291,27 +482,99 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 			 * GAS's .code16gcc mode (-m16, see Makefile), where a
 			 * bare string instruction's implicit address/count
 			 * registers default to DI/CX (16-bit), not EDI/ECX,
-			 * unless this prefix says otherwise; `data_buf`/`take`
-			 * are ordinary ints (32-bit, confirmed via DWARF earlier
-			 * in this project's own investigation) and the C operand
-			 * constraints below put them in EDI/ECX, so the
-			 * instruction itself must be told to use the same width.
-			 * `cld` first: guarantees the forward (incrementing)
-			 * direction this depends on, regardless of any assumption
-			 * about DF's state elsewhere in this stage.
+			 * unless this prefix says otherwise. `data_buf` really is
+			 * 32-bit (confirmed via DWARF earlier in this project's
+			 * own investigation), bound to EDI via "+D" below. `cld`
+			 * first: guarantees the forward (incrementing) direction
+			 * this depends on, regardless of any assumption about
+			 * DF's state elsewhere in this stage.
+			 *
+			 * `words` below is deliberately uint32_t, NOT uint16_t
+			 * matching `take`'s own real range (max 65535, checked at
+			 * its own assignment above) - a real, shipped, unidoc-alip
+			 * PR #5 review finding (N1): `addr32` widens rep's OWN
+			 * count register to the FULL 32-bit ECX, not just CX -
+			 * that's the entire reason this prefix is here at all, for
+			 * EDI's sake. A "+c" constraint only promises the value
+			 * GCC itself deposits and later reads back through CX (the
+			 * low 16 bits) matches this variable - it says nothing
+			 * about what's already sitting in ECX's upper 16 bits at
+			 * that moment, and `addr32 rep insw` reads all 32 of them
+			 * as the iteration count regardless of what C-level type
+			 * this operand was declared with. With a uint16_t operand,
+			 * whatever 32-bit value GCC's own register allocator most
+			 * recently happened to leave in ECX (via whichever
+			 * instruction actually loaded it - sometimes a wider
+			 * mov of an unrelated value entirely) leaks straight into
+			 * the repeat count. Confirmed the hard way, by exactly the
+			 * mechanism this predicts: CI's toolchain (gcc 13.3) chose
+			 * to materialize this operand via `mov %eax,%ecx` with
+			 * EAX's own upper 16 bits still holding an unrelated
+			 * earlier value, turning a real ~1024-word (0x0400) native-
+			 * sector transfer into one asking for roughly 4 billion
+			 * words - not a hang at all: `rep insw` does not advance
+			 * EIP again until its own count reaches zero, so a guest
+			 * stuck deep inside this single instruction is
+			 * indistinguishable, from the outside, from one that never
+			 * left `wait_status_clear()`. This project's own local gcc
+			 * (14.2 at the time) happened to zero-extend when loading
+			 * the same uint16_t operand, which is exactly why this
+			 * passed locally and under every local pinned-CI-QEMU-
+			 * binary reproduction attempted, every single time, while
+			 * failing in real CI deterministically - the divergence
+			 * was never QEMU, the runner, or the device at all; it was
+			 * two different compilers making two different (both
+			 * individually legal) choices about a register this
+			 * function never actually owned the width of. `uint32_t`
+			 * forces GCC to materialize the full, correctly zero-
+			 * extended 32-bit value into ECX itself, which is what
+			 * this code always needed regardless of `take`'s own
+			 * logical range.
 			 */
 			if (take > 0) {
-				uint16_t words = take;
+				/* asm_dst is a SCRATCH copy, deliberately separate from
+				 * data_buf: "+D"(asm_dst) below is a read-write operand
+				 * bound to EDI, and `rep insw` itself increments EDI by
+				 * 2 bytes per word transferred - GCC writes EDI back
+				 * into whatever C variable is bound to "+D" as part of
+				 * honoring that constraint. Binding that straight to
+				 * data_buf (this function's own previous shape) meant
+				 * data_buf was advanced ONCE by the asm block's own
+				 * side effect, invisibly - and a second, explicit
+				 * `data_buf += take * 2` after it (also this function's
+				 * own previous shape) double-advanced the pointer on
+				 * every phase after the first. Harmless for a single-
+				 * DRQ-phase transfer (the only shape ever exercised
+				 * under QEMU/SeaBIOS, which is why this went unnoticed
+				 * for a whole session), but on a real multi-phase
+				 * READ(10) it scatters phase N's data at 2x the correct
+				 * stride, eventually running the destination pointer
+				 * into whatever memory follows g_native_buf (this
+				 * driver's own port-base globals) and off the end of
+				 * the ES segment.
+				 *
+				 * The fix is architectural, not just deleting the extra
+				 * line: data_buf/got_words are now advanced in EXACTLY
+				 * ONE place, atapi_advance_after_phase() below - a
+				 * small, pure, host-testable function with no asm and
+				 * no port I/O in it at all - so the asm block's own
+				 * destructive EDI write-back can never again collide
+				 * with a second advance. See
+				 * bios/tests/ata_atapi_host_test.c, which drives that
+				 * function through a real multi-phase sequence (the
+				 * shape QEMU/SeaBIOS never exercises) and would have
+				 * caught this. */
+				uint8_t *asm_dst = data_buf;
+				uint32_t words = take;
 
 				__asm__ __volatile__(
 					"cld\n\t"
 					"addr32 rep insw"
-					: "+D"(data_buf), "+c"(words)
+					: "+D"(asm_dst), "+c"(words)
 					: "d"(io + ATA_REG_DATA)
 					: "memory"
 				);
-				data_buf += take * 2;
-				got_words += take;
+				atapi_advance_after_phase(&data_buf, &got_words, take);
 			}
 			/* Drain anything THIS PHASE reported beyond what's still
 			 * wanted - the phase isn't complete until every byte it
@@ -320,8 +583,17 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 			for (i = (int)take; i < (int)actual_words; i++)
 				(void)inw(io + ATA_REG_DATA);
 		}
+
+		/* See atapi_transfer_complete's own comment for the real gap
+		 * this closes - the loop's own exit condition alone never
+		 * proved the full requested transfer actually happened. */
+		if (!atapi_transfer_complete(got_words, want_words))
+			return -1;
 	}
 
+#ifdef ZFSBOOT_TEST_SERIAL
+	console_puts("ok\n");
+#endif
 	return 0;
 }
 

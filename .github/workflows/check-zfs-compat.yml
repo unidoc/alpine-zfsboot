@@ -1,0 +1,102 @@
+name: Check ZFS compatibility data
+
+# Semi-automatic, same pattern as check-alpine.yml / unidoc-aports' own
+# check-updates.yml: finds updated (or missing) zfs-compatibility.d/ data
+# for whatever OpenZFS release line Alpine's own `zfs` package currently
+# ships, and opens a PR - never merges anything itself.
+#
+# Validates with a real `go build`/`go vet`/`go test` IN THIS JOB, before
+# ever committing anything - NOT by relying on ci.yml's own `pull_request:`
+# trigger to catch a bad edit on the PR. A full source audit caught this:
+# GitHub does not run `push`/`pull_request`-triggered workflows for commits
+# or PRs made with the default GITHUB_TOKEN (a documented anti-loop
+# measure) - commit-verified.sh pushes via the Contents API and `gh pr
+# create` both authenticate as GITHUB_TOKEN, so ci.yml's own go-tests job
+# was NEVER actually running on these PRs, contrary to what an earlier
+# version of this comment (and the PR body below) claimed. Running the
+# same checks locally, synchronously, closes the actual risk directly:
+# .github/scripts/check-zfs-compat.py's own zfscompat.go edit (only made
+# when a brand-new OpenZFS release line shows up - see that script's own
+# comment) now fails BEFORE anything is committed, not after.
+#
+# Every byte this ever writes into zfs-compatibility.d/ is copied verbatim
+# from a real openzfs/zfs git tag - never generated, never a second
+# representation of the same data (see zfscompat.go's own package comment
+# on why that distinction matters). check-zfs-compat.py is the one place
+# that logic lives; this workflow is just its schedule + PR wiring.
+on:
+  schedule:
+    - cron: "0 7 * * 1" # weekly, Mondays 07:00 UTC - this data changes far
+                          # less often than Alpine's own base image does
+  workflow_dispatch: {}
+
+jobs:
+  check-zfs-compat:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check zfs-compatibility.d/ against Alpine's current zfs package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          out="$(python3 .github/scripts/check-zfs-compat.py)"
+          echo "$out"
+          # Only lines actually shaped like KEY=value are meant for
+          # GITHUB_ENV - the plain "up to date" message the script prints
+          # instead, when nothing changed, is human-readable log output
+          # only and would otherwise land in GITHUB_ENV as a malformed
+          # line (no '=').
+          printf '%s\n' "$out" | grep -E '^[A-Z_]+=' >> "$GITHUB_ENV" || true
+
+      # Real validation, not a hope that ci.yml will do it later - see
+      # this workflow's own header comment for why that assumption was
+      # wrong. Runs even when nothing changed (cheap, and confirms the
+      # checkout itself is buildable) but only matters when it did.
+      - name: go build/vet/test
+        if: env.CHANGED_FILES != ''
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Open PR
+        if: env.CHANGED_FILES != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          branch="bump-zfs-compat-$TAG"
+          # shellcheck disable=SC2086 # CHANGED_FILES is a script-controlled
+          # list of repo-relative paths, not attacker input.
+          .github/scripts/commit-verified.sh "$branch" \
+            "zfs-compatibility.d: vendor $TAG (Alpine zfs $ALPINE_ZFS_VERSION)" \
+            $CHANGED_FILES
+
+          body="Alpine's zfs package is now $ALPINE_ZFS_VERSION. Re-vendored zfs-compatibility.d/ data from openzfs/zfs's own $TAG tag - verbatim copies, not generated (see zfs-compatibility.d/README.md and zfscompat.go's own package comment for the provenance/semantics this depends on). go build/vet/test already ran in this same job before this PR was opened - go.mod ready, this commit compiles and the full test suite passes."
+          body="$(printf '%s\n\n%s' "$body" "**Note:** ci.yml does NOT automatically run on this PR - GitHub does not trigger \`push\`/\`pull_request\` workflows for commits or PRs authored by the default GITHUB_TOKEN. If you want the shell test suite and the real BIOS/UEFI Docker builds to run before merging, push an empty commit to this branch or re-run ci.yml manually.")"
+
+          if [ -n "${NEW_RELEASE_LINES:-}" ]; then
+            body="$(printf '%s\n\n**New release line(s): %s.** zfscompat.go picked up a new map entry + go:embed line for it automatically - go build/vet/test already validated it (see above), but read the zfscompat.go diff yourself before approving: this is the one part of the change that isnt a plain data-file copy.' "$body" "$NEW_RELEASE_LINES")"
+          fi
+
+          # F15 (unidoc-alip's PR #5 review): see check-alpine.yml's own
+          # identical fix for the full reasoning - `|| echo` here
+          # turned ANY gh pr create failure (not just "already open")
+          # into a green job.
+          if [ "$(gh pr list --head "$branch" --json number --jq length)" -gt 0 ]; then
+              echo "PR already open for $branch - nothing to do"
+          else
+              gh pr create --title "zfs-compatibility.d: vendor $TAG" --body "$body" \
+                --head "$branch" --base master
+          fi

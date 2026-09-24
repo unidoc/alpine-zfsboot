@@ -81,4 +81,28 @@ int atapi_init(void);
  */
 int atapi_read_native(uint32_t lba, uint16_t count, void *buf);
 
+/*
+ * NOT part of this driver's real interface - exposed (non-static) only
+ * so bios/tests/ata_atapi_host_test.c can drive it directly. Advances
+ * data_buf and got_words by exactly one ATAPI PIO data-phase's worth (see
+ * ata_atapi.c's own definition and its call site's comment for why this
+ * exists as its own pure function: a previous version of that call site
+ * advanced data_buf BOTH via this same arithmetic AND via an inline
+ * asm block's own destructive EDI write-back, double-advancing the
+ * pointer on every DRQ phase after the first - invisible under
+ * QEMU/SeaBIOS, which never split a transfer across phases, and only
+ * caught by a full source audit reading the real disassembly).
+ */
+void atapi_advance_after_phase(uint8_t **data_buf, uint16_t *got_words, uint16_t take);
+
+/*
+ * NOT part of this driver's real interface either - same reasoning as
+ * atapi_advance_after_phase above, exposed only for
+ * bios/tests/ata_atapi_host_test.c. True only if GOT_WORDS reached
+ * WANT_WORDS - see ata_atapi.c's own definition for the real gap this
+ * closes (a device ending the data phase early, before delivering
+ * everything requested, used to return as SUCCESS).
+ */
+int atapi_transfer_complete(uint16_t got_words, uint16_t want_words);
+
 #endif

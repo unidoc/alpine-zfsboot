@@ -265,20 +265,26 @@ than this one.
 
 A second, completely independent way to reach the exact same kernel+
 initramfs the UEFI path already builds, on hardware with no UEFI at
-all - `bios/`. GPT with a dedicated BIOS boot partition is the primary
-target (`sgdisk`-partitioned, same as the install instructions below);
-stage2 also falls back to reading a classic MBR partition table (up to
-4 primary partitions, no extended chain - see `bios/mbr.h`) if no
-valid GPT is found, for disks partitioned the older way instead. Built
-entirely in-house (hand-written stage1/stage2, no vendored bootloader
-stage code from anywhere else), same as `efi/` is this project's own
-loader rather than a patched third-party stub - including, for the
-El Torito CD-ROM boot path, its own from-scratch ATA/ATAPI PIO driver
-(`bios/ata_atapi.c`), written directly against the ATA/ATAPI command-
-set spec rather than any other BIOS/OS driver's source: real-hardware
-testing established that INT 13h has no working read path at all for
-a "no emulation" El Torito boot drive on some firmware, so that path
-talks to the IDE controller directly instead.
+all - `bios/`. Both boot methods read from the SAME canonical FAT/ESP
+partition - alpine-zfsboot's own unified storage architecture: there
+is exactly one persistent boot-store format, not one for UEFI and a
+separate one for BIOS. GPT is the primary target (`sgdisk`-
+partitioned, same as the install instructions below), the partition
+identified by the real, standard EFI System Partition type GUID
+(`C12A7328-F81F-11D2-BA4B-00A0C93EC93B` - the same one UEFI firmware
+itself looks for); stage2 also falls back to reading a classic MBR
+partition table (up to 4 primary partitions, no extended chain - see
+`bios/mbr.h`) if no valid GPT is found, for disks partitioned the
+older way instead. Built entirely in-house (hand-written stage1/
+stage2, no vendored bootloader stage code from anywhere else), same as
+`efi/` is this project's own loader rather than a patched third-party
+stub - including, for the El Torito CD-ROM boot path, its own
+from-scratch ATA/ATAPI PIO driver (`bios/ata_atapi.c`), written
+directly against the ATA/ATAPI command-set spec rather than any other
+BIOS/OS driver's source: real-hardware testing established that INT
+13h has no working read path at all for a "no emulation" El Torito
+boot drive on some firmware, so that path talks to the IDE controller
+directly instead.
 
 ```
 protective MBR (LBA 0)                                 <- stage1
@@ -287,11 +293,15 @@ protective MBR (LBA 0)                                 <- stage1
 BIOS boot partition (type GUID 21686148-6449-6E6F-744E-656564454649,
 starts at LBA 34 by construction - stage1 never parses GPT at all)
                                                          <- stage2
-  -> real-mode GPT parse, finds the "alpine-zfsboot boot blob" partition
-     (a second, freshly-minted type GUID - see bios/gpt.h)
-  -> reads that partition's boot-blob (bios/bootblob.h: a small
-     header, then the kernel/initramfs/cmdline build.sh already
-     produces for the UEFI path, repackaged - not rebuilt)
+  -> real-mode GPT parse, finds the canonical alpine-zfsboot FAT/ESP
+     partition (the SAME partition UEFI firmware boots BOOTX64.EFI/
+     BOOTAA64.EFI from - see bios/gpt.h's ZFSBOOT_ESP_TYPE_GUID)
+  -> a small, deliberately minimal read-only FAT32 reader (bios/fat.c -
+     real BPB/geometry validation, FAT-chain walking with cycle
+     detection, no writes, no long-filename support) locates and reads
+     EFI/ALPINE/{KERNEL,INITRD,CMDLINE} - the exact same kernel/
+     initramfs/cmdline build.sh already produces for the UEFI path,
+     as ordinary files, not a separate packed format
   -> "unreal mode" (bios/switch32.S) to place the kernel at 1MB and
      the initrd above it, gathers the E820 memory map, builds a
      Linux/x86 boot_params, and jumps into the kernel per
@@ -299,13 +309,18 @@ starts at LBA 34 by construction - stage1 never parses GPT at all)
 
 kernel + initramfs - identical to the UEFI path from here on: /init,
 menu.py, boot-dataset.sh neither know nor care which boot path got
-them running.
+them running. /init remains the sole reader of
+EFI/ALPINE/{config,authorized_keys,ssh_host_ed25519_key} on
+this same partition - stage1/stage2 never touch machine configuration
+or rescue-SSH policy at all.
 ```
 
-`build.sh` packs the boot-blob and produces
-`alpine-zfsboot-x86_64-bios-{stage1,stage2}.bin` +
-`...-bios-bootblob.img` alongside the usual `.EFI`/`.iso` assets. MBR
-mode supports up to 4 primary partitions, no extended/logical chain.
+`build.sh` produces `alpine-zfsboot-x86_64-bios-{stage1,stage2}.bin`
+alongside the usual `.EFI`/`.iso` assets and the loose
+`vmlinuz`/`initramfs.img`/`cmdline.txt` files - the SAME loose files
+both the UEFI GRUB-chainload use case and a BIOS install's
+EFI/ALPINE/* payload are populated from. MBR mode supports up to 4
+primary partitions, no extended/logical chain.
 
 ## Quick start / installation
 
@@ -320,9 +335,9 @@ project's `alpine-install-zfs.sh` partitions a disk (BIOS/MBR,
 BIOS/GPT, or UEFI/GPT — see [Compatibility](#compatibility)), installs
 Alpine onto a ZFS root, and installs an alpine-zfsboot release
 directly, in one run. It handles the boot-layout details this project
-expects (pool name, root dataset, `bootfs` property, ESP layout in
-UEFI mode or boot-blob partition in BIOS mode) so nothing needs to be
-matched up by hand.
+expects (pool name, root dataset, `bootfs` property, the canonical FAT/
+ESP partition every layout carries) so nothing needs to be matched up
+by hand.
 
 **Deploying a clone of an existing machine**: once one machine is
 running Alpine on ZFS with alpine-zfsboot installed, the fastest way to
@@ -371,7 +386,7 @@ Each of the two arches above also ships as:
   the cmdline separately).
 
 Each release also ships `alpine-zfsboot-x86_64` / `alpine-zfsboot-aarch64`
-(see [`cmd/tool`](#cmdtool-checking-and-updating-an-already-installed-build)
+(see [`cmd/tool`](#cmdtool-alpine-zfsboot-the-boot-management-cli)
 below) alongside the `.EFI`/`.iso`/loose-file assets above. Each
 release includes a `SHA256SUMS` covering every asset.
 
@@ -574,7 +589,7 @@ seconds without piecing it together from several separate commands.
 
 ## Rescue SSH
 
-If `/EFI/alpine-zfsboot/authorized_keys` and `/EFI/alpine-zfsboot/ssh_host_ed25519_key`
+If `/EFI/ALPINE/authorized_keys` and `/EFI/ALPINE/ssh_host_ed25519_key`
 are both present on the EFI System Partition, `dropbear` sshd is available for
 break-glass access - but only started **on demand**, exactly when it's
 needed, never on a healthy, unattended boot:
@@ -662,8 +677,8 @@ for that one):
 
 | File | Job |
 |---|---|
-| `/EFI/alpine-zfsboot/authorized_keys` | who may connect - one **bare** public key per line (blank lines/comments OK); this is *not* full OpenSSH `authorized_keys` syntax - operator options (`from=`, `restrict`, `expiry-time=`, ...) are rejected outright, not silently stripped, so alpine-zfsboot stays the sole owner of what restrictions apply |
-| `/EFI/alpine-zfsboot/ssh_host_ed25519_key` | this one machine's own persistent SSH host identity |
+| `/EFI/ALPINE/authorized_keys` | who may connect - one **bare** public key per line (blank lines/comments OK); this is *not* full OpenSSH `authorized_keys` syntax - operator options (`from=`, `restrict`, `expiry-time=`, ...) are rejected outright, not silently stripped, so alpine-zfsboot stays the sole owner of what restrictions apply |
+| `/EFI/ALPINE/ssh_host_ed25519_key` | this one machine's own persistent SSH host identity |
 
 `ssh_host_ed25519_key` is generated **once**, by the installer
 (`dropbearkey -t ed25519`), and persists with the machine for its
@@ -950,13 +965,27 @@ just build-all        # both arches
 ```
 
 Docker only - `build.sh` runs inside a real `alpine:3.24` container
-(see the Justfile). Nothing here compiles anything except the tiny
-`bios/` boot code (x86_64 only) and `efi/`'s own loader: `zfs-lts`
-ships prebuilt kernel modules, `mkinitfs`/`objcopy` just assemble
-existing files, so even the non-native arch runs tolerably under
-Docker's own `--platform` QEMU emulation for a local build. CI uses a
-real native `aarch64` runner regardless, removing the QEMU question
-entirely rather than assuming it would be fine.
+(see the Justfile). Inside that container, nothing here compiles
+anything except the tiny `bios/` boot code (x86_64 only) and `efi/`'s
+own loader: `zfs-lts` ships prebuilt kernel modules, `mkinitfs`/
+`objcopy` just assemble existing files, so even the non-native arch
+runs tolerably under Docker's own `--platform` QEMU emulation for a
+local build. CI uses a real native `aarch64` runner regardless,
+removing the QEMU question entirely rather than assuming it would be
+fine. `just build` also depends on `build-tool` (plain host-side Go
+cross-compile, no Docker involved) - `cmd/tool`'s own CLI binary is
+baked into the bundled initramfs at `/boot/alpine-zfsboot` straight
+from this checkout's own source, so the rescue shell's CLI always
+matches the image it's running on rather than lagging behind whatever
+`unidoc-aports` last happened to package (see build.sh's
+`alpine-zfsboot.files` manifest entry for the full reasoning).
+Deliberately `/boot`, not `/usr/bin` - the rescue shell's own
+`apk add alpine-zfsboot` (a real thing an operator might type out of
+habit) must never be able to clobber this exact-match build, so it
+lives off `$PATH` at `/boot/alpine-zfsboot` instead. A target OS
+that's already installed still gets the CLI via
+`apk add alpine-zfsboot` at `/usr/bin/alpine-zfsboot` instead - see
+`alpine-installer`'s own README.
 
 ### How this is built
 
@@ -1042,49 +1071,87 @@ entirely rather than assuming it would be fine.
   + `SHA256SUMS`, no GitHub Pages/apk repo involved (these are boot
   binaries, not Alpine packages).
 
-#### `cmd/tool`: checking and updating an already-installed build
+#### `cmd/tool`: `alpine-zfsboot`, the boot-management CLI
 
-A small Go helper for a machine that's *already* running an
-alpine-zfsboot `.EFI` - not part of the boot process itself. It reads
-the `alpine-zfsboot.version=` build stamp and every other
-`alpine-zfsboot.*` boot param straight out of an installed `.EFI`'s own
-`.cmdline` PE section - the exact same section `efi/cmdline.c` reads at
-boot - using nothing but Go's stdlib `debug/pe` package, so it never
-needs to unpack an initramfs just to answer "what version is this, and
-what was it built with". Built on
-[Cobra](https://github.com/spf13/cobra) - `--version` reports the
-*tool's own* build, separate from the `version <path>` subcommand
-below, which reports a `.EFI` file's:
+`alpine-zfsboot` (`cmd/tool`) is the authoritative management interface
+for an installed alpine-zfsboot system, on both firmwares - not part of
+the boot process itself, but everything an admin (or `alpine-installer`)
+needs after it. Firmware (BIOS vs UEFI) is detected automatically, never
+a flag: internally it dispatches between the UEFI backend (a single
+self-contained `.EFI`) and the BIOS backend (stage1/stage2 plus the
+separate FAT payload/config files), but the four commands below are the
+same either way.
 
 ```
-$ alpine-zfsboot version /boot/efi/EFI/BOOT/BOOTX64.EFI
-path:     /boot/efi/EFI/BOOT/BOOTX64.EFI
-arch:     x86_64
-console:  auto
-version:  20260910T003200Z (2026-09-10 00:32 UTC)
-pool:     zroot
-timeout:  10s
-
-$ alpine-zfsboot check /boot/efi/EFI/BOOT/BOOTX64.EFI
-/boot/efi/EFI/BOOT/BOOTX64.EFI is out of date: local 2026-09-01 12:00 UTC, latest 2026-09-10 00:32 UTC
-
-$ alpine-zfsboot update /boot/efi/EFI/BOOT/BOOTX64.EFI
-/boot/efi/EFI/BOOT/BOOTX64.EFI: local 2026-09-01 12:00 UTC -> latest 2026-09-10 00:32 UTC
-overwrite /boot/efi/EFI/BOOT/BOOTX64.EFI with the latest build? [y/N]
+alpine-zfsboot status              # what's installed, on THIS machine
+alpine-zfsboot verify              # the same facts, but fail (exit 1) on any gap
+alpine-zfsboot update              # fetch+install the latest release over it
+alpine-zfsboot install <disk> \    # write alpine-zfsboot's own artifacts onto an
+  --root <path> --firmware <bios|uefi>  # already-partitioned, already-formatted disk
+alpine-zfsboot version <path>      # inspect one .EFI file directly (unchanged, standalone)
 ```
 
-`check`/`update` always download the matching `alpine-zfsboot-<arch>.EFI`
-asset off `releases/latest/download/` (arch from the file's own PE
-header - no need to tell it which one) and compare its embedded
-version against the local file's, since release asset filenames are
-deliberately unversioned - the artifact itself is the only real source
-of truth for "which build is this." `update` writes the new file into
-the same directory first and `rename()`s it over the target, so
-there's never a moment where the boot file is half-written.
+`status`/`verify`/`update` auto-discover the canonical FAT/ESP partition
+by volume label + marker files (the same algorithm `/init` itself uses
+at boot - refuses to guess if more than one candidate qualifies) - no
+path argument needed. `install` is the one exception: it writes onto a
+disk that has no bootable identity yet, so both the target disk and
+`--firmware` are explicit, required arguments - see that command's own
+`--help` for why firmware is never auto-detected there.
 
-Deliberately doesn't try to auto-discover the ESP or the currently-
-booted `.EFI`'s own path yet - point it at the file explicitly for
-now.
+`status`/`verify` also report the *boot environment*'s own identity -
+the installed kernel's embedded version string, and the OpenZFS version
+baked into the initrd's own `zfs.ko` (extracted directly from its ELF
+`.modinfo` section, NOT inferred from the kernel version - independent
+facts) - alongside a live pool's own active feature flags, for real
+`zpool upgrade` decision-making, plus a real `Boot compatible:` verdict
+(F13, unidoc-alip's PR #5 review - this section previously described an
+older design that always reported `UNKNOWN`; the code has since grown a
+real check, computed from OpenZFS's own vendored `compatibility.d`
+feature data, and this section had drifted out of sync with it).
+Three verdicts, never a guessed yes/no:
+- `VERIFIED` - every active pool feature is supported by the boot
+  environment's own OpenZFS release line.
+- `NO` - at least one active feature is NOT supported - the boot
+  environment cannot import this pool. This is the one verdict `verify`
+  actually fails on (exit 1); `VERIFIED` and `UNKNOWN` both pass.
+- `UNKNOWN` - not enough information to say either way (no imported
+  pool to check against, the boot environment's own OpenZFS version
+  couldn't be determined, or no vendored compatibility data exists yet
+  for that release line) - reports the facts it can actually establish
+  and stops there, rather than computing a false yes/no.
+
+Every write (`install`/`update`) goes through the same low-level
+primitives regardless of caller - `internal/biosboot`'s `WriteStage1`/
+`WriteStage2` (zero the whole reserved extent first, then write, then
+read back and verify byte-for-byte - the proven `update-stage2-only.sh`
+algorithm, now the tool's own code), `internal/espconfig`'s `WriteFile`
+(temp file, fsync, rename, fsync the directory - real atomicity, not a
+truncate-in-place), `internal/uefiboot`'s `WriteLoader` (same atomic
+rename, with a `.previous` rollback copy). `WriteStage2` refuses to run
+if anything on the disk's own partition table - GPT or MBR - actually
+overlaps the fixed stage2 extent (LBA 34-97): a real partition, or
+(GPT) the partition array's own on-disk footprint. This is a SAFETY
+check, deliberately not an ownership one - identity ("is this
+alpine-zfsboot's disk") comes from finding the canonical FAT/ESP
+partition and deriving its parent disk, the same way `update`/`verify`/
+`status` already establish it, not from any specially-named/typed
+partition at the stage2 extent itself: an earlier version of this
+check required exactly that (a GPT partition named
+`alpine-zfsboot-stage2`), and was wrong to - that was never part of
+the actual on-disk ABI (stage1 itself never looks stage2 up via
+GPT/MBR at all, see `bios/mbr.h`'s own comment: fixed LBA, full stop),
+and a real, already-migrated production system has no such
+partition-table entry at all despite being a completely valid
+installation - see `internal/bootenv.CheckStage2ExtentFree`'s own
+comment for the full reasoning, including why an exact-match cosmetic
+entry (what `partition_disk()` still creates on a fresh install) is
+tolerated rather than treated as a conflict.
+
+`alpine-installer` no longer implements any of this itself: it fetches
+this one binary and calls `alpine-zfsboot install`/`verify` - one
+authoritative implementation of the on-disk boot ABI, not two (see that
+repo's own README).
 
 ## Testing
 

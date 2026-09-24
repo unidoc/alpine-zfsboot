@@ -80,3 +80,31 @@ func TestArchFromMachine(t *testing.T) {
 		t.Error("i386 (unsupported) machine type: expected an error, got nil")
 	}
 }
+
+func TestParseText(t *testing.T) {
+	line := "root=ZFS=zroot/ROOT/alpine ro alpine-zfsboot.pool=zroot alpine-zfsboot.version=0.1.0 console=tty0\n"
+	info := ParseText([]byte(line))
+	if info.Pool != "zroot" {
+		t.Errorf("Pool = %q, want zroot", info.Pool)
+	}
+	if info.Version != "0.1.0" {
+		t.Errorf("Version = %q, want 0.1.0", info.Version)
+	}
+}
+
+func TestParseText_EmptyInputIsNotAnError(t *testing.T) {
+	info := ParseText(nil)
+	if info.Pool != "" {
+		t.Errorf("Pool = %q, want empty", info.Pool)
+	}
+}
+
+func TestParseText_StopsAtFirstNewline(t *testing.T) {
+	// A plain text file (EFI/ALPINE/CMDLINE) can have a trailing
+	// newline, or even stray content on a second line if hand-edited -
+	// only the first line is the real cmdline.
+	info := ParseText([]byte("alpine-zfsboot.pool=zroot\nsomething unrelated alpine-zfsboot.pool=wrong\n"))
+	if info.Pool != "zroot" {
+		t.Errorf("Pool = %q, want zroot (must not read past the first line)", info.Pool)
+	}
+}
