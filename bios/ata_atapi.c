@@ -88,6 +88,30 @@
  */
 #define ATA_TIMEOUT_SPINS 20000000UL
 
+#ifdef ZFSBOOT_TEST_SERIAL
+/*
+ * Test-only, bounded to well under the CI harness's own 150s deadline
+ * - never used in a real build (gated behind the same macro as every
+ * other TEST_SERIAL diagnostic in this file). The real 20,000,000-spin
+ * budget above exists to tolerate real hardware; on a real CI failure
+ * it has NEVER been observed to return at all - the harness's own
+ * external deadline always kills QEMU first, meaning wait_status_clear()
+ * either genuinely never exits, or takes long enough that nothing
+ * downstream (a retry banner, a FATAL message) ever gets the chance to
+ * print and prove which. Bounding THIS build's own internal wait to a
+ * small fraction of that lets a real CI failure return control to
+ * atapi_send_packet()'s own caller quickly - onto the SAME retry path
+ * gpt_read_header() already has ("GPT header invalid, retrying"),
+ * which then reports what wait_status_clear() saw right at its own
+ * cutoff, and does so again on the next real retry attempt, instead of
+ * the harness's outer 150s kill being the only thing that ever ends
+ * the wait.
+ */
+#define ATA_TIMEOUT_SPINS_ACTIVE 500000UL
+#else
+#define ATA_TIMEOUT_SPINS_ACTIVE ATA_TIMEOUT_SPINS
+#endif
+
 static uint16_t g_io_base;
 static uint16_t g_ctrl_base;
 static uint8_t g_dev_select;
@@ -120,9 +144,33 @@ static inline uint16_t inw(uint16_t port)
 static int wait_status_clear(uint16_t io_base, uint8_t mask)
 {
 	unsigned long spins;
+	uint8_t status;
 
-	for (spins = 0; spins < ATA_TIMEOUT_SPINS; spins++) {
-		if (!(inb(io_base + ATA_REG_STATUS) & mask))
+	/*
+	 * A periodic status print INSIDE this loop (one per ~0x100000
+	 * iterations, gated behind ZFSBOOT_TEST_SERIAL) was tried and
+	 * reverted here - not because printing itself is unsafe in
+	 * general (this whole project prints from far deeper call chains
+	 * elsewhere without issue), but because a real, reproduced-locally
+	 * bug appeared the moment it actually executed: the boot would run
+	 * one real ATAPI command successfully, then reprint its own
+	 * startup banner and restart stage2_main from the top, repeatedly
+	 * - confirmed via `-d int,cpu_reset` to NOT be a real CPU reset,
+	 * and confirmed via a clean A/B (disable the print, same binary
+	 * otherwise: passes; re-enable it: reproduces every time) to be
+	 * caused by executing this specific print, not by anything else
+	 * changed alongside it. The exact mechanism was never pinned down
+	 * (stack depth at this specific nesting point is the leading
+	 * suspect, not confirmed) - the fix is "don't call console output
+	 * from inside this exact loop", not a deeper one. See console.c's
+	 * own ZFSBOOT_TEST_SERIAL comment for a DIFFERENT, real bug this
+	 * same investigation found and fixed (ES not saved/restored around
+	 * INT 0x10) - that fix is real and stays, but did NOT resolve this
+	 * one; the two are not the same bug.
+	 */
+	for (spins = 0; spins < ATA_TIMEOUT_SPINS_ACTIVE; spins++) {
+		status = inb(io_base + ATA_REG_STATUS);
+		if (!(status & mask))
 			return 0;
 		/*
 		 * `pause` - the standard x86 spin-wait hint (encodes as `rep
@@ -146,6 +194,22 @@ static int wait_status_clear(uint16_t io_base, uint8_t mask)
 		 */
 		__asm__ __volatile__("pause");
 	}
+#ifdef ZFSBOOT_TEST_SERIAL
+	/*
+	 * ONE print, after the loop, not inside it - the same shape as
+	 * every other diagnostic in this file that has actually shipped
+	 * safely across real CI runs (the pre-loop alt-status snapshot,
+	 * the call-site trace), not the shape that reproduced a real bug
+	 * above. Reports exactly what status this build's own bounded
+	 * cutoff saw, so a real CI failure - which now returns here well
+	 * within the 150s deadline instead of the harness having to kill
+	 * QEMU mid-spin - leaves a concrete, comparable value instead of
+	 * silence.
+	 */
+	console_puts("TO status=");
+	console_puts_hex32(status);
+	console_putc(' ');
+#endif
 	return -1;
 }
 

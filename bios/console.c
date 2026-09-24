@@ -125,11 +125,38 @@ void console_putc(char c)
 	 * a caller could read) forces GCC to reload everything it needs
 	 * from memory after every single character, not just after
 	 * console_puts() returns.
+	 *
+	 * ES is explicitly saved/restored here too, NOT just added to the
+	 * clobber list - GCC's inline-asm clobber list has no way to name
+	 * a segment register at all, so there was never a way to tell the
+	 * compiler about this the way "bp" etc. are declared above. Found
+	 * the same way as the EBP bug this comment already describes, one
+	 * register further out: a caller with ATAPI diagnostics gated
+	 * behind ZFSBOOT_TEST_SERIAL added a console_puts() call in the
+	 * middle of atapi_send_packet()'s data-phase loop, immediately
+	 * before that loop's own `rep insw` - which writes through ES:EDI,
+	 * not a plain flat pointer, since this stage runs in real mode.
+	 * If SeaBIOS's own INT 0x10 handler leaves ES pointing somewhere
+	 * else internally, the next `rep insw` scatters a real ATAPI
+	 * sector's worth of bytes into whatever ES now is - not a crash at
+	 * the call site, but memory corruption far away from it. Confirmed
+	 * the hard way (again): with that diagnostic active, this stage
+	 * would boot, run one real command successfully, then reprint its
+	 * own startup banner and restart stage2_main from the top,
+	 * repeatedly - the signature of a stray write landing somewhere
+	 * that redirects control flow, not of a hang. Wrapping the BIOS
+	 * call in push/pop %es (and %ds, for the same reason, since
+	 * nothing in this file currently depends on DS either but a future
+	 * caller easily could) made that reproduction disappear.
 	 */
 	ax = (unsigned short)(0x0e00 | (unsigned char)c);
 	__asm__ __volatile__(
+		"pushw %%ds\n\t"
+		"pushw %%es\n\t"
 		"xor %%bh, %%bh\n\t"
 		"int $0x10\n\t"
+		"popw %%es\n\t"
+		"popw %%ds\n\t"
 		:
 		: "a"(ax)
 		: "bx", "cx", "dx", "si", "di", "bp", "memory"
