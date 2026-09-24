@@ -1,9 +1,20 @@
-// Package release finds and downloads the latest alpine-zfsboot .EFI
-// build for a given arch, straight off GitHub's releases/latest/
-// download/ URL scheme (see .github/workflows/release.yml's own
-// comment: asset filenames are arch-based and unversioned, so this
-// URL never needs to change across releases) - no GitHub API call,
-// no auth, no rate limit, needed at all for this.
+// Package release finds and downloads alpine-zfsboot's own release
+// assets (the UEFI .EFI build, and BIOS's five loose stage1/stage2/
+// kernel/initrd/cmdline artifacts) for a given arch.
+//
+// F16 (unidoc-alip's PR #5 follow-up review): this package's own doc
+// comment used to say "no GitHub API call, no auth, no rate limit,
+// needed at all for this" - true of the ORIGINAL bare
+// releases/latest/download/ scheme (asset filenames are arch-based
+// and unversioned - see .github/workflows/release.yml's own comment -
+// so that URL never needed to change across releases), but stale
+// since the F16 fix that pinned every default-sourced asset (BIOS's
+// five, and now UEFI's one, via resolveDefaultAsset/ResolveEFI) to one
+// concrete, resolved release tag: resolveTag() below DOES call
+// GitHub's real REST API (apiLatestReleaseURL), unauthenticated, once
+// per resolution. An explicit --*-file/--*-url override still never
+// touches the API at all - only the "use the latest release" default
+// path does.
 package release
 
 import (
@@ -18,12 +29,6 @@ import (
 	"strings"
 	"time"
 )
-
-// var, not const - overridden by TestDownloadRespectsClientTimeout to
-// point at a local httptest.Server, so that test can exercise the real
-// client-timeout behavior against a server that genuinely stalls,
-// without touching the network.
-var baseURL = "https://github.com/unidoc/alpine-zfsboot/releases/latest/download/"
 
 // http.DefaultClient has no timeout at all - a server that accepts the
 // connection and then stalls (not a DNS/connect failure, which would
@@ -96,9 +101,13 @@ func downloadAsset(url, dir string) (string, error) {
 }
 
 // Download fetches the latest UEFI .EFI asset for arch - see
-// downloadAsset's own doc comment for the dir/cleanup contract.
+// downloadAsset's own doc comment for the dir/cleanup contract. A thin
+// wrapper around ResolveEFI's own default (no override) path - see
+// that function's own comment for why this goes through a tag-pinned,
+// checksum-verified fetch (F16, unidoc-alip's PR #5 follow-up review)
+// rather than a bare baseURL request.
 func Download(arch, dir string) (string, error) {
-	return downloadAsset(baseURL+AssetName(arch), dir)
+	return ResolveEFI(Source{}, arch, dir)
 }
 
 // BIOSAssets holds temp file paths for all five downloaded BIOS
@@ -170,8 +179,28 @@ func (s Source) resolve(defaultURL, dir string) (string, error) {
 // ResolveEFI returns a temp-file path for arch's UEFI .EFI artifact,
 // sourced per src (see Source's own doc comment), defaulting to the
 // latest GitHub release for that arch.
+//
+// F16 (unidoc-alip's PR #5 follow-up review): the default (no
+// File/URL override) case now goes through the SAME tag-pinned,
+// checksum-verified path ResolveBIOS's own default fields already use
+// (resolveDefaultAsset, below) - it used to fetch straight from
+// baseURL (releases/latest/download/), unpinned and unverified, the
+// exact class of gap the original F16 fix closed for BIOS but never
+// carried over to UEFI. An explicit override (a custom --efi-file or
+// --efi-url) is still resolved via Source.resolve with no checksum
+// check, same reasoning as every explicit BIOS override: it was never
+// claiming to BE the official release asset, so there is nothing
+// legitimate to verify it against.
 func ResolveEFI(src Source, arch, dir string) (string, error) {
-	return src.resolve(baseURL+AssetName(arch), dir)
+	if src.File != "" || src.URL != "" {
+		return src.resolve("", dir)
+	}
+	assetFile := AssetName(arch)
+	path, err := resolveDefaultAsset(assetFile, dir)
+	if err != nil {
+		return "", fmt.Errorf("resolving %s: %w", assetFile, err)
+	}
+	return path, nil
 }
 
 // BIOSSources bundles one independently-resolved Source per BIOS
@@ -184,12 +213,13 @@ type BIOSSources struct {
 }
 
 // apiLatestReleaseURL is GitHub's own REST API for this repo's latest
-// release - var, not const, same test-injection reason as baseURL.
+// release - var, not const, so tests can point it at a local
+// httptest.Server instead of the real network.
 var apiLatestReleaseURL = "https://api.github.com/repos/unidoc/alpine-zfsboot/releases/latest"
 
 // downloadBaseURLTemplate is a CONCRETE, tag-pinned download base
 // (releases/download/<tag>/, not releases/latest/download/ - one %s
-// for the tag) - var, same test-injection reason as baseURL.
+// for the tag) - var, same test-injection reason as apiLatestReleaseURL.
 var downloadBaseURLTemplate = "https://github.com/unidoc/alpine-zfsboot/releases/download/%s/"
 
 var sha256HexPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
@@ -287,6 +317,37 @@ func verifyChecksum(name, path string, sums map[string]string) error {
 	return nil
 }
 
+// resolveDefaultAsset fetches assetFile from the current tag-pinned,
+// checksum-verified GitHub release - the shared "no override given,
+// fetch the real thing safely" primitive ResolveEFI's own default case
+// uses directly (one asset, so one resolveTag/fetchChecksums pair is
+// exactly right). ResolveBIOS does NOT call this: it resolves the tag
+// and fetches checksums ONCE, up front, shared across all five of its
+// own fields in its own loop - calling this per-field there would
+// re-issue five independent resolveTag/fetchChecksums round trips and
+// reintroduce the exact same-release-consistency race the original
+// F16 fix closed, just one level down.
+func resolveDefaultAsset(assetFile, dir string) (string, error) {
+	tag, err := resolveTag()
+	if err != nil {
+		return "", err
+	}
+	tagBase := fmt.Sprintf(downloadBaseURLTemplate, tag)
+	sums, err := fetchChecksums(tagBase)
+	if err != nil {
+		return "", err
+	}
+	path, err := downloadAsset(tagBase+assetFile, dir)
+	if err != nil {
+		return "", err
+	}
+	if err := verifyChecksum(assetFile, path, sums); err != nil {
+		os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
 // ResolveBIOS resolves all five BIOS artifacts per src, each
 // independently sourced, defaulting whichever aren't overridden to
 // the latest GitHub release for arch. On any single artifact's
@@ -360,35 +421,6 @@ func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 				assets.RemoveAll()
 				return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
 			}
-		}
-		*f.dst = path
-	}
-	return assets, nil
-}
-
-// DownloadBIOS fetches all five latest BIOS artifacts for arch into
-// new temp files inside dir - see downloadAsset's own doc comment for
-// the dir/cleanup contract, which applies to each file individually.
-// On any failure, every file successfully downloaded so far is
-// removed before returning, so a partial-failure caller never has to
-// remember to clean up a partially-filled BIOSAssets itself.
-func DownloadBIOS(arch, dir string) (BIOSAssets, error) {
-	names := BIOSAssetName(arch)
-	var assets BIOSAssets
-	for _, f := range []struct {
-		name string
-		dst  *string
-	}{
-		{names.Stage1, &assets.Stage1},
-		{names.Stage2, &assets.Stage2},
-		{names.Kernel, &assets.Kernel},
-		{names.Initrd, &assets.Initrd},
-		{names.Cmdline, &assets.Cmdline},
-	} {
-		path, err := downloadAsset(baseURL+f.name, dir)
-		if err != nil {
-			assets.RemoveAll()
-			return BIOSAssets{}, err
 		}
 		*f.dst = path
 	}

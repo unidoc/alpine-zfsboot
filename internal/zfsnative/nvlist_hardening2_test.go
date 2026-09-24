@@ -267,19 +267,60 @@ func TestDecodeNative_NestingWithinDepthStillDecodes(t *testing.T) {
 	}
 }
 
-// TestDecodeNative_NestingDepthExceeded_NVListArray covers the
-// DATA_TYPE_NVLIST_ARRAY recursion path separately from the plain
-// DATA_TYPE_NVLIST path above - decodePair's two nesting branches have
-// their own, separate depth check.
+// buildNestedNvlistViaArrays is buildNestedNvlist's own DATA_TYPE_NVLIST_ARRAY
+// analogue - nests depth levels DEEP, every single level through a
+// one-element array ([]Nvlist{...}), never falling through to plain
+// DATA_TYPE_NVLIST nesting at any level.
+func buildNestedNvlistViaArrays(depth int) Nvlist {
+	cur := Nvlist{"leaf": uint64(1)}
+	for i := 0; i < depth; i++ {
+		cur = Nvlist{"arr": []Nvlist{cur}}
+	}
+	return cur
+}
+
+// TestDecodeNative_NestingDepthExceeded_NVListArray is the direct
+// regression test for the SECOND of F14's four unguarded call sites
+// (unidoc-alip's PR #5 follow-up review): decodePair's two nesting
+// branches (DATA_TYPE_NVLIST, DATA_TYPE_NVLIST_ARRAY) each have their own
+// separate depth check - the ORIGINAL version of this test wrapped a
+// DATA_TYPE_NVLIST_ARRAY around a deeply-nested chain built entirely out
+// of plain DATA_TYPE_NVLIST pairs (buildNestedNvlist), so the actual deep
+// recursion it exercised ran through DATA_TYPE_NVLIST's own check, not
+// DATA_TYPE_NVLIST_ARRAY's - confirmed directly: commenting out ONLY the
+// array branch's own depth check (nvlist.go, decodePair's
+// dataTypeNVListArray case) left the ORIGINAL version of this test
+// (and the whole rest of `go test ./internal/zfsnative/...`) green.
+// Nesting through buildNestedNvlistViaArrays instead - every level a
+// one-element array, never a plain nested list - routes the entire deep
+// chain through DATA_TYPE_NVLIST_ARRAY's own recursive decodeBody call,
+// so only ITS OWN depth check can catch this.
 func TestDecodeNative_NestingDepthExceeded_NVListArray(t *testing.T) {
-	nv := buildNestedNvlist(maxNVListDepth + 10)
-	wrapped := Nvlist{"arr": []Nvlist{nv}}
-	b, err := EncodeNative(wrapped)
+	nv := buildNestedNvlistViaArrays(maxNVListDepth + 10)
+	b, err := EncodeNative(nv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = DecodeNative(b)
 	if err == nil {
 		t.Fatal("DecodeNative on an nvlist-array nested past maxNVListDepth: want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "nesting depth") {
+		t.Errorf("error = %q, want it to mention nesting depth", err.Error())
+	}
+}
+
+// TestDecodeNative_NestingWithinDepthStillDecodes_NVListArray is the
+// negative-facing control for the array-nesting test above: real,
+// shallow array nesting must be entirely unaffected.
+func TestDecodeNative_NestingWithinDepthStillDecodes_NVListArray(t *testing.T) {
+	nv := buildNestedNvlistViaArrays(5)
+	b, err := EncodeNative(nv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = DecodeNative(b)
+	if err != nil {
+		t.Fatalf("DecodeNative on legitimately-shallow array nesting: %v", err)
 	}
 }

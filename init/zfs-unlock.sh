@@ -153,7 +153,28 @@ zfs_stage_secret() {
         zfs_unlock_msg "failed to write the staged handoff secret for $1 - handoff will correctly report NOT READY"
         return 1
     fi
+    # staged_by_me set HERE - immediately before the rename that
+    # actually publishes the secret at $stage, not by either caller
+    # after this whole function has already returned (N3, unidoc-alip's
+    # PR #5 follow-up review). `mv` is an external command: a signal
+    # landing while the shell is merely waiting on it can have the
+    # rename already complete (or complete a moment later, same
+    # outcome) with staged_by_me still 0 under the OLD "set it after
+    # the function returns" shape - the trap (boot-dataset.sh's
+    # _cleanup_secrets()) then sees staged_by_me=0 and leaves a real
+    # plaintext secret sitting in tmpfs for the rest of the rescue
+    # session, exactly the exposure window this whole staged_by_me
+    # mechanism (F2) exists to close. staged_by_me is a plain global
+    # (no `local` in this codebase's shell) - safe to set here directly
+    # rather than only at the two call sites, since nothing before this
+    # point in this function has touched $stage itself yet (only the
+    # private, per-PID $stage_tmp). Explicitly reset to 0 below if the
+    # rename itself fails: a failed mv means $stage is untouched and
+    # may still hold a DIFFERENT session's own valid stage, which this
+    # process must never delete.
+    staged_by_me=1
     if ! mv -f "$stage_tmp" "$stage"; then
+        staged_by_me=0
         rm -f "$stage_tmp"
         zfs_unlock_msg "failed to publish the staged handoff secret for $1 - handoff will correctly report NOT READY"
         return 1
@@ -389,9 +410,70 @@ zfs_op_lock() {
     lock_dir="$(zfs_op_lock_path "$1")"
     if mkdir "$lock_dir" 2>/dev/null; then
         echo "$$" > "$lock_dir/pid" 2>/dev/null
+        # F3 (unidoc-alip's PR #5 follow-up review): recorded so a
+        # signal landing anywhere between this success and the matching
+        # zfs_op_unlock() call - mid `zfs load-key`, mid dialog prompt,
+        # anywhere in zfs_unlock()/zfs_lock()'s own body - can still be
+        # released cleanly by the caller's own trap instead of sitting
+        # there until N4/F11's own dead-pid reclaim eventually notices.
+        # A plain global, same convention as every other cross-function
+        # variable in this file (lock_pid, stale, ...) - no `local` in
+        # this codebase's shell.
+        zfs_op_lock_held_for="$1"
         return 0
     fi
     lock_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
+    # F11 (unidoc-alip's PR #5 follow-up review): mkdir above and the
+    # pid write below it are NOT atomic together - a holder genuinely
+    # killed (SIGKILL, an OOM kill) in that exact gap leaves a lock
+    # directory with no pid file at all. lock_pid then reads empty, the
+    # dead-pid check below (`[ -n "$lock_pid" ]`) never even runs, and
+    # NOTHING in this function can ever tell that holder apart from one
+    # still legitimately running - permanently wedged, recoverable only
+    # by a human removing the directory by hand or a reboot. The SAME
+    # severity as N4's own finding, just reached through a different
+    # gap. A brief, bounded poll first: the pid write is a single near-
+    # instant tmpfs write, so if it still hasn't appeared after several
+    # short checks, no live holder is genuinely still mid-way through
+    # writing it, and this really is abandoned rather than merely
+    # caught at a bad moment.
+    if [ -z "$lock_pid" ]; then
+        _i=0
+        while [ -z "$lock_pid" ] && [ "$_i" -lt 5 ]; do
+            sleep 0.05
+            lock_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
+            _i=$((_i + 1))
+        done
+        if [ -z "$lock_pid" ]; then
+            stale="$lock_dir.stale.$$"
+            if mv "$lock_dir" "$stale" 2>/dev/null; then
+                # Re-check after the mv, same discipline as the dead-
+                # pid path below: did a pid appear in the moved-aside
+                # copy after all (a live holder finished writing it in
+                # the instant this process grabbed it)? If so, this was
+                # never actually abandoned - give it back (unless a
+                # third party has since recreated $lock_dir - N4's own
+                # nesting hazard applies here identically).
+                moved_pid="$(cat "$stale/pid" 2>/dev/null)"
+                if [ -n "$moved_pid" ]; then
+                    if [ ! -e "$lock_dir" ]; then
+                        mv "$stale" "$lock_dir" 2>/dev/null
+                    else
+                        rm -rf "$stale"
+                    fi
+                    return 1
+                fi
+                rm -rf "$stale"
+                if mkdir "$lock_dir" 2>/dev/null; then
+                    echo "$$" > "$lock_dir/pid" 2>/dev/null
+                    zfs_op_lock_held_for="$1"
+                    zfs_unlock_msg "reclaimed an abandoned encryption operation lock for $1 (no owner pid was ever recorded - a previous holder was likely killed between acquiring the lock and recording ownership)"
+                    return 0
+                fi
+            fi
+        fi
+        return 1
+    fi
     # command -v, not a bare `! _pid_alive ...` - this file calls
     # _pid_alive but never sources pid-alive.sh itself, relying on
     # every caller having done so first (both real ones do -
@@ -425,12 +507,41 @@ zfs_op_lock() {
             # instead of stealing it.
             moved_pid="$(cat "$stale/pid" 2>/dev/null)"
             if [ "$moved_pid" != "$lock_pid" ]; then
-                mv "$stale" "$lock_dir" 2>/dev/null
+                # N4 (unidoc-alip's PR #5 follow-up review): a THIRD
+                # process racing the same window can `mkdir "$lock_dir"`
+                # (its own plain, non-reclaim fast path above) in the
+                # gap between this process's own mv-aside and this
+                # mv-back - confirmed with three real processes running
+                # the real functions. `mv src dst` when dst ALREADY
+                # EXISTS as a directory does not fail and does not
+                # replace it - it moves src INSIDE dst instead. Moving
+                # back onto a $lock_dir a third party has since
+                # recreated would nest the wrongly-grabbed lock's own
+                # directory (pid file and all) inside that third
+                # party's fresh one - not a mismatch this function would
+                # ever notice, but a permanent wedge for THEM: their own
+                # later zfs_op_unlock()'s `rmdir` fails on a non-empty
+                # directory forever after, recoverable only by a reboot.
+                # Checking existence immediately before the mv-back
+                # closes the one deterministic, unrecoverable outcome
+                # here - a residual TOCTOU race between this check and
+                # the mv itself remains (the same order of race this
+                # whole reclaim mechanism already accepts elsewhere,
+                # documented above), but "silently lose one lock" is a
+                # bounded, already-precedented risk; "permanently wedge
+                # a directory with no owner and no way to remove it" is
+                # not.
+                if [ ! -e "$lock_dir" ]; then
+                    mv "$stale" "$lock_dir" 2>/dev/null
+                else
+                    rm -rf "$stale"
+                fi
                 return 1
             fi
             rm -rf "$stale"
             if mkdir "$lock_dir" 2>/dev/null; then
                 echo "$$" > "$lock_dir/pid" 2>/dev/null
+                zfs_op_lock_held_for="$1"
                 zfs_unlock_msg "reclaimed a stale encryption operation lock for $1 (holder pid $lock_pid is gone)"
                 return 0
             fi
@@ -443,6 +554,38 @@ zfs_op_unlock() {
     lock_dir="$(zfs_op_lock_path "$1")"
     rm -f "$lock_dir/pid" 2>/dev/null
     rmdir "$lock_dir" 2>/dev/null
+    # Only clear the tracker if it's still pointing at THIS
+    # encryptionroot - matters for _zfs_unlock_release_held_lock()
+    # below, called from a trap that may fire after this process has
+    # already released one lock and moved on to holding a different one
+    # (not a real path in this codebase today, since every caller only
+    # ever holds one at a time, but cheap to get right rather than
+    # assume).
+    [ "${zfs_op_lock_held_for:-}" = "$1" ] && zfs_op_lock_held_for=""
+}
+
+# _zfs_unlock_release_held_lock - F3 (unidoc-alip's PR #5 follow-up
+# review): releases whatever zfs_op_lock this process currently holds,
+# if any. Every normal, uninterrupted path through zfs_unlock()/
+# zfs_lock() already calls zfs_op_unlock() itself before returning (see
+# their own bodies), so zfs_op_lock_held_for is already empty by the
+# time either function returns normally - this exists purely for the
+# signal case: a SIGTERM/SIGINT/SIGHUP landing anywhere inside one of
+# those functions' own body (mid `zfs load-key`, mid dialog prompt)
+# used to leave the lock held with nothing to ever release it until
+# N4/F11's own dead-pid reclaim eventually noticed and stole it back -
+# safe, but only after that reclaim's own bounded delay, and only once
+# another caller actually tries. Called from both real entry points'
+# own trap/cleanup chains: the standalone zfs-unlock wrapper (this
+# file's own header comment on why it, not this file, binds the traps)
+# and boot-dataset.sh's _cleanup_secrets() (same reasoning as that
+# function's own call to _zfs_unlock_cleanup_tempfiles). ${x:-} under
+# `set -u`, same convention as every other trap-reachable cleanup
+# function in this project - safe to call at any time, lock held or
+# not.
+_zfs_unlock_release_held_lock() {
+    [ -n "${zfs_op_lock_held_for:-}" ] || return 0
+    zfs_op_unlock "$zfs_op_lock_held_for"
 }
 
 # zfs_op_lock_retry ENCRYPTIONROOT - like zfs_op_lock(), but polls for a
@@ -657,13 +800,17 @@ zfs_unlock() {
             # that used to sit here on exactly this dry-run contract.
             if printf '%s\n' "$passphrase" | zfs load-key -n "$encryptionroot" >/tmp/load-key.log 2>&1; then
                 if zfs_stage_secret "$encryptionroot" "$passphrase"; then
-                    # staged_by_me - see boot-dataset.sh's own
+                    # staged_by_me is set inside zfs_stage_secret()
+                    # itself now, right before the rename that publishes
+                    # the secret (N3, unidoc-alip's PR #5 follow-up
+                    # review) - not here, after this whole call has
+                    # already returned. See boot-dataset.sh's own
                     # _cleanup_secrets() comment (F2, unidoc-alip's PR
-                    # #5 review) for why this exists: the staged-secret
-                    # path is shared by every session unlocking the
-                    # SAME encryptionroot, so cleanup must only ever
-                    # remove a stage THIS process actually created.
-                    staged_by_me=1
+                    # #5 review) for why this flag exists at all: the
+                    # staged-secret path is shared by every session
+                    # unlocking the SAME encryptionroot, so cleanup must
+                    # only ever remove a stage THIS process actually
+                    # created.
                     unset passphrase
                     zfs_op_unlock "$encryptionroot"
                     zfs_unlock_msg "kexec handoff secret for $encryptionroot staged"
@@ -689,9 +836,10 @@ zfs_unlock() {
         # right here, with no extra re-prompt needed.
         if printf '%s\n' "$passphrase" | zfs load-key "$encryptionroot" >/tmp/load-key.log 2>&1; then
             if zfs_stage_secret "$encryptionroot" "$passphrase"; then
-                # staged_by_me - see this function's other zfs_stage_secret
-                # success site above for why (F2, unidoc-alip's PR #5 review).
-                staged_by_me=1
+                # staged_by_me is set inside zfs_stage_secret() itself
+                # now (N3, unidoc-alip's PR #5 follow-up review) - see
+                # this function's other zfs_stage_secret call site above
+                # for the full reasoning, and F2 for why the flag exists.
                 unset passphrase
                 zfs_op_unlock "$encryptionroot"
                 zfs_unlock_msg "encryption key loaded for $encryptionroot and kexec handoff secret staged"

@@ -315,7 +315,7 @@ func TestMBRPartitions_FATBootSectorRefused(t *testing.T) {
 	disk := make([]byte, 4096)
 	disk[0] = 0xEB // BS_jmpBoot: short jump
 	disk[1] = 0x3C
-	disk[2] = 0x90 // NOP
+	disk[2] = 0x90                                  // NOP
 	binary.LittleEndian.PutUint16(disk[11:13], 512) // BPB_BytsPerSec
 	disk[13] = 8                                    // BPB_SecPerClus (power of two)
 	disk[mbrBootSignatureOffset] = 0x55

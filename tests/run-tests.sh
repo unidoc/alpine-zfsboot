@@ -124,7 +124,56 @@ run_stubbed() {
         dropbear() { "$STUBS/dropbear" "$@"; }
         dropbearkey() { "$STUBS/dropbearkey" "$@"; }
         cpio()     { "$STUBS/cpio" "$@"; }
-        . "$script"
+        # setsid, not a plain `. "$script"` in this same subshell -
+        # found the hard way, running this suite interactively on real
+        # hardware (bureau): a bare fd-redirected subshell (`>"$d/out"
+        # 2>&1`) does NOT detach from a controlling terminal - /dev/tty
+        # resolution is a SESSION property, entirely independent of
+        # what fds 0/1/2 point at, so a script run from a real
+        # interactive terminal/SSH session inherits that session's own
+        # ctty all the way down through this dot-sourced subshell. Every
+        # test that stages a real die()/fail() -> _recovery_shell() call
+        # (see that function's own `( : < /dev/tty ) 2>/dev/null`
+        # branch check) and asserts the "no controlling terminal yet"
+        # branch was silently relying on whoever invoked run-tests.sh
+        # itself having no ctty - true for CI and any other detached
+        # invocation, false the moment a human runs this suite from
+        # their own real terminal, where it started failing FOUR real,
+        # otherwise-passing tests with no code regression behind them at
+        # all. `setsid` (without -c/--ctty, which does the opposite -
+        # attaches the CURRENT terminal instead) creates a genuinely
+        # fresh session with no controlling terminal at all, regardless
+        # of the caller's own - making run_stubbed()'s own long-
+        # standing "never has a controlling terminal" comment (see this
+        # function's own callers, and the block comment further down
+        # this file explaining exactly this) actually true unconditionally,
+        # not just true by accident of how it happened to be invoked so
+        # far. The stub functions above are `export -f`'d first since
+        # setsid execs a genuinely NEW bash process - unlike a plain `(
+        # ... )` subshell, it does not inherit function definitions any
+        # other way.
+        export -f mount umount zpool zfs kexec modprobe mdev ifconfig udhcpc udhcpc6 ip nft dropbear dropbearkey cpio
+        # export -f only carries each function's own body text - $STUBS
+        # itself (every stub function's own closed-over reference to
+        # where the real tests/stubs/* scripts live) is a PLAIN variable,
+        # resolved fresh by the new bash process's own environment at
+        # call time, not baked into the exported function text. Without
+        # this, every stub call below resolved $STUBS as empty in the
+        # new process (unset, not the caller's own value) - "$STUBS/mount"
+        # became the literal path "/mount", and every single stubbed
+        # command failed. Found immediately while testing this exact
+        # setsid fix, not shipped broken.
+        export STUBS
+        # "$@" here is run_stubbed()'s own remaining args after its
+        # `shift` above (e.g. the DATASET/POOL args boot-dataset.sh
+        # itself takes) - forwarded through as bash -c's own extra
+        # arguments ($2 onward, since $1 is $script), then re-shifted
+        # inside the new process so `. "$_s" "$@"` passes them on to
+        # the sourced script as ITS $1 $2..., exactly as the original
+        # plain `. "$script"` did by sharing positional params directly
+        # with its own enclosing subshell - a new bash -c process has
+        # no such sharing, so this has to be done explicitly.
+        exec setsid bash -c '_s="$1"; shift; . "$_s" "$@"' -- "$script" "$@"
     )
 }
 
@@ -295,6 +344,73 @@ if grep -qi "still has something else mounted" "$d/out" \
 else
     cat "$d/out" 2>/dev/null; cat "$d/log" 2>/dev/null
     bad "the busy pre-check either did not fire, or something downstream of it still ran (zpool export / attempt record / bootcheck write)"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== boot-dataset.sh: N2 - the bootcheck confirm-service check reads \$ROOTFS/mnt/root BEFORE it gets unmounted, not after =="
+# Regression test for N2 (unidoc-alip's PR #5 follow-up review): F21
+# (test just above) moved `umount "$ROOTFS"/mnt/root` earlier in this
+# file to make its own pre-check possible, but the bootcheck
+# confirm-service file tests further down still read paths UNDER that
+# same mount - so once the umount ran first, both tests always read
+# "absent", and every armed BE silently disarmed itself
+# (org.alpinezfsboot:bootcheck reset to armed:0) instead of ever
+# incrementing, on every single real boot. Not reproducible against
+# this suite's own default umount stub (a no-op that never actually
+# removes anything) - STUB_UMOUNT_REALLY_UNMOUNT makes it really hide
+# the target directory's content, the same real-world behavior a
+# genuine umount has, so this test fails against the pre-fix ordering
+# and passes against the fix.
+#
+# Bypasses run_stubbed (which always wires the plain, not-bootcheck-
+# aware `zfs` stub) in favor of the same fully-manual inline-subshell
+# shape the /init bootcheck tests already use elsewhere in this suite,
+# so zfs() can be zfs.bootcheck here instead.
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+# Under $STUB_POOL_DATA, NOT directly under $d/root/mnt/root - the
+# mount stub is what actually populates $ROOTFS/mnt/root (by copying
+# $STUB_POOL_DATA's own content into it), and this file lives BEFORE
+# that mount stub's own call in this script's own flow, AFTER an EARLY
+# pre-mount cleanup `umount` (line ~584, unrelated to N2 - this one
+# runs before ANY mount has happened, clearing any stale leftover from
+# a previous crashed attempt) that STUB_UMOUNT_REALLY_UNMOUNT would
+# otherwise also hide away if this fixture were placed directly under
+# $d/root/mnt/root ahead of time.
+mkdir -p "$d/pooldata/etc/runlevels/default" "$d/pooldata/etc/init.d"
+ln -s /etc/init.d/alpine-zfsboot-bootcheck "$d/pooldata/etc/runlevels/default/alpine-zfsboot-bootcheck"
+: > "$d/pooldata/etc/init.d/alpine-zfsboot-bootcheck"
+(
+    set +e
+    mount()    { "$STUBS/mount" "$@"; }
+    umount()   { "$STUBS/umount" "$@"; }
+    zpool()    { "$STUBS/zpool" "$@"; }
+    zfs()      { "$STUBS/zfs.bootcheck" "$@"; }
+    kexec()    { "$STUBS/kexec" "$@"; }
+    modprobe() { "$STUBS/modprobe" "$@"; }
+    mdev()     { "$STUBS/mdev" "$@"; }
+    ifconfig() { "$STUBS/ifconfig" "$@"; }
+    udhcpc()   { "$STUBS/udhcpc" "$@"; }
+    udhcpc6()  { "$STUBS/udhcpc6" "$@"; }
+    ip()       { "$STUBS/ip" "$@"; }
+    nft()      { "$STUBS/nft" "$@"; }
+    dropbear() { "$STUBS/dropbear" "$@"; }
+    dropbearkey() { "$STUBS/dropbearkey" "$@"; }
+    cpio()     { "$STUBS/cpio" "$@"; }
+    STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+        STUB_BOOTCHECK_VALUE="armed:2" STUB_BOOTCHECK_SOURCE="local" \
+        STUB_UMOUNT_REALLY_UNMOUNT=1
+    export STUB_LOG STUB_ROOT STUB_POOL_DATA STUB_BOOTCHECK_VALUE STUB_BOOTCHECK_SOURCE STUB_UMOUNT_REALLY_UNMOUNT
+    . "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot"
+) >"$d/out" 2>&1 || true
+if grep -q "^zfs set.*bootcheck=armed:3.*zroot/ROOT/alpine" "$d/log" 2>/dev/null \
+   && ! grep -qi "disarming" "$d/out" 2>/dev/null; then
+    ok "a real confirm service present before the umount is still seen as present - armed:2 -> armed:3, not disarmed"
+else
+    cat "$d/out" 2>/dev/null; cat "$d/log" 2>/dev/null
+    bad "the confirm-service check read \$ROOTFS/mnt/root AFTER it was unmounted - a real, armed BE with a real confirm service was incorrectly disarmed"
 fi
 rm -rf "$d"
 
@@ -1123,6 +1239,14 @@ echo "== boot-dataset.sh: lock already held by another session -> this one backs
 # stands in for "someone else's mkdir already won".
 d="$(fresh_env)"
 mkdir -p "$d/pooldata/boot" "$d/root/tmp/boot-lock.zroot_ROOT_alpine"
+# A real, currently-alive pid ($$, this very test process) - as of F11
+# (unidoc-alip's PR #5 follow-up review), a pid-less lock directory is
+# correctly reclaimed after a brief bounded poll rather than treated as
+# "someone else holds it"; this fixture wants the latter (a genuine
+# lost-race backoff), so it must record a live pid, the same as a real
+# concurrent mkdir winner's own zfs_op_lock()/boot_lock_acquire() would
+# have done immediately after its own mkdir.
+echo "$$" > "$d/root/tmp/boot-lock.zroot_ROOT_alpine/pid"
 : > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
 STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
     run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
@@ -1136,6 +1260,76 @@ if grep -qi "another session is already proceeding" "$d/out" && ! grep -qi "FATA
 else
     cat "$d/out"; bad "backoff message missing or wrongly alarmed"
 fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== boot-dataset.sh: a session that staged the handoff secret itself, then loses the boot race, must NOT delete its own stage =="
+# F2 (unidoc-alip's PR #5 follow-up review, 'smaller leftovers'): N3's
+# staged_by_me gate only ever protected a DIFFERENT process's stage
+# from a losing session that never staged anything itself. It does
+# nothing for the case alip's own follow-up flagged as still open: THIS
+# session unlocks and stages the secret (encryptionroot is checked well
+# before boot_lock_acquire - see this file's own call ordering), then
+# loses the boot lock race to a session that got there first and is
+# already proceeding with the SAME dataset - which may well be relying
+# on the exact stage this session just published, since the stage path
+# is keyed by encryptionroot, not by process. Before lose_boot_race()
+# cleared staged_by_me itself, its own unconditional `exit 0` ran
+# _cleanup_secrets() with staged_by_me=1 still set from this session's
+# own successful staging, deleting a secret a still-booting session may
+# depend on - the same double-ZFS-prompt failure mode this project's
+# kexec handoff exists to prevent, just reached via a different pairing
+# of processes than the original bug.
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot" "$d/root/tmp/boot-lock.zroot_ROOT_alpine"
+# Same fixture convention as the plain lost-race test above: a live pid
+# recorded up front so F11's own empty-pid reclaim poll does not treat
+# this as abandoned and steal it back before boot_lock_acquire ever
+# gets a chance to genuinely lose the race.
+echo "$$" > "$d/root/tmp/boot-lock.zroot_ROOT_alpine/pid"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+cat > "$STUBS/zfs.f2-lose-race" <<'EOF'
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$prop" in
+            encryptionroot) echo "zroot/ROOT" ;;
+            keystatus) [ "$ds" = "zroot/ROOT" ] && echo "unavailable" || echo "-" ;;
+            keylocation) echo "prompt" ;;
+            org.alpinezfsboot:commandline) echo "-" ;;
+        esac
+        ;;
+    load-key)
+        [ "$2" = "zroot/ROOT" ]
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$STUBS/zfs.f2-lose-race"
+(
+    set +e
+    mount()    { "$STUBS/mount" "$@"; }
+    umount()   { "$STUBS/umount" "$@"; }
+    zpool()    { "$STUBS/zpool" "$@"; }
+    zfs()      { "$STUBS/zfs.f2-lose-race" "$@"; }
+    kexec()    { "$STUBS/kexec" "$@"; }
+    dialog()   { echo "test-passphrase" >&2; return 0; }
+    stty()     { :; }
+    clear()    { :; }
+    STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" STUB_TTY="$d/tty"
+    export STUB_LOG STUB_ROOT STUB_POOL_DATA STUB_TTY
+    . "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot"
+) >"$d/out" 2>&1 || true
+key_stage="$d/root/tmp/zfs-key.zroot_ROOT"
+if grep -qi "another session is already proceeding" "$d/out" && [ -s "$key_stage" ]; then
+    ok "lost the boot race after staging the secret itself - the stage it created survives, not deleted out from under the winner"
+else
+    cat "$d/out"; ls "$d/root/tmp" 2>/dev/null
+    bad "a session that staged its own secret then lost the race deleted it on exit (key_stage present=$([ -s "$key_stage" ] && echo yes || echo no))"
+fi
+rm -f "$STUBS/zfs.f2-lose-race"
 rm -rf "$d"
 
 # =============================================================================
@@ -1244,6 +1438,34 @@ if grep -q "^mount" "$d/log2" 2>/dev/null \
 else
     cat "$d/out" 2>/dev/null; echo "recorded_pid=$recorded_pid holder_pid=$holder_pid"; ls "$d/root/tmp" 2>/dev/null
     bad "boot_lock_acquire did not reclaim a real dead holder's lock as expected"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== boot-dataset.sh: F11 - a boot lock directory with no pid file at all is reclaimed, not permanently wedged =="
+# Same real gap as zfs-unlock.sh's own identical F11 fix (see that
+# file's own regression test for the full reasoning): mkdir and the pid
+# write below it are not atomic together, so a holder killed in that
+# exact gap leaves $boot_lock_dir existing with no pid file - lock_pid
+# then reads empty and the dead-pid liveness check never runs at all,
+# permanently wedging every future boot of this dataset until a human
+# removes the directory by hand or the machine reboots. Simulates the
+# exact end state directly (a real mkdir, deliberately no pid file)
+# rather than timing a real kill - boot_lock_acquire's own fix only
+# ever examines the end state, not how it arose.
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+lock_dir="$d/root/tmp/boot-lock.zroot_ROOT_alpine"
+mkdir -p "$lock_dir" # deliberately no pid file inside
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -qi "reclaimed an abandoned boot lock" "$d/out" \
+   && [ -s "$lock_dir/pid" -o ! -e "$lock_dir" ]; then
+    ok "a pid-less boot lock directory (holder killed between mkdir and recording ownership) is reclaimed after the bounded poll, not left wedged forever"
+else
+    cat "$d/out" 2>/dev/null; ls -la "$lock_dir" 2>/dev/null
+    bad "a pid-less boot lock directory was not reclaimed - this would wedge every future boot of this dataset until a human intervenes or the machine reboots"
 fi
 rm -rf "$d"
 
@@ -1414,6 +1636,93 @@ else
     bad "SIGTERM after staging left the plaintext passphrase behind in tmpfs (staged_before=$staged_before)"
 fi
 rm -f "$STUBS/zfs.sigterm-secret"
+rm -rf "$d"
+
+# =============================================================================
+echo "== boot-dataset.sh: SIGTERM during zfs load-key releases the per-encryptionroot zfs_op_lock too, not just the boot lock or a staged secret =="
+# F3 (unidoc-alip's PR #5 follow-up review), the boot-dataset.sh half:
+# this file calls zfs_unlock() in-process (see this file's own header
+# comment), which holds zfs_op_lock across its own `zfs load-key` call -
+# a DIFFERENT lock from $boot_lock_dir (covered by the test above) and
+# a window that closes BEFORE the plaintext secret ever gets staged
+# (covered by the test above THAT one) - neither existing test actually
+# signals inside this specific window. `load-key` blocks via a short-
+# poll loop here, not a single long sleep - see the standalone
+# zfs-unlock wrapper's own equivalent test for why (a bash foreground
+# wait() on one long sleep does not get interrupted promptly by a
+# trapped signal; this project's existing SIGTERM-mid-boot test above
+# documents the same lesson for pkill's own -P usage).
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+cat > "$STUBS/zfs.sigterm-oplock" <<'EOF'
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$prop" in
+            encryptionroot) echo "zroot/ROOT" ;;
+            keystatus) [ "$ds" = "zroot/ROOT" ] && echo "unavailable" || echo "-" ;;
+            keylocation) echo "prompt" ;;
+            org.alpinezfsboot:commandline) echo "-" ;;
+        esac
+        ;;
+    load-key)
+        while :; do sleep 1; done
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$STUBS/zfs.sigterm-oplock"
+cat > "$d/holder.sh" <<EOF
+#!/usr/bin/env bash
+STUB_ROOT="$d/root"
+STUB_LOG="$d/log"
+STUB_TTY="$d/tty"
+export STUB_ROOT STUB_LOG STUB_TTY
+mount()    { "$STUBS/mount" "\$@"; }
+umount()   { "$STUBS/umount" "\$@"; }
+zpool()    { "$STUBS/zpool" "\$@"; }
+zfs()      { "$STUBS/zfs.sigterm-oplock" "\$@"; }
+kexec()    { "$STUBS/kexec" "\$@"; }
+modprobe() { "$STUBS/modprobe" "\$@"; }
+mdev()     { "$STUBS/mdev" "\$@"; }
+ifconfig() { "$STUBS/ifconfig" "\$@"; }
+udhcpc()   { "$STUBS/udhcpc" "\$@"; }
+udhcpc6()  { "$STUBS/udhcpc6" "\$@"; }
+ip()       { "$STUBS/ip" "\$@"; }
+nft()      { "$STUBS/nft" "\$@"; }
+dropbear() { "$STUBS/dropbear" "\$@"; }
+dropbearkey() { "$STUBS/dropbearkey" "\$@"; }
+dialog()   { echo "test-passphrase" >&2; return 0; }
+stty()     { :; }
+clear()    { :; }
+. "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot"
+EOF
+chmod +x "$d/holder.sh"
+"$d/holder.sh" &
+holder_pid=$!
+op_lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT"
+i=0
+while [ ! -s "$op_lock_dir/pid" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+lock_seen="$([ -s "$op_lock_dir/pid" ] && echo yes || echo no)"
+kill -TERM "$holder_pid" 2>/dev/null || true
+pkill -TERM -P "$holder_pid" 2>/dev/null || true
+i=0
+while [ -d "/proc/$holder_pid" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+if [ "$lock_seen" = yes ] && [ ! -e "$op_lock_dir" ]; then
+    ok "SIGTERM during zfs load-key released the per-encryptionroot zfs_op_lock via boot-dataset.sh's own trap"
+else
+    echo "lock_seen=$lock_seen"; ls "$op_lock_dir" 2>/dev/null
+    bad "SIGTERM during zfs load-key left the per-encryptionroot zfs_op_lock directory behind (lock_seen=$lock_seen)"
+fi
+rm -f "$STUBS/zfs.sigterm-oplock"
 rm -rf "$d"
 
 # =============================================================================
@@ -4184,6 +4493,74 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+echo "== zfs-unlock.sh: N3 - zfs_stage_secret() sets staged_by_me BEFORE calling mv, not after the whole function returns =="
+# Regression test for N3 (unidoc-alip's PR #5 follow-up review): `mv` is
+# an external command - a signal landing while the calling shell merely
+# WAITS on it can have the rename already genuinely complete with
+# staged_by_me still 0, if that flag is only set by the CALLER after
+# zfs_stage_secret's own return (the old shape). boot-dataset.sh's own
+# EXIT/INT/TERM/HUP trap (_cleanup_secrets) then sees staged_by_me=0
+# and leaves a real plaintext secret sitting in tmpfs for the rest of
+# the rescue session - exactly the exposure window this flag exists to
+# close in the first place (F2). Proven directly, not by racing a real
+# signal against a real timing window (unreliable by nature) - a `mv`
+# override captures staged_by_me's own value at the exact moment it is
+# invoked, before doing the real rename itself, so this test is
+# deterministic: it fails every time against the old "set it after the
+# call returns" shape and passes every time against the fix.
+d="$(fresh_env)"
+mv_capture="$d/mv-capture"
+(
+    set +e
+    STUB_ROOT="$d/root"
+    export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
+    . "$REPO_ROOT/init/zfs-unlock.sh"
+    mv() {
+        echo "staged_by_me-at-mv-time=${staged_by_me:-unset}" > "$mv_capture"
+        command mv "$@"
+    }
+    zfs_stage_secret "zroot/ROOT/enc" "a-real-secret"
+    echo "staged_by_me-after-return=${staged_by_me:-unset}"
+) >"$d/out" 2>&1 || true
+if grep -qx "staged_by_me-at-mv-time=1" "$mv_capture" 2>/dev/null \
+   && grep -qx "staged_by_me-after-return=1" "$d/out"; then
+    ok "staged_by_me is already 1 at the exact moment mv is invoked, not only after zfs_stage_secret returns"
+else
+    cat "$mv_capture" 2>/dev/null; cat "$d/out"
+    bad "staged_by_me was not set before the rename - a signal during a real mv could leave a staged secret with the cleanup flag still unset"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== zfs-unlock.sh: N3 - a failed rename resets staged_by_me to 0, never claiming ownership of a stage this process didn't actually publish =="
+# The other half of N3's fix: setting the flag optimistically before
+# the rename would be unsafe on its own if a FAILED mv left it stuck at
+# 1 - cleanup would then delete whatever is sitting at the canonical
+# stage path even though this process never actually published
+# anything there, which could be a DIFFERENT session's own real,
+# in-use secret (the exact cross-session deletion F2 already closed
+# once, for a different code path).
+d="$(fresh_env)"
+(
+    set +e
+    STUB_ROOT="$d/root"
+    export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
+    . "$REPO_ROOT/init/zfs-unlock.sh"
+    mv() { return 1; }
+    zfs_stage_secret "zroot/ROOT/enc" "a-real-secret"
+    echo "stage-status=$?"
+    echo "staged_by_me-after-failed-rename=${staged_by_me:-unset}"
+) >"$d/out" 2>&1 || true
+if grep -qx "stage-status=1" "$d/out" && grep -qx "staged_by_me-after-failed-rename=0" "$d/out"; then
+    ok "a failed rename resets staged_by_me to 0 - this process never claims ownership of a publish that didn't actually happen"
+else
+    cat "$d/out"; bad "staged_by_me was left at 1 after a failed rename - cleanup could delete another session's real stage"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== zfs-unlock.sh: a passphrase prompt fails CLOSED when terminal echo suppression cannot be established =="
 # The Rolls-Royce audit's own required invariant: never accept a
 # passphrase without a confirmed-working echo-suppression/restore
@@ -4281,10 +4658,18 @@ zfs_unlock_env "$d"
 mkdir -p "$d/root/tmp"
 # Simulates a concurrent operation already in flight - a real second
 # process would have created this exact directory via zfs_op_lock()'s
-# own atomic mkdir; pre-creating it here is the deterministic,
-# single-process way to exercise "someone else already holds this
-# encryptionroot's lock" without needing real concurrency.
+# own atomic mkdir AND immediately recorded its own pid inside it;
+# pre-creating both here is the deterministic, single-process way to
+# exercise "someone else already holds this encryptionroot's lock"
+# without needing real concurrency. The pid file matters as of F11
+# (unidoc-alip's PR #5 follow-up review): a lock directory that stays
+# pid-less is now correctly treated as abandoned (reclaimed after a
+# brief bounded poll) rather than "someone else holds it" - this
+# fixture must record a REAL, currently-alive pid ($$, this very test
+# process) so it still means what it always meant here: a live holder,
+# not the F11 case this test isn't exercising.
 mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+echo "$$" > "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"
 (
     set +e
     zfs()    { "$STUBS/zfs.unlock" "$@"; }
@@ -4325,7 +4710,13 @@ STUB_ZFS_UNLOCK_CORRECT="hunter2"
 export STUB_ZFS_UNLOCK_CORRECT
 mkdir -p "$d/root/tmp"
 mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
-( sleep 0.3; rmdir "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc" ) &
+# A real, currently-alive pid, same F11 reasoning as the fixture just
+# above - this test wants "genuinely held, then released", not F11's
+# own "pid-less, reclaimed as abandoned" case.
+echo "$$" > "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"
+# rm -f the pid file first, same order zfs_op_unlock() itself uses -
+# a bare rmdir would fail on the now-non-empty directory otherwise.
+( sleep 0.3; rm -f "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"; rmdir "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc" ) &
 release_pid=$!
 (
     set +e
@@ -4537,6 +4928,166 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+echo "== zfs-unlock.sh: N4 - a third process's fresh lock is never permanently wedged by another process's mv-back =="
+# Regression test for N4 (unidoc-alip's PR #5 follow-up review), a
+# THIRD real process added to the exact two-process race just above -
+# their own PoC methodology, reproduced here with three real processes
+# running the real functions, not simulated:
+#
+#   B judges the original holder dead and starts reclaiming - its own
+#   mv-aside is delayed so A's full reclaim (mv+rm+mkdir+own pid)
+#   genuinely completes first, same as the test above.
+#   B's own (now real) mv-aside grabs A's fresh lock instead of the
+#   dead one it judged - the pid mismatch this file's own F11 fix
+#   already detects. Before this round's fix, B would then
+#   unconditionally `mv` A's lock BACK onto $lock_dir.
+#   C, a genuinely separate process, does a PLAIN zfs_op_lock() call in
+#   the real gap this creates (B's mv-aside already ran, so $lock_dir
+#   is genuinely missing) - C's own ordinary mkdir fast path succeeds,
+#   and C believes it holds the lock.
+#   B's delayed mv-back then runs. `mv src dst` onto a dst that already
+#   exists as a directory does not fail or replace it - it nests src
+#   INSIDE dst. Before this fix, that left C's own lock directory
+#   containing an unexpected extra subdirectory (A's stale-named dir,
+#   pid file and all) - C's own later zfs_op_unlock() rmdir then fails
+#   on a non-empty directory forever, recoverable only by a reboot.
+#
+# B signals C via a marker file the instant its own mv-aside genuinely
+# completes (not a fixed sleep guess) - C polls for that marker, then
+# fires its own zfs_op_lock() immediately, landing deterministically in
+# the real gap every run.
+d="$(fresh_env)"
+mkdir -p "$d/root/tmp"
+_lock_holder_script "$d/holder.sh" "$d/root" 300
+sh "$d/holder.sh" &
+holder_pid=$!
+lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+i=0
+while [ ! -s "$lock_dir/pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+kill -KILL "$holder_pid" 2>/dev/null || true
+i=0
+while [ -d "/proc/$holder_pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+
+marker="$d/b-mv-aside-done"
+_lock_racer_script "$d/racer_B.sh" "$d/root" \
+    "mv() { _mv_n=\$((\${_mv_n:-0} + 1)); if [ \"\$_mv_n\" = 1 ]; then command sleep 0.3; command mv \"\$@\"; touch '$marker'; command sleep 0.5; else command mv \"\$@\"; fi; }" \
+    "$d/B.out"
+_lock_racer_script "$d/racer_A.sh" "$d/root" '' "$d/A.out"
+cat > "$d/racer_C.sh" <<EOF
+#!/bin/sh
+STUB_ROOT="$d/root"
+export STUB_ROOT
+. "$REPO_ROOT/init/pid-alive.sh"
+. "$REPO_ROOT/init/zfs-unlock.sh"
+i=0
+while [ ! -e "$marker" ] && [ "\$i" -lt 100 ]; do sleep 0.05; i=\$((i + 1)); done
+zfs_op_lock "zroot/ROOT/enc"
+echo "lock_status=\$? pid=\$\$" > "$d/C.out"
+EOF
+chmod +x "$d/racer_C.sh"
+sh "$d/racer_B.sh" &
+b_pid=$!
+sh "$d/racer_A.sh" &
+a_pid=$!
+sh "$d/racer_C.sh" &
+c_pid=$!
+wait "$a_pid" 2>/dev/null
+wait "$c_pid" 2>/dev/null
+wait "$b_pid" 2>/dev/null
+
+c_status="$(sed -n 's/.*lock_status=\([0-9-]*\).*/\1/p' "$d/C.out" 2>/dev/null)"
+c_pid_recorded="$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' "$d/C.out" 2>/dev/null)"
+lock_dir_entries="$(ls -A "$lock_dir" 2>/dev/null)"
+if [ "$c_status" = "0" ] && [ "$lock_dir_entries" = "pid" ]; then
+    rm -f "$lock_dir/pid"
+    if rmdir "$lock_dir" 2>/dev/null; then
+        ok "C's own fresh lock is never nested/wedged by B's mv-back - contains only its own pid file, and releases cleanly"
+    else
+        bad "C's lock directory could not be removed even though it looked clean - something else is wrong"
+    fi
+else
+    echo "C: status=$c_status pid=$c_pid_recorded / lock_dir entries: [$lock_dir_entries]"
+    cat "$d/A.out" "$d/B.out" "$d/C.out" 2>/dev/null
+    bad "C's fresh lock was corrupted by B's mv-back - either C never acquired cleanly, or \$lock_dir now contains more than just C's own pid file (the permanent-wedge shape N4 describes)"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== zfs-unlock.sh: F11 - a lock directory with no pid file at all (holder killed between mkdir and recording ownership) is reclaimed, not permanently wedged =="
+# Regression test for F11 (unidoc-alip's PR #5 follow-up review):
+# mkdir and the pid write immediately after it are not atomic together
+# - a holder genuinely killed (SIGKILL, an OOM kill) in that exact gap
+# leaves a lock directory that EXISTS but has no pid file inside it at
+# all. Before this fix, lock_pid then read empty, the dead-pid
+# liveness check never even ran (it's gated on `[ -n "$lock_pid" ]`),
+# and nothing in this function could ever tell that holder apart from
+# one still legitimately running - permanently wedged, the same
+# severity as N4's own finding, reached through a different gap.
+# Simulates the exact end state a killed-mid-acquire holder leaves
+# behind directly (a real `mkdir`, deliberately with no pid file
+# written into it) rather than timing a real kill against a real
+# process - the fix's own logic only ever examines the end state, not
+# how it arose, so this is a faithful, deterministic reproduction.
+d="$(fresh_env)"
+mkdir -p "$d/root/tmp"
+lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+mkdir -p "$lock_dir" # deliberately no pid file inside
+(
+    set +e
+    STUB_ROOT="$d/root"
+    export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
+    . "$REPO_ROOT/init/zfs-unlock.sh"
+    zfs_op_lock "zroot/ROOT/enc"
+    echo "lock_status=$?"
+) >"$d/out" 2>&1 || true
+if grep -qx "lock_status=0" "$d/out" \
+   && grep -qi "reclaimed an abandoned encryption operation lock" "$d/out" \
+   && [ -s "$lock_dir/pid" ]; then
+    ok "a pid-less lock directory (holder killed between mkdir and recording ownership) is reclaimed after the bounded poll, not left wedged forever"
+else
+    cat "$d/out" 2>/dev/null; ls -la "$lock_dir" 2>/dev/null
+    bad "a pid-less lock directory was not reclaimed - this would wedge every future zfs_op_lock() call on this encryptionroot until the next reboot"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== zfs-unlock.sh: F11 - a lock directory whose pid write is merely in progress (not abandoned) is left alone =="
+# The negative-facing control for F11 above: a genuinely live holder
+# that has mkdir'd but not yet finished writing its own pid file (the
+# real, narrow, legitimate window the bounded poll must not steal from)
+# must NOT be reclaimed. A real background process holds the lock open
+# (writes its own pid, then sleeps) - by the time this test's own
+# zfs_op_lock() call runs, the pid IS already there, so this proves the
+# common "someone else genuinely holds it, and has recorded that"
+# case still correctly refuses, unaffected by the new poll.
+d="$(fresh_env)"
+mkdir -p "$d/root/tmp"
+_lock_holder_script "$d/holder.sh" "$d/root" 5
+sh "$d/holder.sh" &
+holder_pid=$!
+lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+i=0
+while [ ! -s "$lock_dir/pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+(
+    set +e
+    STUB_ROOT="$d/root"
+    export STUB_ROOT
+    . "$REPO_ROOT/init/pid-alive.sh"
+    . "$REPO_ROOT/init/zfs-unlock.sh"
+    zfs_op_lock "zroot/ROOT/enc"
+    echo "lock_status=$?"
+) >"$d/out" 2>&1 || true
+kill -KILL "$holder_pid" 2>/dev/null || true
+if grep -qx "lock_status=1" "$d/out"; then
+    ok "a lock genuinely held by a live process (pid already recorded) is correctly refused, unaffected by the new pid-less-reclaim poll"
+else
+    cat "$d/out"
+    bad "a lock held by a genuinely live holder was incorrectly reclaimed"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== zfs-unlock.sh: zfs_op_lock_retry() itself is a real ~10-poll budget, not just barely wide enough for the other tests' own release timings =="
 # A DIRECT unit test of zfs_op_lock_retry() alone, deliberately not
 # routed through the full zfs_unlock() flow - that flow's own outer
@@ -4554,7 +5105,14 @@ echo "== zfs-unlock.sh: zfs_op_lock_retry() itself is a real ~10-poll budget, no
 d="$(fresh_env)"
 mkdir -p "$d/root/tmp"
 mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
-( sleep 4; rmdir "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc" ) &
+# A real, currently-alive pid (F11, unidoc-alip's PR #5 follow-up
+# review) - without it, this pid-less lock directory would be
+# reclaimed as abandoned after F11's own bounded poll (~250ms), long
+# before this test's own 4-second release, and the background job's
+# plain `rmdir` below would then fail on the reclaiming process's own
+# non-empty (pid file present) directory.
+echo "$$" > "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"
+( sleep 4; rm -f "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"; rmdir "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc" ) &
 release_pid=$!
 (
     set +e
@@ -4582,6 +5140,9 @@ STUB_ZFS_UNLOCK_CORRECT="hunter2"
 export STUB_ZFS_UNLOCK_CORRECT
 mkdir -p "$d/root/tmp"
 mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+# A real, currently-alive pid - see F11's own fixture comment above for
+# why this matters now (unidoc-alip's PR #5 follow-up review).
+echo "$$" > "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"
 # Background job simulates the OTHER terminal's own real load-key+stage
 # completing first (same correct passphrase), then releasing the lock -
 # standing in for a second, genuinely concurrent zfs_unlock() call.
@@ -4589,6 +5150,7 @@ mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
     sleep 0.3
     echo "available" > "$d/state"
     printf 'hunter2' > "$d/root/tmp/zfs-key.zroot_ROOT_enc"
+    rm -f "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"
     rmdir "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
 ) &
 release_pid=$!
@@ -4635,7 +5197,10 @@ STUB_ZFS_UNLOCK_CORRECT="hunter2"
 export STUB_ZFS_UNLOCK_CORRECT
 mkdir -p "$d/root/tmp"
 mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
-( sleep 0.3; echo "unavailable" > "$d/state"; rmdir "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc" ) &
+# A real, currently-alive pid - see F11's own fixture comment above for
+# why this matters now (unidoc-alip's PR #5 follow-up review).
+echo "$$" > "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"
+( sleep 0.3; echo "unavailable" > "$d/state"; rm -f "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"; rmdir "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc" ) &
 release_pid=$!
 (
     set +e
@@ -4704,6 +5269,11 @@ zfs_unlock_env "$d"
 echo "available" > "$d/state"
 mkdir -p "$d/root/tmp"
 mkdir -p "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+# A real, currently-alive pid - see F11's own fixture comment further
+# above for why this matters now (unidoc-alip's PR #5 follow-up
+# review): this test wants an IMMEDIATE, permanent refusal with zero
+# zfs calls, not F11's own bounded-poll-then-reclaim path.
+echo "$$" > "$d/root/tmp/zfs-key-lock.zroot_ROOT_enc/pid"
 (
     set +e
     zfs() { "$STUBS/zfs.unlock" "$@"; }
@@ -4884,6 +5454,75 @@ fi
 # abort the ENTIRE test suite right here, not just this one cleanup
 # step - confirmed the hard way, this exact gap silently truncated
 # every run after this test until fixed.
+kill -KILL "$wrapper_pid" 2>/dev/null || true
+pkill -9 -P "$wrapper_pid" 2>/dev/null || true
+rm -rf "$d"
+
+# =============================================================================
+echo "== zfs-unlock: SIGTERM after zfs_op_lock succeeds but before zfs_op_unlock releases the per-encryptionroot lock, not just the boot lock =="
+# F3 (unidoc-alip's PR #5 follow-up review): distinct from the SIGTERM
+# mid-prompt test above, which lands BEFORE zfs_op_lock() is ever
+# acquired (this file's own header comment: the lock is deliberately
+# never held during the human prompt itself). This test signals in the
+# ONE window that actually exercises the bug - after zfs_op_lock()
+# has succeeded but before that same call has reached its own
+# zfs_op_unlock() - using the non-prompt keylocation path
+# (zfs_unlock.sh lines ~712-734), the shortest real path from "lock
+# acquired" to "a blocking external command runs next" (`zfs load-key`,
+# stubbed here to block indefinitely). Before the F3 fix, nothing in
+# this wrapper's trap chain ever called zfs_op_unlock() for a lock
+# already held at signal time - the lock directory (with a live-looking
+# pid file, since the process really was alive when it wrote it) was
+# left behind, invisible to N4/F11's own dead-pid reclaim until this
+# process's pid was ALSO gone, i.e. exactly the state a clean release
+# reaches immediately anyway. Checking for the lock directory itself
+# being gone (not just the wrapper process exiting, already proven by
+# the test above) is what's new here.
+d="$(fresh_env)"
+cat > "$d/holder.sh" <<EOF
+#!/usr/bin/env bash
+zfs() {
+    if [ "\$1" = "get" ]; then
+        case "\$5" in
+            keystatus) echo "unavailable" ;;
+            keylocation) echo "file:///run/some-key" ;;
+        esac
+    elif [ "\$1" = "load-key" ]; then
+        # A short-poll loop, not a single long sleep - a bash foreground
+        # wait() on a single multi-hundred-second child does NOT get
+        # interrupted promptly by delivery of a trapped signal (confirmed
+        # directly: a bare 300s sleep left the trap unrun for minutes).
+        # Real dialog in _zfs_prompt_once() has the same shape for the
+        # same reason (background + a 1s poll loop, see its own code) -
+        # matching that grain here is what lets SIGTERM actually land
+        # inside this window within the test's own poll budget below.
+        while :; do sleep 1; done
+    fi
+}
+STUB_ROOT="$d/root"
+export STUB_ROOT
+. "$REPO_ROOT/init/zfs-unlock" unlock "zroot/ROOT/enc"
+EOF
+chmod +x "$d/holder.sh"
+lock_dir="$d/root/tmp/zfs-key-lock.zroot_ROOT_enc"
+"$d/holder.sh" >"$d/out" 2>"$d/err" &
+wrapper_pid=$!
+i=0
+while [ ! -e "$lock_dir/pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+if [ ! -e "$lock_dir/pid" ]; then
+    cat "$d/out" "$d/err" 2>/dev/null
+    bad "SIGTERM-after-lock test setup failed - the lock was never even acquired (zfs load-key never reached)"
+else
+    kill -TERM "$wrapper_pid" 2>/dev/null
+    i=0
+    while [ -e "$lock_dir" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    if [ ! -e "$lock_dir" ]; then
+        ok "SIGTERM after zfs_op_lock succeeded released the per-encryptionroot lock via the trap, not just the wrapper process itself"
+    else
+        ls -la "$lock_dir" 2>/dev/null; cat "$d/out" "$d/err" 2>/dev/null
+        bad "SIGTERM after zfs_op_lock succeeded left the per-encryptionroot lock directory behind"
+    fi
+fi
 kill -KILL "$wrapper_pid" 2>/dev/null || true
 pkill -9 -P "$wrapper_pid" 2>/dev/null || true
 rm -rf "$d"

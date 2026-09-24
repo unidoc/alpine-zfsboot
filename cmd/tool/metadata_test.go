@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/unidoc/alpine-zfsboot/internal/cmdline"
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
 	"github.com/unidoc/alpine-zfsboot/internal/metadata"
 )
@@ -158,6 +159,55 @@ func TestWriteMetadata_MissingVersionOrBuildStamp_RefusesToWrite(t *testing.T) {
 				t.Error("writeMetadata must not leave a manifest file behind when it refuses to write one")
 			}
 		})
+	}
+}
+
+// TestPreflightBIOSMetadata_MissingVersionOrBuildStamp_Refuses is the
+// regression test for F8 (unidoc-alip's PR #5 follow-up review):
+// updateBIOS/installBIOS now call preflightBIOSMetadata BEFORE
+// writeBIOSStagesWithRollback, using exactly the same
+// deepMetadataFor+checkMetadataEncodable round trip writeMetadata
+// itself does later - see preflightBIOSMetadata's own comment for why
+// this must run before any disk write at all rather than only inside
+// writePayloadWithRollback (which runs well after stage1/stage2 are
+// already on disk). preflightBIOSMetadata takes no mountpoint or disk
+// argument at all - its signature alone is the proof it cannot write
+// anywhere, independent of what this test checks about its return
+// value.
+func TestPreflightBIOSMetadata_MissingVersionOrBuildStamp_Refuses(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		version, buildStamp string
+	}{
+		{"missing_version", "", "20260923T150000Z"},
+		{"missing_buildstamp", "0.1.0", ""},
+		{"missing_both", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kernel := buildFakeKernelBytes("6.18.53-0-lts")
+			initrd := buildFakeInitrdBytes(t, "2.4.4-1")
+			info := cmdline.Info{Version: tc.version, BuildStamp: tc.buildStamp}
+
+			if err := preflightBIOSMetadata("aarch64", info, kernel, initrd); err == nil {
+				t.Fatal("preflightBIOSMetadata with a missing version/buildstamp: want an error, got nil - updateBIOS/installBIOS would proceed to write stage1/stage2 for a build whose metadata manifest can never be written")
+			}
+		})
+	}
+}
+
+// TestPreflightBIOSMetadata_Valid_NoError is the positive control for
+// the test above: a real, complete version/buildstamp/kernel/initrd
+// combination must NOT be rejected - proving the preflight actually
+// exercises the same real deep-inspection logic writeMetadata's own
+// happy path does (kernelinfo/initrdinfo extraction succeeding, not
+// just "always refuses").
+func TestPreflightBIOSMetadata_Valid_NoError(t *testing.T) {
+	kernel := buildFakeKernelBytes("6.18.53-0-lts")
+	initrd := buildFakeInitrdBytes(t, "2.4.4-1")
+	info := cmdline.Info{Version: "0.1.0", BuildStamp: "20260923T150000Z"}
+
+	if err := preflightBIOSMetadata("aarch64", info, kernel, initrd); err != nil {
+		t.Fatalf("preflightBIOSMetadata with a complete, valid manifest: want nil, got %v", err)
 	}
 }
 

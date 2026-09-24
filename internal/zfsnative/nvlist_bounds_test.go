@@ -45,6 +45,61 @@ func buildCorruptedElemCountPair(t *testing.T, value Value, elem int32) []byte {
 	return b
 }
 
+// TestCheckElemCount_SanityCeiling is a direct unit test of
+// checkElemCount's own maxDecodeElems branch (F14, unidoc-alip's PR #5
+// follow-up review), isolated from the "bytes available" branch by
+// giving it an `available` value large enough that ONLY the sanity
+// ceiling - not the buffer-size arithmetic - could possibly reject
+// nelem. Every DecodeNative-level test elsewhere in this file uses a
+// small, realistic buffer, where the available-bytes check alone would
+// already reject any nelem this large - this is the one place that
+// specifically isolates the ceiling itself. Calling checkElemCount
+// directly (an unexported function, same package) rather than building
+// a real multi-megabyte wire buffer just to reach it.
+func TestCheckElemCount_SanityCeiling(t *testing.T) {
+	err := checkElemCount(maxDecodeElems+1, 1, maxDecodeElems+1)
+	if err == nil {
+		t.Fatal("checkElemCount(maxDecodeElems+1, ...) with more than enough bytes available: want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "sanity limit") {
+		t.Errorf("error = %q, want it to specifically name the sanity-limit case", err.Error())
+	}
+}
+
+// TestCheckElemCount_AtCeilingIsFine is the negative-facing control:
+// exactly maxDecodeElems, with enough bytes available, must be accepted
+// - the ceiling is inclusive of its own boundary.
+func TestCheckElemCount_AtCeilingIsFine(t *testing.T) {
+	if err := checkElemCount(maxDecodeElems, 1, maxDecodeElems); err != nil {
+		t.Errorf("checkElemCount(maxDecodeElems, ...) with exactly enough bytes: want nil, got %v", err)
+	}
+}
+
+// TestCheckElemCount_Negative and TestCheckElemCount_AvailableBytes
+// round out direct coverage of checkElemCount's remaining two branches,
+// the same way the ceiling test above does - one test per branch,
+// calling the function directly rather than only ever exercising it
+// indirectly through a specific decodeScalar/decodePair call site.
+func TestCheckElemCount_Negative(t *testing.T) {
+	err := checkElemCount(-1, 8, 1000)
+	if err == nil {
+		t.Fatal("checkElemCount(-1, ...): want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "negative") {
+		t.Errorf("error = %q, want it to specifically name the negative-count case", err.Error())
+	}
+}
+
+func TestCheckElemCount_AvailableBytes(t *testing.T) {
+	err := checkElemCount(1000, 8, 100) // 1000 elements of 8 bytes each, only 100 bytes available
+	if err == nil {
+		t.Fatal("checkElemCount(1000, 8, 100): want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "bytes available") {
+		t.Errorf("error = %q, want it to specifically name the available-bytes case", err.Error())
+	}
+}
+
 func TestDecodeNative_CorruptedElemCount_ByteArray(t *testing.T) {
 	b := buildCorruptedElemCountPair(t, []byte{1, 2, 3, 4}, 1<<30) // ~1GiB claimed, real payload is 4 bytes
 	if _, err := DecodeNative(b); err == nil {
@@ -61,8 +116,23 @@ func TestDecodeNative_CorruptedElemCount_Uint64Array(t *testing.T) {
 
 func TestDecodeNative_CorruptedElemCount_StringArray(t *testing.T) {
 	b := buildCorruptedElemCountPair(t, []string{"a", "b"}, 1<<20)
-	if _, err := DecodeNative(b); err == nil {
+	_, err := DecodeNative(b)
+	if err == nil {
 		t.Fatal("DecodeNative with a corrupted string-array element count: want an error, got nil")
+	}
+	// F14 (unidoc-alip's PR #5 follow-up review): 1<<20 alone is not
+	// enough to prove decodeScalar's own STRING_ARRAY checkElemCount
+	// call site (nvlist.go, dataTypeStringArray's own case) is what
+	// caught this - confirmed directly: commenting out ONLY that call
+	// site left this test (checking merely err == nil) green, because
+	// the SAME corrupted count still ran out of real string data a few
+	// iterations into decodeScalar's own for-loop and returned a
+	// different, generic "starts past the value region" error instead.
+	// Asserting on checkElemCount's own specific error text closes that
+	// gap - a generic truncation-shaped error no longer satisfies this
+	// test.
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want it to be checkElemCount's own bound error (mentioning \"exceeds\"), not some other decode failure", err.Error())
 	}
 }
 
@@ -87,8 +157,21 @@ func TestDecodeNative_CorruptedElemCount_Negative(t *testing.T) {
 // (decodePair, not decodeScalar) with its own, separate bound.
 func TestDecodeNative_CorruptedElemCount_NVListArray(t *testing.T) {
 	b := buildCorruptedElemCountPair(t, []Nvlist{{"a": uint64(1)}}, 1<<20)
-	if _, err := DecodeNative(b); err == nil {
+	_, err := DecodeNative(b)
+	if err == nil {
 		t.Fatal("DecodeNative with a corrupted nvlist-array element count: want an error, got nil")
+	}
+	// F14 (unidoc-alip's PR #5 follow-up review): 1<<20 alone does not
+	// prove decodePair's own dataTypeNVListArray checkElemCount call
+	// site is what caught this - confirmed directly: commenting out
+	// ONLY that call site left this test (checking merely err == nil)
+	// green, because the same corrupted count still ran decodeBody out
+	// of real buffer a couple of iterations in and returned a
+	// different, generic "nvlist: truncated at %d" error instead.
+	// Asserting on checkElemCount's own specific error text closes that
+	// gap.
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want it to be checkElemCount's own bound error (mentioning \"exceeds\"), not some other decode failure", err.Error())
 	}
 }
 

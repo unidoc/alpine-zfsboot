@@ -334,6 +334,86 @@ func TestCheckMountInfo_BIOS_DiskMatchesViaSymlink(t *testing.T) {
 	}
 }
 
+// TestCheckMountInfo_BIOS_ByIDAliasWithPartitionSuffix is the direct
+// regression test for N5 (unidoc-alip's PR #5 follow-up review), the
+// first of its two failure shapes: a by-id alias that itself embeds a
+// partition suffix in its own NAME (a real, common udev naming
+// convention - "ata-Model_serial-part1"), which DevicePartitionBase
+// was never meant to understand (it only knows real kernel device-
+// naming conventions) and must never be asked to parse BEFORE the
+// symlink is resolved to a real device path.
+func TestCheckMountInfo_BIOS_ByIDAliasWithPartitionSuffix(t *testing.T) {
+	resolve := func(p string) string {
+		if p == "/dev/disk/by-id/ata-Model_serial-part1" {
+			return "/dev/sda1"
+		}
+		return p
+	}
+	err := checkMountInfo("/mnt/alpine/boot/efi", "/dev/disk/by-id/ata-Model_serial-part1", "vfat", true,
+		"/dev/sda", resolve)
+	if err != nil {
+		t.Errorf("want nil - both sides resolve to the same real whole disk (/dev/sda) once the alias is resolved BEFORE DevicePartitionBase runs on it, got: %v", err)
+	}
+}
+
+// TestCheckMountInfo_BIOS_ByUUIDAliasSuffixNeverStripped is N5's second
+// failure shape: a by-uuid alias that carries no partition-like suffix
+// of its own at all, resolving to a real, partition-suffixed device
+// path (/dev/sda1) - DevicePartitionBase must run on THAT resolved
+// path, not on the alias string it replaced.
+func TestCheckMountInfo_BIOS_ByUUIDAliasSuffixNeverStripped(t *testing.T) {
+	resolve := func(p string) string {
+		if p == "/dev/disk/by-uuid/1234-5678" {
+			return "/dev/sda1"
+		}
+		return p
+	}
+	err := checkMountInfo("/mnt/alpine/boot/efi", "/dev/disk/by-uuid/1234-5678", "vfat", true,
+		"/dev/sda", resolve)
+	if err != nil {
+		t.Errorf("want nil - the uuid alias resolves to /dev/sda1, which DevicePartitionBase must then strip to /dev/sda to match diskArg, got: %v", err)
+	}
+}
+
+// TestCanonicalizeMountpoint_RelativePathBecomesAbsolute is the other
+// half of N5 (unidoc-alip's PR #5 follow-up review): a relative --root
+// must resolve to the same absolute form /proc/self/mounts itself
+// reports, or a genuinely-mounted ESP is refused as "not mounted at
+// all".
+func TestCanonicalizeMountpoint_RelativePathBecomesAbsolute(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	got := canonicalizeMountpoint("boot/efi")
+	want := filepath.Join(wd, "boot/efi")
+	if got != want {
+		t.Errorf("canonicalizeMountpoint(%q) = %q, want %q (absolute, relative to the real working directory)", "boot/efi", got, want)
+	}
+}
+
+// TestCanonicalizeMountpoint_SymlinkComponentResolved proves a
+// mountpoint reached through a symlinked PARENT directory (not the
+// mountpoint itself - resolving through the actual mount would follow
+// into the mounted filesystem's own root, not what's being checked
+// here) still canonicalizes to the same real path the kernel reports.
+func TestCanonicalizeMountpoint_SymlinkComponentResolved(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(real, "boot", "efi"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	got := canonicalizeMountpoint(filepath.Join(link, "boot", "efi"))
+	want := filepath.Join(real, "boot", "efi")
+	if got != want {
+		t.Errorf("canonicalizeMountpoint through a symlinked parent = %q, want %q (the real path, matching what /proc/self/mounts itself would report)", got, want)
+	}
+}
+
 func TestSelectESP(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -487,6 +567,19 @@ func TestDevicePartitionBase(t *testing.T) {
 		// whole-disk name already ends in a digit.
 		"/dev/nvme0n1": "/dev/nvme0n1",
 		"/dev/mmcblk0": "/dev/mmcblk0",
+		// F22, unidoc-alip's PR #5 FOLLOW-UP review: the original round
+		// above only covered nvme/mmcblk - loop/nbd/md whole-disk names
+		// (the same "own name already ends in a digit" shape) were
+		// still silently mismatched by partitionSuffixPlain's generic
+		// fallback (md127 -> "md", a real, supported RAID1 boot disk).
+		"/dev/loop0": "/dev/loop0",
+		"/dev/nbd0":  "/dev/nbd0",
+		"/dev/md127": "/dev/md127",
+		"/dev/md0":   "/dev/md0",
+		// And their own real partition-suffixed forms, for symmetry
+		// with nvme0n1p1/mmcblk0p1 above.
+		"/dev/nbd0p1":  "/dev/nbd0",
+		"/dev/md127p1": "/dev/md127",
 	}
 	for in, want := range cases {
 		if got := DevicePartitionBase(in); got != want {

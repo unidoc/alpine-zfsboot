@@ -59,10 +59,18 @@ LIB_DIR="$(cd "$_dir" && pwd)"
 # always shells out to it as a real subprocess - see this file's own
 # header comment), so there is no PID-1-must-never-exit case to guard
 # here at all: every invocation can safely terminate for real.
-trap _zfs_unlock_cleanup_tempfiles EXIT
-trap '_zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 129' HUP
-trap '_zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 130' INT
-trap '_zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 143' TERM
+#
+# _zfs_unlock_release_held_lock (F3, unidoc-alip's PR #5 follow-up
+# review): a signal landing mid zfs_unlock()/zfs_lock() - after
+# zfs_op_lock() has succeeded but before that same call has reached its
+# own zfs_op_unlock() - used to leave the per-encryptionroot lock held
+# with nothing here to ever release it, recoverable only via N4/F11's
+# own dead-pid reclaim path once another session next tried. See that
+# function's own comment (zfs-unlock.sh) for the full reasoning.
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles' EXIT
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 129' HUP
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 130' INT
+trap '_zfs_unlock_release_held_lock; _zfs_unlock_cleanup_tempfiles; trap - EXIT; exit 143' TERM
 
 case "$ACTION" in
     unlock) zfs_unlock "$ENCRYPTIONROOT" ;;

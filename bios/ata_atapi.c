@@ -58,10 +58,12 @@
  * stage's entire execution, citing an `sti` in stage2_entry.S - that
  * `sti` is gone. stage2_entry.S's own current header comment states
  * plainly: interrupts stay OFF for this stage's entire execution now
- * (switch32.S's own brief cli/sti pair around its unreal-mode
- * transition is the one deliberate, narrowly-scoped exception). So
- * the tick counter is unusable here for an even more direct reason
- * than before: with IF=0, it simply never advances at all, not just
+ * (switch32.S's own brief pushfl/cli/popfl - not a plain cli/sti pair,
+ * see that file's own comment on why popfl and not a bare sti - around
+ * its unreal-mode transition is the one deliberate, narrowly-scoped
+ * exception). So the tick counter is unusable here for an even more
+ * direct reason than before: with IF=0, it simply never advances at
+ * all, not just
  * "advancing it would be hazardous."
  *
  * The real incident below is kept, not deleted - it's what a plain
@@ -480,14 +482,54 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 			 * GAS's .code16gcc mode (-m16, see Makefile), where a
 			 * bare string instruction's implicit address/count
 			 * registers default to DI/CX (16-bit), not EDI/ECX,
-			 * unless this prefix says otherwise; `data_buf`/`take`
-			 * are ordinary ints (32-bit, confirmed via DWARF earlier
-			 * in this project's own investigation) and the C operand
-			 * constraints below put them in EDI/ECX, so the
-			 * instruction itself must be told to use the same width.
-			 * `cld` first: guarantees the forward (incrementing)
-			 * direction this depends on, regardless of any assumption
-			 * about DF's state elsewhere in this stage.
+			 * unless this prefix says otherwise. `data_buf` really is
+			 * 32-bit (confirmed via DWARF earlier in this project's
+			 * own investigation), bound to EDI via "+D" below. `cld`
+			 * first: guarantees the forward (incrementing) direction
+			 * this depends on, regardless of any assumption about
+			 * DF's state elsewhere in this stage.
+			 *
+			 * `words` below is deliberately uint32_t, NOT uint16_t
+			 * matching `take`'s own real range (max 65535, checked at
+			 * its own assignment above) - a real, shipped, unidoc-alip
+			 * PR #5 review finding (N1): `addr32` widens rep's OWN
+			 * count register to the FULL 32-bit ECX, not just CX -
+			 * that's the entire reason this prefix is here at all, for
+			 * EDI's sake. A "+c" constraint only promises the value
+			 * GCC itself deposits and later reads back through CX (the
+			 * low 16 bits) matches this variable - it says nothing
+			 * about what's already sitting in ECX's upper 16 bits at
+			 * that moment, and `addr32 rep insw` reads all 32 of them
+			 * as the iteration count regardless of what C-level type
+			 * this operand was declared with. With a uint16_t operand,
+			 * whatever 32-bit value GCC's own register allocator most
+			 * recently happened to leave in ECX (via whichever
+			 * instruction actually loaded it - sometimes a wider
+			 * mov of an unrelated value entirely) leaks straight into
+			 * the repeat count. Confirmed the hard way, by exactly the
+			 * mechanism this predicts: CI's toolchain (gcc 13.3) chose
+			 * to materialize this operand via `mov %eax,%ecx` with
+			 * EAX's own upper 16 bits still holding an unrelated
+			 * earlier value, turning a real ~1024-word (0x0400) native-
+			 * sector transfer into one asking for roughly 4 billion
+			 * words - not a hang at all: `rep insw` does not advance
+			 * EIP again until its own count reaches zero, so a guest
+			 * stuck deep inside this single instruction is
+			 * indistinguishable, from the outside, from one that never
+			 * left `wait_status_clear()`. This project's own local gcc
+			 * (14.2 at the time) happened to zero-extend when loading
+			 * the same uint16_t operand, which is exactly why this
+			 * passed locally and under every local pinned-CI-QEMU-
+			 * binary reproduction attempted, every single time, while
+			 * failing in real CI deterministically - the divergence
+			 * was never QEMU, the runner, or the device at all; it was
+			 * two different compilers making two different (both
+			 * individually legal) choices about a register this
+			 * function never actually owned the width of. `uint32_t`
+			 * forces GCC to materialize the full, correctly zero-
+			 * extended 32-bit value into ECX itself, which is what
+			 * this code always needed regardless of `take`'s own
+			 * logical range.
 			 */
 			if (take > 0) {
 				/* asm_dst is a SCRATCH copy, deliberately separate from
@@ -523,7 +565,7 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 				 * shape QEMU/SeaBIOS never exercises) and would have
 				 * caught this. */
 				uint8_t *asm_dst = data_buf;
-				uint16_t words = take;
+				uint32_t words = take;
 
 				__asm__ __volatile__(
 					"cld\n\t"

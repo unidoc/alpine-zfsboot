@@ -159,17 +159,19 @@
  * used to provide, without guessing at how much bigger some future
  * toolchain might run.
  *
- * UPDATE (F22, unidoc-alip's PR #5 review): re-measured against the
- * REAL Alpine gcc 15.2.0 CI toolchain this project actually ships
- * with (not this sandbox's own Debian cross-compiler, the toolchain
- * every number in the table above was built with) - _bss_end there is
- * 0xe80a, 4070 bytes of margin at NATIVE_BATCH=9. Still real, still
- * comfortable headroom (over the ~4.4KB original design intent behind
- * NATIVE_BATCH=11, and nowhere near check-bss-bounds's own limit) -
- * just a third real data point (sandbox gcc: 5382B, Alpine gcc
- * 15.2.0: 4070B) worth keeping alongside the table above rather than
- * letting it silently stand in as if it were the number that matters
- * for the toolchain real builds actually use.
+ * UPDATE (F22, unidoc-alip's PR #5 follow-up review, correcting a
+ * transcription error in the FIRST review's own re-measurement): re-
+ * measured against the REAL Alpine gcc 15.2.0 CI toolchain this
+ * project actually ships with (not this sandbox's own Debian cross-
+ * compiler, the toolchain every number in the table above was built
+ * with) - _bss_end there is 0xe84a, 4006 bytes of margin at
+ * NATIVE_BATCH=9. Still real, still comfortable headroom (over the
+ * ~4.4KB original design intent behind NATIVE_BATCH=11, and nowhere
+ * near check-bss-bounds's own limit) - just a third real data point
+ * (sandbox gcc: 5382B, Alpine gcc 15.2.0: 4006B) worth keeping
+ * alongside the table above rather than letting it silently stand in
+ * as if it were the number that matters for the toolchain real builds
+ * actually use.
  *
  * Costs a real, modest thing in return: the ATAPI-fallback
  * native-sector backend (cdrom_disk.c's own atapi_read_native() path
@@ -315,34 +317,38 @@ static int int13_read_native(uint32_t native_lba, uint16_t native_count, void *b
  * filter only, always followed by one real, functional test read
  * before trusting this backend for the whole rest of the boot.
  *
- * Known, accepted limitation (F18, unidoc-alip's PR #5 review): this
- * asm passes g_drive_number in via a plain "d" (DX) input constraint,
- * and AH=0x41's own real BIOS return convention can leave DH holding
- * data this code never reads - a bare input operand doesn't tell GCC
- * DX's contents are redefined afterward, so in principle some OTHER
- * live value the compiler happened to also be keeping in DX around
- * this call could be silently corrupted, the same class of finding
- * that got "ebp" added to this file's own int13_read_native() above
- * and to e820.c's INT 0x15 call. Unlike those two, this one could NOT
- * be closed the same way: this function's other three outputs already
- * pin BX ("=b"), CX ("=c"), and DX itself would need a real "+d"
- * capture operand to tell GCC its value is destroyed - confirmed
- * empirically, not just reasoned, that adding either "dx" to the
- * clobber list (invalid - a register can't be both a constraint
- * operand and a clobber) or a "+d" scratch capture operand both fail
- * this file's own real -O2 build with "asm operand has impossible
- * constraints or there are not enough registers", the identical
- * register-exhaustion failure e820.c's own comment already documents
- * for its unrelated "edi" case - this function's tightly-packed
- * 4-operand set (carry/bx/cx/dx) genuinely has no register budget left
- * for a fifth. In practice: g_drive_number is a plain uint8_t global,
- * reloaded from memory wherever it's next used rather than kept live
- * in a register across this call, so the actual corruption window this
- * leaves open is narrow (the compiler would have to independently
- * choose to cache some OTHER unrelated value in DX spanning this exact
- * asm statement) - not proven impossible, but real testing (this
- * file's own build, both real QEMU boot paths) shows no evidence of it
- * actually happening with this compiler/flags today.
+ * F18 (unidoc-alip's PR #5 review, closed by the follow-up review):
+ * this asm passes g_drive_number in via a plain "d" (DX) input
+ * constraint, and AH=0x41's own real BIOS return convention can leave
+ * DH holding data this code never reads - a bare input operand doesn't
+ * tell GCC DX's contents are redefined afterward, so in principle some
+ * OTHER live value the compiler happened to also be keeping in DX
+ * around this call could be silently corrupted, the same class of
+ * finding that got "ebp" added to this file's own int13_read_native()
+ * above and to e820.c's INT 0x15 call. Unlike those two, a GCC-level
+ * fix (a real "+d" capture operand telling GCC DX is destroyed) does
+ * NOT fit here - confirmed empirically, not just reasoned, that adding
+ * either "dx" to the clobber list (invalid - a register can't be both
+ * a constraint operand and a clobber) or a "+d" scratch capture
+ * operand both fail this file's own real -O2 build with "asm operand
+ * has impossible constraints or there are not enough registers", the
+ * identical register-exhaustion failure e820.c's own comment already
+ * documents for its unrelated "edi" case - this function's tightly-
+ * packed 4-operand set (carry/bx/cx/dx) genuinely has no register
+ * budget left for a fifth.
+ *
+ * The actual fix needs no extra operand at all: push %dx onto the
+ * stack as the asm block's own first instruction (BEFORE anything
+ * could touch it), pop it back as its second-to-last (after int $0x13
+ * returns, before setc reads the carry flag - `pop` does not itself
+ * touch EFLAGS, so this ordering is safe). GCC is never told DX
+ * changed because, from its own point of view, it genuinely didn't:
+ * whatever value it handed this asm block in DX is exactly what comes
+ * back out, regardless of what the BIOS did to DH/DL internally in
+ * between - the same class of protection "ebp" gets elsewhere in this
+ * file, achieved here via the stack instead of a constraint, at the
+ * cost of 2 bytes of stack space for the asm block's own duration and
+ * nothing else.
  */
 static int int13_extensions_present(void)
 {
@@ -350,9 +356,11 @@ static int int13_extensions_present(void)
 	uint8_t carry;
 
 	__asm__ __volatile__(
+		"pushw %%dx\n\t"
 		"movw $0x55aa, %%bx\n\t"
 		"movb $0x41, %%ah\n\t"
 		"int $0x13\n\t"
+		"popw %%dx\n\t"
 		"setc %0\n\t"
 		: "=q"(carry), "=b"(result_bx), "=c"(result_cx)
 		: "d"(g_drive_number)

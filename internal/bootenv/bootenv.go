@@ -336,8 +336,37 @@ func FindMountAtPath(mountpoint string) (dev, fstype string, ok bool) {
 // no corresponding check to add here, since there is no second disk
 // argument to compare against in the first place).
 func VerifyESPMounted(mountpoint, diskArg string) error {
-	dev, fstype, ok := FindMountAtPath(mountpoint)
+	dev, fstype, ok := FindMountAtPath(canonicalizeMountpoint(mountpoint))
 	return checkMountInfo(mountpoint, dev, fstype, ok, diskArg, resolveSymlinkOrSelf)
+}
+
+// canonicalizeMountpoint is VerifyESPMounted's own pure normalization
+// step, split out for testability the same way checkMountInfo/
+// parseMountAtPath already are (a real filepath.Abs/EvalSymlinks-backed
+// function has no meaningful way to inject a fake filesystem view, but
+// its OWN transform logic - "make relative absolute, then resolve
+// symlink components" - is worth pinning down directly).
+//
+// N5 (unidoc-alip's PR #5 follow-up review): /proc/self/mounts always
+// reports mountpoints as absolute, canonical paths (the kernel's own
+// resolved view) - FindMountAtPath's own parseMountAtPath does a plain
+// exact-string comparison against whatever it's given, with no
+// normalization of its own. A relative --root (a real, supported case -
+// install's own --root flag defaults to "/" but accepts any path) or
+// one reached through a symlink component would never exact-match the
+// kernel's own canonical form, even though the filesystem genuinely IS
+// mounted there - failing closed as "not a mounted filesystem at all"
+// rather than a wrong-disk write, per VerifyESPMounted's own doc
+// comment, but a real false refusal all the same. resolveSymlinkOrSelf
+// already tolerates a path that doesn't fully resolve (falls back to
+// its input), so canonicalizing costs nothing in the cases that were
+// already working.
+func canonicalizeMountpoint(mountpoint string) string {
+	canonical := mountpoint
+	if abs, err := filepath.Abs(mountpoint); err == nil {
+		canonical = abs
+	}
+	return resolveSymlinkOrSelf(canonical)
 }
 
 // checkMountInfo is VerifyESPMounted's own pure decision logic, split
@@ -355,8 +384,26 @@ func checkMountInfo(mountpoint, dev, fstype string, found bool, diskArg string, 
 	if diskArg == "" {
 		return nil
 	}
-	gotDisk := resolveSymlink(DevicePartitionBase(dev))
-	wantDisk := resolveSymlink(diskArg)
+	// N5 (unidoc-alip's PR #5 follow-up review): resolve the symlink
+	// FIRST, then strip the partition suffix - not the other order.
+	// DevicePartitionBase only understands real kernel device-naming
+	// conventions (/dev/sdX, /dev/nvmeXnYpZ, ...), never the
+	// /dev/disk/by-id or /dev/disk/by-uuid alias schemes - called on an
+	// UNRESOLVED "/dev/disk/by-id/ata-X-part1", none of its regexes
+	// match, and it silently returns the alias path unchanged
+	// ("ata-X-part1", not stripped to a whole-disk name at all) rather
+	// than the real "/dev/sda". A "/dev/disk/by-uuid/..." alias fails
+	// the OTHER way: it resolves to a real "/dev/sda1", but only AFTER
+	// DevicePartitionBase already ran on the alias and had nothing to
+	// strip, so the partition suffix survives into the final
+	// comparison. Both shapes then compare a partition-suffixed (or
+	// alias-mangled) path against dev's own correctly-stripped
+	// whole-disk name and refuse as a mismatch - fails closed (a wrong
+	// refusal, not a wrong-disk write, per this function's own doc
+	// comment), but a real false refusal on install's own documented
+	// <disk> argument accepting exactly these alias forms.
+	gotDisk := DevicePartitionBase(resolveSymlink(dev))
+	wantDisk := DevicePartitionBase(resolveSymlink(diskArg))
 	if gotDisk != wantDisk {
 		return fmt.Errorf("%s's own filesystem (%s, on disk %s) does not match the disk argument (%s) - stage1/stage2 and the boot payload would land on two different disks", mountpoint, dev, gotDisk, wantDisk)
 	}
@@ -611,17 +658,28 @@ func DetectDiskLayout(disk string) (DiskLayout, error) {
 var (
 	partitionSuffixP     = regexp.MustCompile(`^(.*\d)p(\d+)$`)
 	partitionSuffixPlain = regexp.MustCompile(`^(.*[a-zA-Z])(\d+)$`)
-	// nvmeOrMMCWholeDisk matches an nvme namespace or mmcblk WHOLE-DISK
-	// name that itself ends in a digit (nvme0n1, mmcblk0) - see
-	// DevicePartitionBase's own comment on the real, confirmed bug
-	// this guards: partitionSuffixPlain's "any trailing digit is a
-	// partition number" heuristic is correct for sda/vda-style names
-	// (whole disk never ends in a digit there), but WRONG for these
-	// two device classes, whose own whole-disk name already ends in a
-	// digit by convention - a real partition of either always adds an
-	// explicit "p<N>" (matched by partitionSuffixP above, tried
-	// first), never a bare digit.
-	nvmeOrMMCWholeDisk = regexp.MustCompile(`(nvme\d+n\d+|mmcblk\d+)$`)
+	// pSuffixWholeDisk matches a WHOLE-DISK name, from any device class
+	// whose own convention already ends its whole-disk name in a digit
+	// (nvme0n1, mmcblk0, loop0, nbd0, md127) - see DevicePartitionBase's
+	// own comment on the real, confirmed bug this guards:
+	// partitionSuffixPlain's "any trailing digit is a partition number"
+	// heuristic is correct for sda/vda-style names (whole disk never
+	// ends in a digit there), but WRONG for every device class here,
+	// each of which always adds an explicit "p<N>" for a real partition
+	// (matched by partitionSuffixP above, tried first) rather than a
+	// bare trailing digit.
+	//
+	// loop/nbd/md (F22, unidoc-alip's PR #5 follow-up review): the
+	// original version of this pattern only covered nvme/mmcblk - a
+	// software-RAID (md, common for a real redundant boot disk pair)
+	// or loop/nbd whole-disk device name was still silently mismatched
+	// by partitionSuffixPlain's own generic fallback (md127 -> "md",
+	// loop0 -> "loop", nbd0 -> "nbd") the exact same wrong way nvme/
+	// mmcblk used to be - meaning an ESP that install/verify correctly
+	// discovers as living on "/dev/md127" would compare that whole-disk
+	// name against a mangled "md" and refuse as a disk mismatch, on a
+	// real, supported RAID1 boot disk.
+	pSuffixWholeDisk = regexp.MustCompile(`(nvme\d+n\d+|mmcblk\d+|loop\d+|nbd\d+|md\d+)$`)
 )
 
 // DevicePartitionBase returns the whole-disk device path for a
@@ -637,19 +695,21 @@ var (
 // case here should ever fail for a real blkid-reported device path.
 //
 // A real gap a follow-up review found (F22, unidoc-alip's PR #5
-// review): called on an ALREADY-whole-disk nvme/mmcblk name (no "p<N>"
-// partition suffix at all - "/dev/nvme0n1", "/dev/mmcblk0"),
+// review): called on an ALREADY-whole-disk nvme/mmcblk/loop/nbd/md
+// name (no "p<N>" partition suffix at all - "/dev/nvme0n1",
+// "/dev/mmcblk0", "/dev/loop0", "/dev/nbd0", "/dev/md127"),
 // partitionSuffixPlain's own generic "trailing digit = partition
 // number" fallback used to match anyway (nvme0n1 -> nvme0n,
-// mmcblk0 -> mmcblk) - wrong, and silently so, since nothing about
-// that shape signals an error on its own. nvmeOrMMCWholeDisk, checked
-// BEFORE falling through to that generic heuristic, recognizes this
-// specific shape and returns it unchanged instead.
+// mmcblk0 -> mmcblk, md127 -> md) - wrong, and silently so, since
+// nothing about that shape signals an error on its own.
+// pSuffixWholeDisk, checked BEFORE falling through to that generic
+// heuristic, recognizes every one of these shapes and returns it
+// unchanged instead.
 func DevicePartitionBase(part string) string {
 	if m := partitionSuffixP.FindStringSubmatch(part); m != nil {
 		return m[1]
 	}
-	if nvmeOrMMCWholeDisk.MatchString(part) {
+	if pSuffixWholeDisk.MatchString(part) {
 		return part
 	}
 	if m := partitionSuffixPlain.FindStringSubmatch(part); m != nil {

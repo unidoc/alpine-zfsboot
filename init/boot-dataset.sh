@@ -84,6 +84,45 @@ boot_lock_acquire() {
         return 0
     fi
     lock_pid="$(cat "$boot_lock_dir/pid" 2>/dev/null)"
+    # F11 (unidoc-alip's PR #5 follow-up review) - same real gap as
+    # zfs_op_lock's own identical fix (zfs-unlock.sh, see its own
+    # comment for the full reasoning): mkdir above and the pid write
+    # below it are not atomic together, so a holder killed in that
+    # exact gap leaves a lock directory with no pid file - permanently
+    # wedged, since lock_pid then reads empty and the dead-pid check
+    # below never runs at all. A brief, bounded poll first: the pid
+    # write is a single near-instant tmpfs write, so if it still hasn't
+    # appeared after several short checks, this is genuinely abandoned.
+    if [ -z "$lock_pid" ]; then
+        _i=0
+        while [ -z "$lock_pid" ] && [ "$_i" -lt 5 ]; do
+            sleep 0.05
+            lock_pid="$(cat "$boot_lock_dir/pid" 2>/dev/null)"
+            _i=$((_i + 1))
+        done
+        if [ -z "$lock_pid" ]; then
+            stale="$boot_lock_dir.stale.$$"
+            if mv "$boot_lock_dir" "$stale" 2>/dev/null; then
+                moved_pid="$(cat "$stale/pid" 2>/dev/null)"
+                if [ -n "$moved_pid" ]; then
+                    if [ ! -e "$boot_lock_dir" ]; then
+                        mv "$stale" "$boot_lock_dir" 2>/dev/null
+                    else
+                        rm -rf "$stale"
+                    fi
+                    return 1
+                fi
+                rm -rf "$stale"
+                if mkdir "$boot_lock_dir" 2>/dev/null; then
+                    echo "$$" > "$boot_lock_dir/pid" 2>/dev/null
+                    boot_lock_held=1
+                    msg "reclaimed an abandoned boot lock for $DATASET (no owner pid was ever recorded - a previous holder was likely killed between acquiring the lock and recording ownership)"
+                    return 0
+                fi
+            fi
+        fi
+        return 1
+    fi
     # command -v guard: same fail-closed reasoning as zfs_op_lock's own
     # identical guard - a missing _pid_alive must never be silently
     # treated as "the holder is dead" (that would make bypassing this
@@ -109,7 +148,25 @@ boot_lock_acquire() {
             # stealing it.
             moved_pid="$(cat "$stale/pid" 2>/dev/null)"
             if [ "$moved_pid" != "$lock_pid" ]; then
-                mv "$stale" "$boot_lock_dir" 2>/dev/null
+                # N4 (unidoc-alip's PR #5 follow-up review) - same real
+                # race as zfs_op_lock's own identical fix (zfs-unlock.sh,
+                # see its own comment for the full reasoning): a THIRD
+                # process can `mkdir "$boot_lock_dir"` (its own plain
+                # fast path) in the gap between this process's mv-aside
+                # and this mv-back. `mv src dst` onto an EXISTING
+                # directory nests src inside it rather than failing or
+                # replacing it - moving back onto a since-recreated
+                # $boot_lock_dir would permanently wedge that third
+                # party's own lock (their later release_boot_lock()'s
+                # `rmdir` fails on a non-empty directory forever after,
+                # recoverable only by a reboot). Checking existence
+                # immediately before the mv-back closes that
+                # deterministic, unrecoverable outcome.
+                if [ ! -e "$boot_lock_dir" ]; then
+                    mv "$stale" "$boot_lock_dir" 2>/dev/null
+                else
+                    rm -rf "$stale"
+                fi
                 return 1
             fi
             rm -rf "$stale"
@@ -174,12 +231,18 @@ release_boot_lock() {
 # exactly the double-ZFS-prompt bug this project's kexec handoff fix
 # exists to remove, reintroduced by this cleanup path. staged_by_me is
 # a plain global (no `local` in this codebase's shell, same convention
-# every other cross-function variable here already uses), set ONLY at
-# zfs_unlock()'s own two real zfs_stage_secret success sites
-# (zfs-unlock.sh) - so this process only ever removes a stage it
-# actually created itself, never one it merely found already staged
-# (zfs_unlock()'s own "already unlocked and staged... discarding this
-# passphrase" early-return path never sets it) or one another session
+# every other cross-function variable here already uses), set ONLY
+# inside zfs_stage_secret() itself (zfs-unlock.sh), immediately before
+# the rename that actually publishes the secret - not by either of
+# zfs_unlock()'s own two call sites after the whole call has already
+# returned (N3, unidoc-alip's PR #5 follow-up review closed a real
+# signal race here: `mv` is an external command, and a signal landing
+# while the shell merely waits on it could leave the rename genuinely
+# complete with the flag not yet set under the old shape) - so this
+# process only ever removes a stage it actually created itself, never
+# one it merely found already staged (zfs_unlock()'s own "already
+# unlocked and staged... discarding this passphrase" early-return path
+# never sets it) or one another session
 # is using.
 _cleanup_secrets() {
     if [ -n "${kexec_initrd:-}" ] && [ "${kexec_initrd:-}" != "${initrd:-}" ]; then
@@ -199,6 +262,18 @@ _cleanup_secrets() {
     # top-level sourcing order), but defined defensively anyway, same
     # reasoning as every other command -v guard in this project.
     command -v _zfs_unlock_cleanup_tempfiles >/dev/null 2>&1 && _zfs_unlock_cleanup_tempfiles
+    # F3 (unidoc-alip's PR #5 follow-up review): this file calls
+    # zfs_unlock()/zfs_lock() in-process (see this script's own header
+    # comment), so a signal landing anywhere inside one of those calls'
+    # own body - after zfs_op_lock() succeeded but before that same call
+    # reached its own zfs_op_unlock() - used to leave the per-
+    # encryptionroot lock held with nothing in THIS file's trap to ever
+    # release it, same gap as the standalone zfs-unlock wrapper (see
+    # zfs-unlock.sh's own comment on _zfs_unlock_release_held_lock for
+    # the full reasoning). Distinct from release_boot_lock below, which
+    # is this file's own separate whole-boot lock, not the per-
+    # encryptionroot one.
+    command -v _zfs_unlock_release_held_lock >/dev/null 2>&1 && _zfs_unlock_release_held_lock
 }
 
 # _on_exit_cleanup - the actual EXIT trap target: removes every
@@ -488,6 +563,26 @@ _recovery_shell_child() {
 # cleanly - that just ends the one SSH command normally, the same way
 # any other finished remote command would.
 lose_boot_race() {
+    # F2 (unidoc-alip's PR #5 follow-up review): staged_by_me, if this
+    # process is the one that staged the handoff secret earlier in its
+    # own run, is cleared to 0 HERE, before the EXIT trap below (via
+    # _cleanup_secrets()) can act on it. "Losing the race" means, by
+    # definition, some OTHER session is the one actually proceeding
+    # with THIS dataset's boot right now - and since the staged secret
+    # is published at a path keyed by encryptionroot, not by process,
+    # that other session may well be relying on the EXACT stage this
+    # process itself created a moment ago (e.g. this session unlocked
+    # and staged it, then lost boot_lock_acquire to a session that
+    # arrived first and was already mid-boot). staged_by_me alone (N3)
+    # only ever protected a DIFFERENT process's stage from being
+    # deleted by a losing session that never staged anything itself -
+    # it does nothing for the case where the losing session IS the one
+    # that staged it. Never deleting a self-staged secret on the
+    # specific "stepping back, someone else has this" path is a strictly
+    # safer failure mode than deleting a secret a still-booting session
+    # needs - worst case here is a secret sitting in tmpfs a little
+    # longer than the single-owner-at-a-time norm, not a re-prompt.
+    staged_by_me=0
     msg "another session is already proceeding with booting $DATASET - stepping back"
     if [ "$$" -eq 1 ]; then
         _recovery_shell
@@ -996,6 +1091,32 @@ fi
 
 msg "kexec -l succeeded, unmounting and exporting $POOL before the jump"
 
+# N2 (unidoc-alip's PR #5 follow-up review): this BE's own confirm-
+# service files MUST be read before the umount two lines below, not
+# after - a real, shipped regression the F21 pre-check above introduced
+# by moving the umount earlier in this file without moving every read
+# of $ROOTFS/mnt/root along with it. The bootcheck block further down
+# used to run before this umount existed at all; once it started
+# running AFTER an umount of the very path it reads
+# ($ROOTFS/mnt/root/etc/runlevels/.../etc/init.d/...), both file tests
+# became permanently false - not "sometimes wrong", every single armed
+# BE on every single boot silently disarmed itself
+# (org.alpinezfsboot:bootcheck reset to armed:0) instead of ever
+# incrementing, making the whole failed-boot-counter/forced-rescue
+# mechanism permanently inert. Confirmed the hard way (per the review):
+# a harness whose `umount` stub actually hides the mounted content
+# showed armed:3 before this fix's own predecessor moved the umount up,
+# armed:0/"disarming" after. Computed here, while the mount still
+# exists, and used (not recomputed) inside that later block.
+bootcheck_confirm_svc="$ROOTFS/mnt/root/etc/runlevels/default/alpine-zfsboot-bootcheck"
+bootcheck_confirm_script="$ROOTFS/mnt/root/etc/init.d/alpine-zfsboot-bootcheck"
+if { [ -L "$bootcheck_confirm_svc" ] || [ -f "$bootcheck_confirm_svc" ]; } \
+   && [ -f "$bootcheck_confirm_script" ]; then
+    bootcheck_confirm_present=1
+else
+    bootcheck_confirm_present=0
+fi
+
 umount "$ROOTFS"/mnt/root 2>/dev/null
 
 # F21 (unidoc-alip's PR #5 review): a read-only busy pre-check, BEFORE
@@ -1145,10 +1266,13 @@ if [ "${ALPINE_ZFSBOOT_BOOTCHECK:-}" != "off" ]; then
             ;;
     esac
     if [ -n "$bootcheck_k" ] && [ "$bootcheck_source" = "local" ]; then
-        bootcheck_confirm_svc="$ROOTFS/mnt/root/etc/runlevels/default/alpine-zfsboot-bootcheck"
-        bootcheck_confirm_script="$ROOTFS/mnt/root/etc/init.d/alpine-zfsboot-bootcheck"
-        if { [ -L "$bootcheck_confirm_svc" ] || [ -f "$bootcheck_confirm_svc" ]; } \
-           && [ -f "$bootcheck_confirm_script" ]; then
+        # bootcheck_confirm_present was computed BEFORE the umount
+        # above, while $ROOTFS/mnt/root still pointed at this BE's real
+        # mounted filesystem (N2, unidoc-alip's PR #5 follow-up review)
+        # - re-testing bootcheck_confirm_svc/bootcheck_confirm_script
+        # here, now, would test paths under an already-unmounted
+        # directory and always read as absent.
+        if [ "$bootcheck_confirm_present" = 1 ]; then
             if zfs set "org.alpinezfsboot:bootcheck=armed:$((bootcheck_k + 1))" "$DATASET" 2>/dev/null; then
                 msg "bootcheck: $DATASET attempt $((bootcheck_k + 1)) recorded"
             else

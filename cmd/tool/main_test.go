@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -437,6 +438,74 @@ func TestCheckUpdateEligible(t *testing.T) {
 		// a plausible partition table, zero content at LBA 34.
 		if err := checkUpdateEligible(disk); err == nil {
 			t.Error("checkUpdateEligible on a disk with no alpine-zfsboot stage2 at all: want an error, got nil")
+		}
+	})
+}
+
+// TestCheckBIOSUpToDate is the regression test for F16 (unidoc-alip's
+// PR #5 follow-up review): BIOS update used to have no build
+// comparison at all, unlike UEFI's own latest.BuildStamp <=
+// local.BuildStamp check - `update -y` rewrote every artifact on every
+// run, and a retracted/rolled-back "latest" release applied as a
+// silent downgrade.
+func TestCheckBIOSUpToDate(t *testing.T) {
+	writeCmdline := func(t *testing.T, mountpoint, buildStamp string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(mountpoint, layout.ESPDir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		content := fmt.Sprintf("root=ZFS=zroot/ROOT/default ro alpine-zfsboot.version=0.1.0 alpine-zfsboot.buildstamp=%s\n", buildStamp)
+		if err := os.WriteFile(filepath.Join(mountpoint, layout.CmdlineFile), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("new build strictly newer than installed - not up to date", func(t *testing.T) {
+		mountpoint := t.TempDir()
+		writeCmdline(t, mountpoint, "20260101T000000Z")
+		installed, upToDate := checkBIOSUpToDate(mountpoint, "20260201T000000Z")
+		if upToDate {
+			t.Errorf("checkBIOSUpToDate with a strictly newer build: want upToDate=false, got true (installed=%q)", installed)
+		}
+	})
+
+	t.Run("new build identical to installed - up to date, refuses a same-build reinstall", func(t *testing.T) {
+		mountpoint := t.TempDir()
+		writeCmdline(t, mountpoint, "20260101T000000Z")
+		installed, upToDate := checkBIOSUpToDate(mountpoint, "20260101T000000Z")
+		if !upToDate || installed != "20260101T000000Z" {
+			t.Errorf("checkBIOSUpToDate with the SAME build: want upToDate=true installed=20260101T000000Z, got upToDate=%v installed=%q", upToDate, installed)
+		}
+	})
+
+	t.Run("new build OLDER than installed - up to date, refuses a silent downgrade", func(t *testing.T) {
+		mountpoint := t.TempDir()
+		writeCmdline(t, mountpoint, "20260201T000000Z")
+		installed, upToDate := checkBIOSUpToDate(mountpoint, "20260101T000000Z")
+		if !upToDate || installed != "20260201T000000Z" {
+			t.Errorf("checkBIOSUpToDate with an OLDER build (a retracted/rolled-back release): want upToDate=true installed=20260201T000000Z, got upToDate=%v installed=%q", upToDate, installed)
+		}
+	})
+
+	t.Run("no installed CMDLINE at all - skipped, never refused", func(t *testing.T) {
+		mountpoint := t.TempDir() // no CMDLINE written at all
+		installed, upToDate := checkBIOSUpToDate(mountpoint, "20260101T000000Z")
+		if upToDate || installed != "" {
+			t.Errorf("checkBIOSUpToDate with no installed CMDLINE: want upToDate=false installed=\"\", got upToDate=%v installed=%q - a pre-feature installation must never be blocked from updating", upToDate, installed)
+		}
+	})
+
+	t.Run("installed CMDLINE has no buildstamp field at all - skipped, never refused", func(t *testing.T) {
+		mountpoint := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(mountpoint, layout.ESPDir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(mountpoint, layout.CmdlineFile), []byte("root=ZFS=zroot/ROOT/default ro\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		installed, upToDate := checkBIOSUpToDate(mountpoint, "20260101T000000Z")
+		if upToDate || installed != "" {
+			t.Errorf("checkBIOSUpToDate with a buildstamp-less installed CMDLINE: want upToDate=false installed=\"\", got upToDate=%v installed=%q", upToDate, installed)
 		}
 	})
 }

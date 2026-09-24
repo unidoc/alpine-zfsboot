@@ -298,6 +298,19 @@ type report struct {
 	metadataPresent bool
 	metadataErr     error
 
+	// metadataVerified is set by newVerifyCmd's Run closure, never by
+	// inspect() itself - true only when verifyMetadata() actually ran
+	// (verify always calls it; status never does) and found no
+	// discrepancy. Distinct from metadataPresent (a manifest file
+	// merely existing and decoding is not the same claim as its
+	// recorded hash(es) having just been checked against the real
+	// installed payload) - print()'s own "Metadata:" line uses this to
+	// tell a genuinely-confirmed result apart from the "from manifest,
+	// unconfirmed" case, so `verify` never tells the user to go run
+	// `verify` while reporting the real answer as `verify: OK` two
+	// lines later.
+	metadataVerified bool
+
 	zfs zfsCompat
 }
 
@@ -601,6 +614,13 @@ func (r report) print(verbose bool) {
 	printField("Kernel version", r.kernelVersionErr, kernelinfo.ShortVersion(r.kernelVersion))
 	printField("OpenZFS", r.openZFSVersionErr, r.openZFSVersion)
 	switch {
+	case r.metadataVerified:
+		// Only ever true when the caller is `verify` (status never sets
+		// this field) and verifyMetadata() actually re-derived and
+		// compared the real payload's hash(es) against the manifest,
+		// finding no discrepancy - the genuine, confirmed answer, not
+		// the "from manifest, unconfirmed" case below.
+		fmt.Printf("  %-20s OK (confirmed against the real installed payload)\n", "Metadata:")
 	case r.metadataErr != nil:
 		fmt.Printf("  %-20s ERROR (%v)\n", "Metadata:", r.metadataErr)
 	case r.metadataPresent:
@@ -612,7 +632,14 @@ func (r report) print(verbose bool) {
 		// for real: after a crash between a payload write and its own
 		// metadata write, status silently reported a stale generation
 		// while `verify` correctly caught it via both SHA-256 fields -
-		// `verify` is the actual acceptance check, not `status`.
+		// `verify` is the actual acceptance check, not `status`. When
+		// the caller IS `verify`, this branch only prints if the real
+		// check actually found a discrepancy (metadataVerified stays
+		// false) - that mismatch is then spelled out explicitly in the
+		// "problem(s) found" list below, so the advice here isn't
+		// circular even in that case; it's only ever circular-sounding
+		// noise in the common, healthy `status` case this line exists
+		// for.
 		fmt.Printf("  %-20s from manifest (run 'alpine-zfsboot verify' to confirm it matches the real payload)\n", "Metadata:")
 	default:
 		fmt.Printf("  %-20s MISSING (deep-inspected instead - run 'alpine-zfsboot verify --repair' to add it)\n", "Metadata:")
@@ -924,7 +951,9 @@ a later step like a partition-table reread or a reboot.`,
 
 			r := inspect(t)
 			errs := appendCompatErr(r.errs(), r)
-			errs = append(errs, verifyMetadata(t, deep, repair)...)
+			metaErrs := verifyMetadata(t, deep, repair)
+			r.metadataVerified = len(metaErrs) == 0
+			errs = append(errs, metaErrs...)
 
 			if t.uefi {
 				if efiFile != "" {
@@ -1357,27 +1386,71 @@ func writeMetadata(mountpoint, arch, version, buildStamp string, kernelBytes, in
 	if err != nil {
 		return err
 	}
-	enc := metadata.Encode(m)
-	// F8 (unidoc-alip's PR #5 review): metadata.Decode requires
-	// version/buildstamp non-empty, but metadata.Encode validates
-	// nothing, and the BIOS install/update path takes both values from
-	// cmdline.ParseText, which does not require them either - a custom
-	// --cmdline-file or a hand-edited CMDLINE missing either field used
-	// to write a manifest that decoded cleanly at the moment of
-	// writing (Encode doesn't check) but that every LATER `verify`
-	// then rejected with "missing required field(s)" - and, because it
-	// EXISTS, `verify --repair` correctly refuses to touch it (see
-	// verifyMetadata's own doc comment on why a present-but-broken
-	// manifest is never auto-repaired) - leaving the installation stuck
-	// failing verify until an operator deletes the file by hand. A
-	// real round-trip through Decode before ever writing catches this
-	// at the moment it's actually preventable (install/update can
-	// still roll back the whole generation), instead of only ever
-	// being discovered by a later verify with no clean way out.
-	if _, err := metadata.Decode(enc); err != nil {
-		return fmt.Errorf("refusing to write a metadata manifest that would not decode: %w", err)
+	enc, err := checkMetadataEncodable(m)
+	if err != nil {
+		return err
 	}
 	return espconfig.WriteFile(mountpoint, layout.MetadataFile, enc, 0o644)
+}
+
+// checkMetadataEncodable is the Encode-then-Decode round trip shared by
+// writeMetadata (right before its own write) and preflightBIOSMetadata
+// (before ANY disk write at all, BIOS install/update - see that
+// function's own comment for why it needs to run this early). Pure,
+// no I/O - m is already fully assembled by the caller (deepMetadataFor
+// or preflightBIOSMetadata's own equivalent call to it).
+//
+// F8 (unidoc-alip's PR #5 review): metadata.Decode requires
+// version/buildstamp non-empty, but metadata.Encode validates nothing,
+// and the BIOS install/update path takes both values from
+// cmdline.ParseText, which does not require them either - a custom
+// --cmdline-file or a hand-edited CMDLINE missing either field used to
+// write a manifest that decoded cleanly at the moment of writing
+// (Encode doesn't check) but that every LATER `verify` then rejected
+// with "missing required field(s)" - and, because it EXISTS, `verify
+// --repair` correctly refuses to touch it (see verifyMetadata's own
+// doc comment on why a present-but-broken manifest is never auto-
+// repaired) - leaving the installation stuck failing verify until an
+// operator deletes the file by hand. A real round-trip through Decode
+// before ever writing catches this at the moment it's actually
+// preventable.
+func checkMetadataEncodable(m metadata.Manifest) ([]byte, error) {
+	enc := metadata.Encode(m)
+	if _, err := metadata.Decode(enc); err != nil {
+		return nil, fmt.Errorf("refusing to write a metadata manifest that would not decode: %w", err)
+	}
+	return enc, nil
+}
+
+// preflightBIOSMetadata runs the exact same deepMetadataFor +
+// checkMetadataEncodable round trip writeMetadata itself will do
+// later, but here purely to fail BEFORE writeBIOSStagesWithRollback
+// ever touches the disk (F8, unidoc-alip's PR #5 follow-up review).
+//
+// Without this, installBIOS/updateBIOS called writeBIOSStagesWithRollback
+// first and only reached writeMetadata's own round-trip check several
+// steps later, inside writePayloadWithRollback. writePayloadWithRollback
+// correctly rolls back its OWN write (the KERNEL/INITRD/CMDLINE
+// payload) on a writeMetadata failure - but it has no way to also
+// undo a stage1/stage2 write that already succeeded and returned
+// before it was ever called. A cmdline/kernel/initrd combination that
+// fails this round trip (the same "custom --cmdline-file missing
+// version/buildstamp" case writeMetadata's own comment describes)
+// left the disk with the NEW build's stage1/stage2 paired with the
+// OLD build's still-rolled-back KERNEL/INITRD/CMDLINE/METADATA - new
+// boot loader stages, old payload, a real mismatched-generation state
+// no single write actually caused but the ORDERING did. Running the
+// identical check here, before any write at all, means a manifest
+// that will not decode is refused up front, exactly like
+// bootenv.CheckStage2ExtentFree's own "fail before ANY mutation"
+// preflight just above this call at each of its two real call sites.
+func preflightBIOSMetadata(arch string, newCmdline cmdline.Info, kernel, initrd []byte) error {
+	m, err := deepMetadataFor(arch, newCmdline.Version, newCmdline.BuildStamp, kernel, initrd)
+	if err != nil {
+		return err
+	}
+	_, err = checkMetadataEncodable(m)
+	return err
 }
 
 // tryReadMetadata reads and decodes internal/layout.MetadataFile from
@@ -1629,6 +1702,26 @@ func checkUpdateEligible(disk string) error {
 	return nil
 }
 
+// checkBIOSUpToDate is updateBIOS's own downgrade-check primitive
+// (F16, unidoc-alip's PR #5 follow-up review) - see that function's
+// own call site for the full reasoning. Split out, like
+// checkUpdateEligible just above, so it's testable without exercising
+// die()'s own os.Exit. Returns ("", false) - never refuse, just skip
+// the check - when the installed CMDLINE can't be read at all or
+// carries no buildstamp (an installation from before this project
+// recorded one).
+func checkBIOSUpToDate(mountpoint, newBuildStamp string) (installedBuildStamp string, upToDate bool) {
+	installed, err := os.ReadFile(filepath.Join(mountpoint, layout.CmdlineFile))
+	if err != nil {
+		return "", false
+	}
+	localInfo := cmdline.ParseText(installed)
+	if localInfo.BuildStamp == "" {
+		return "", false
+	}
+	return localInfo.BuildStamp, newBuildStamp <= localInfo.BuildStamp
+}
+
 func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 	assets, err := release.ResolveBIOS(src, t.arch, workdir)
 	die(err)
@@ -1668,6 +1761,42 @@ func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 
 	die(checkUpdateEligible(t.disk))
 
+	newCmdline := cmdline.ParseText(cmdlineTxt)
+
+	// F16 (unidoc-alip's PR #5 follow-up review): BIOS update used to
+	// have no build comparison at all, unlike UEFI (updateUEFI's own
+	// latest.BuildStamp <= local.BuildStamp check above) - `update -y`
+	// rewrote stage1/stage2/KERNEL/INITRD/CMDLINE on every run
+	// regardless of whether the new build was actually newer, and a
+	// retracted/rolled-back "latest" release applied as a silent
+	// downgrade with nothing to notice or refuse. Same comparison, same
+	// unconditional behavior (no --force/-y bypass, matching UEFI's own
+	// - see that check's own comment) - the installed CMDLINE's own
+	// buildstamp is the one signal guaranteed to be in the SAME format
+	// as the new build's (both written by the exact same build.sh
+	// printf line - see that script's own BUILD_STAMP comment),
+	// unlike stage2's own separately-generated ZFSBOOT_BUILD_ID (a
+	// different build step, a different timestamp format, not
+	// comparable here). Skipped, not refused, when the installed
+	// CMDLINE can't be read or carries no buildstamp at all (an
+	// installation from before this project recorded one) - treating
+	// that as a hard refusal would regress every such installation's
+	// own first update under this fix, not improve its safety.
+	if installedBuildStamp, upToDate := checkBIOSUpToDate(t.mountpoint, newCmdline.BuildStamp); upToDate {
+		fmt.Printf("%s is already up to date (%s)\n", t.disk, cmdline.HumanVersion(installedBuildStamp))
+		return
+	}
+
+	// F8 (unidoc-alip's PR #5 follow-up review): preflighted here,
+	// before writeBIOSStagesWithRollback below, not after it - see
+	// preflightBIOSMetadata's own comment for the full reasoning (a
+	// cmdline/kernel/initrd combination that fails this check must never
+	// be discovered only after stage1/stage2 already have the new
+	// build's bytes on disk).
+	if err := preflightBIOSMetadata(t.arch, newCmdline, kernel, initrd); err != nil {
+		die(fmt.Errorf("refusing to update: %w", err))
+	}
+
 	if !yes && !confirm(fmt.Sprintf("overwrite %s's stage1/stage2 and %s/{KERNEL,INITRD,CMDLINE} with this build?", t.disk, layout.ESPDir)) {
 		fmt.Println("not updated")
 		return
@@ -1675,7 +1804,6 @@ func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 
 	die(writeBIOSStagesWithRollback(t.disk, stage1, stage2))
 
-	newCmdline := cmdline.ParseText(cmdlineTxt)
 	die(writePayloadWithRollback(t.mountpoint, t.arch, newCmdline.Version, newCmdline.BuildStamp, kernel, initrd, cmdlineTxt))
 
 	fmt.Printf("%s updated: stage1 (%d bytes), stage2 (%d bytes), %s/{KERNEL,INITRD,CMDLINE,METADATA} - every write verified byte-for-byte.\n",
@@ -1843,6 +1971,14 @@ func installBIOS(disk, arch, mountpoint, workdir string, yes bool, src release.B
 		die(fmt.Errorf("refusing to install: %w", err))
 	}
 
+	// F8 (unidoc-alip's PR #5 follow-up review): same preflight, same
+	// reasoning, as updateBIOS's own identical call - see
+	// preflightBIOSMetadata's own comment.
+	newCmdline := cmdline.ParseText(cmdlineTxt)
+	if err := preflightBIOSMetadata(arch, newCmdline, kernel, initrd); err != nil {
+		die(fmt.Errorf("refusing to install: %w", err))
+	}
+
 	if !yes && !confirm(fmt.Sprintf("install stage1/stage2 onto %s and the FAT payload onto %s?", disk, mountpoint)) {
 		fmt.Println("not installed")
 		return
@@ -1850,7 +1986,6 @@ func installBIOS(disk, arch, mountpoint, workdir string, yes bool, src release.B
 
 	die(writeBIOSStagesWithRollback(disk, stage1, stage2))
 
-	newCmdline := cmdline.ParseText(cmdlineTxt)
 	die(writePayloadWithRollback(mountpoint, arch, newCmdline.Version, newCmdline.BuildStamp, kernel, initrd, cmdlineTxt))
 
 	writeConfig(mountpoint, cfg, sshKey)
