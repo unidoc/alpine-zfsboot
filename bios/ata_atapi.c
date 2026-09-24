@@ -226,12 +226,40 @@ int atapi_transfer_complete(uint16_t got_words, uint16_t want_words)
  * and atapi_init()'s own readiness check) is deciding what to do
  * next, not this function's.
  */
+#ifdef ZFSBOOT_TEST_SERIAL
+/*
+ * Test-only call-site trace for atapi_send_packet()'s five internal
+ * wait_status_clear() calls, gated exactly like console.c's own serial
+ * mirror (never defined by a real build). Exists because a real
+ * register dump at a CI timeout cannot tell these five calls apart:
+ * `io + ATA_REG_STATUS` is the same loop-invariant address at every one
+ * of them, so EIP/registers alone only say "stuck somewhere in this
+ * function", not which wait. Prints a single letter right before each
+ * call (no matching "site done" after a hang, by construction) plus the
+ * CDB's opcode byte at entry, so the NEXT CI failure's serial.log names
+ * the exact stuck call instead of leaving it ambiguous.
+ */
+static void trace_site(char c)
+{
+	console_putc(c);
+}
+#else
+#define trace_site(c) ((void)0)
+#endif
+
 static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t data_len)
 {
 	uint16_t io = g_io_base;
 	int i;
 	uint8_t st;
 
+#ifdef ZFSBOOT_TEST_SERIAL
+	console_puts("PKT op=");
+	console_puts_hex32(cdb[0]);
+	console_putc(' ');
+#endif
+
+	trace_site('a');
 	if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 		return -1;
 
@@ -243,6 +271,7 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 	 * follows it rather than relying on that latching detail). */
 	outb(io + ATA_REG_DEVHEAD, g_dev_select);
 	io_settle(g_ctrl_base);
+	trace_site('b');
 	if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 		return -1;
 
@@ -268,6 +297,7 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 	/* Command phase: BSY clears, then the device raises DRQ to ask
 	 * for the CDB (or sets ERR if it's rejecting the command
 	 * outright). */
+	trace_site('c');
 	if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 		return -1;
 	st = inb(io + ATA_REG_STATUS);
@@ -286,8 +316,12 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 	if (data_len == 0) {
 		/* No data phase (TEST UNIT READY) - just the completion
 		 * status. */
+		trace_site('d');
 		if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 			return -1;
+#ifdef ZFSBOOT_TEST_SERIAL
+		console_puts("ok\n");
+#endif
 		return (inb(io + ATA_REG_STATUS) & ATA_STATUS_ERR) ? -1 : 0;
 	}
 
@@ -311,6 +345,7 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 		for (;;) {
 			uint16_t actual_len, actual_words, remaining_want, take;
 
+			trace_site('e');
 			if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 				return -1;
 			st = inb(io + ATA_REG_STATUS);
@@ -419,6 +454,9 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 			return -1;
 	}
 
+#ifdef ZFSBOOT_TEST_SERIAL
+	console_puts("ok\n");
+#endif
 	return 0;
 }
 
