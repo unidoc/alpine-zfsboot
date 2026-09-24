@@ -402,6 +402,51 @@ func TestWritePayloadWithRollback_MidWriteFailureRestoresFullPreviousGeneration(
 	}
 }
 
+// TestTrimStage1Asset is the regression test for a real bug found on
+// real hardware (uniclus-01): install/update required the RAW stage1
+// asset FILE itself be exactly layout.Stage1Bytes (440) - but every
+// real stage1.bin build.sh has ever produced is layout.SectorSize
+// (512), the full MBR sector (bios/Makefile's own stage1.bin target
+// hard-requires exactly 512) - so a genuine, unmodified official
+// release asset failed update/install outright with "stage1 is 512
+// bytes, want exactly 440" on every real run, never just this one
+// user's own case.
+func TestTrimStage1Asset(t *testing.T) {
+	t.Run("a full 512-byte MBR sector is trimmed to the 440-byte boot code region", func(t *testing.T) {
+		raw := bytes.Repeat([]byte{0xAA}, layout.Stage1Bytes)
+		raw = append(raw, bytes.Repeat([]byte{0xFF}, layout.SectorSize-layout.Stage1Bytes)...) // partition-table-shaped tail, deliberately different bytes
+		got, err := trimStage1Asset(raw)
+		if err != nil {
+			t.Fatalf("trimStage1Asset on a real 512-byte asset: %v", err)
+		}
+		if len(got) != layout.Stage1Bytes {
+			t.Fatalf("trimStage1Asset returned %d bytes, want exactly %d", len(got), layout.Stage1Bytes)
+		}
+		if !bytes.Equal(got, raw[:layout.Stage1Bytes]) {
+			t.Error("trimStage1Asset did not return the FIRST 440 bytes unchanged - the actual boot code must never be altered, only the trailing partition-table region dropped")
+		}
+	})
+
+	t.Run("an already-trimmed 440-byte slice passes through unchanged", func(t *testing.T) {
+		raw := bytes.Repeat([]byte{0xBB}, layout.Stage1Bytes)
+		got, err := trimStage1Asset(raw)
+		if err != nil {
+			t.Fatalf("trimStage1Asset on an already-trimmed 440-byte slice: %v", err)
+		}
+		if !bytes.Equal(got, raw) {
+			t.Error("trimStage1Asset altered an already-correctly-sized 440-byte input")
+		}
+	})
+
+	t.Run("any other length is refused, not silently truncated or padded", func(t *testing.T) {
+		for _, n := range []int{0, 439, 441, 511, 513, 1024} {
+			if _, err := trimStage1Asset(make([]byte, n)); err == nil {
+				t.Errorf("trimStage1Asset(%d bytes): want an error, got nil", n)
+			}
+		}
+	})
+}
+
 // TestCheckUpdateEligible is the regression test for a real bug found
 // in a full source audit: update's disk-write target (derived from
 // bootenv.FindESP(), see checkUpdateEligible's own doc comment for the

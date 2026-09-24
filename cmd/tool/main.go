@@ -1691,6 +1691,40 @@ func writeUEFIGenerationWithRollback(mountpoint, arch string, efiBytes []byte, e
 // refusing here, before any write, is a concrete, disk-content-based
 // check "install" doesn't need (it's explicitly for a not-yet-installed
 // disk) but "update" can and should require.
+// trimStage1Asset accepts a stage1 asset either as the real, only
+// shape build.sh ever produces (layout.SectorSize bytes - a full MBR
+// sector, 0x55AA boot signature and all - see bios/Makefile's own
+// stage1.bin target, which hard-requires exactly 512) or as an
+// already-trimmed layout.Stage1Bytes-byte boot-code-only slice (a
+// custom --stage1-file someone pre-trimmed by hand), and returns
+// exactly the layout.Stage1Bytes bytes biosboot.WriteStage1 itself
+// writes.
+//
+// Found on real hardware (uniclus-01): install/update used to require
+// the RAW asset file itself be exactly layout.Stage1Bytes (440) -
+// which no real release asset from this project's own build.sh has
+// EVER been (always 512, the full sector) - so `update`/`install`
+// against a genuine, unmodified official release asset failed outright
+// with "stage1 is 512 bytes, want exactly 440" on every real run. The
+// shell installer (alpine-installer's own install_alpine_zfsboot_bios())
+// has always handled this correctly via `dd bs=440 count=1` - only
+// this Go port never replicated that trim step, going straight from
+// "read the whole asset file" to "hand it to WriteStage1 unmodified"
+// with no truncation in between. WriteStage1 itself is NOT the bug -
+// its own 440-byte-only contract (never touching the disk's real
+// partition table at bytes 440-511) is exactly right; this caller-side
+// trim is what was missing.
+func trimStage1Asset(raw []byte) ([]byte, error) {
+	switch len(raw) {
+	case layout.Stage1Bytes:
+		return raw, nil
+	case layout.SectorSize:
+		return raw[:layout.Stage1Bytes], nil
+	default:
+		return nil, fmt.Errorf("stage1 is %d bytes, want %d (a full MBR sector, the real shape every release asset ships as) or %d (just the boot code region, pre-trimmed)", len(raw), layout.SectorSize, layout.Stage1Bytes)
+	}
+}
+
 func checkUpdateEligible(disk string) error {
 	existing, err := biosboot.ReadStage2(disk)
 	if err != nil {
@@ -1729,6 +1763,8 @@ func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 
 	stage1, err := os.ReadFile(assets.Stage1)
 	die(err)
+	stage1, err = trimStage1Asset(stage1)
+	die(err)
 	stage2, err := os.ReadFile(assets.Stage2)
 	die(err)
 	kernel, err := os.ReadFile(assets.Kernel)
@@ -1738,9 +1774,6 @@ func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 	cmdlineTxt, err := os.ReadFile(assets.Cmdline)
 	die(err)
 
-	if len(stage1) != layout.Stage1Bytes {
-		die(fmt.Errorf("stage1 is %d bytes, want exactly %d", len(stage1), layout.Stage1Bytes))
-	}
 	if len(stage2) > layout.Stage2Bytes {
 		die(fmt.Errorf("stage2 is %d bytes, exceeds the %d-byte budget", len(stage2), layout.Stage2Bytes))
 	}
@@ -1949,6 +1982,8 @@ func installBIOS(disk, arch, mountpoint, workdir string, yes bool, src release.B
 
 	stage1, err := os.ReadFile(assets.Stage1)
 	die(err)
+	stage1, err = trimStage1Asset(stage1)
+	die(err)
 	stage2, err := os.ReadFile(assets.Stage2)
 	die(err)
 	kernel, err := os.ReadFile(assets.Kernel)
@@ -1958,9 +1993,6 @@ func installBIOS(disk, arch, mountpoint, workdir string, yes bool, src release.B
 	cmdlineTxt, err := os.ReadFile(assets.Cmdline)
 	die(err)
 
-	if len(stage1) != layout.Stage1Bytes {
-		die(fmt.Errorf("stage1 is %d bytes, want exactly %d", len(stage1), layout.Stage1Bytes))
-	}
 	if len(stage2) > layout.Stage2Bytes {
 		die(fmt.Errorf("stage2 is %d bytes, exceeds the %d-byte budget", len(stage2), layout.Stage2Bytes))
 	}
