@@ -347,26 +347,32 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 
 #ifdef ZFSBOOT_TEST_SERIAL
 			/*
-			 * A real CI failure narrowed the stuck call to exactly
-			 * this loop's own wait_status_clear() (site 'e' with no
-			 * second 'e' and no 'ok' after it) - but that alone
-			 * can't say WHY: a genuinely busy device (status=0x80,
-			 * BSY set, nothing else), a floating/disconnected bus
-			 * (status=0xFF, indistinguishable from BSY-forever by
-			 * wait_status_clear() alone), and "the loop's own DRQ
-			 * check is wrong" (status=0x58, BSY already clear) are
-			 * three completely different bugs that all look
-			 * identical from the outside. Read (not consume - this
-			 * is the exact same io+ATA_REG_STATUS read
-			 * wait_status_clear() itself is about to do first) both
-			 * status registers ONCE, right as this phase begins,
-			 * before any spinning starts - if the wait then hangs
-			 * for the whole CI deadline, this snapshot is still
-			 * whatever was true at the very start of that hang.
+			 * The previous round's version of this diagnostic read
+			 * io+ATA_REG_STATUS (the PRIMARY status register) here,
+			 * right before wait_status_clear()'s own first read of
+			 * that exact same register - reasoning that an extra
+			 * read of the same register wait_status_clear() was
+			 * about to do anyway couldn't change anything. That
+			 * reasoning was wrong: reading the primary status
+			 * register (unlike alt-status, at ctrl_base) is NOT
+			 * side-effect-free on real ATA/ATAPI controllers - it
+			 * acknowledges the device's pending interrupt/phase
+			 * condition. io_settle() already only ever reads
+			 * alt-status for exactly this reason. The result came
+			 * back "st0=0x58 alt=0x58" (BSY clear, DRQ set - a
+			 * healthy, ready device) immediately before
+			 * wait_status_clear() then hung for the full CI deadline
+			 * anyway - consistent with that extra primary-status
+			 * read itself having advanced the device's own state
+			 * machine past the DRQ phase with no insw ever having
+			 * happened, leaving nothing left for the loop to
+			 * observe. This round drops that read entirely and
+			 * checks ONLY alt-status (side-effect-free, the same
+			 * register io_settle() already trusts) so this
+			 * diagnostic can no longer be the thing perturbing the
+			 * exact race it exists to observe.
 			 */
-			console_puts("st0=");
-			console_puts_hex32(inb(io + ATA_REG_STATUS));
-			console_puts(" alt=");
+			console_puts("alt=");
 			console_puts_hex32(inb(g_ctrl_base));
 			console_putc(' ');
 #endif
