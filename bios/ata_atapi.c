@@ -345,6 +345,31 @@ static int atapi_send_packet(const uint8_t cdb[12], uint8_t *data_buf, uint16_t 
 		for (;;) {
 			uint16_t actual_len, actual_words, remaining_want, take;
 
+#ifdef ZFSBOOT_TEST_SERIAL
+			/*
+			 * A real CI failure narrowed the stuck call to exactly
+			 * this loop's own wait_status_clear() (site 'e' with no
+			 * second 'e' and no 'ok' after it) - but that alone
+			 * can't say WHY: a genuinely busy device (status=0x80,
+			 * BSY set, nothing else), a floating/disconnected bus
+			 * (status=0xFF, indistinguishable from BSY-forever by
+			 * wait_status_clear() alone), and "the loop's own DRQ
+			 * check is wrong" (status=0x58, BSY already clear) are
+			 * three completely different bugs that all look
+			 * identical from the outside. Read (not consume - this
+			 * is the exact same io+ATA_REG_STATUS read
+			 * wait_status_clear() itself is about to do first) both
+			 * status registers ONCE, right as this phase begins,
+			 * before any spinning starts - if the wait then hangs
+			 * for the whole CI deadline, this snapshot is still
+			 * whatever was true at the very start of that hang.
+			 */
+			console_puts("st0=");
+			console_puts_hex32(inb(io + ATA_REG_STATUS));
+			console_puts(" alt=");
+			console_puts_hex32(inb(g_ctrl_base));
+			console_putc(' ');
+#endif
 			trace_site('e');
 			if (wait_status_clear(io, ATA_STATUS_BSY) != 0)
 				return -1;
