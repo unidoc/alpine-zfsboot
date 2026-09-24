@@ -239,9 +239,58 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # publish is the ONLY job in this whole workflow that runs under the
+  # "signing" GitHub Environment, and therefore the only one that can
+  # ever see ALPINE_ZFSBOOT_PRIVATE_KEY at all (issue #2, unidoc-alip's
+  # PR #1 review: "the real answer is detached-signature verification
+  # with a key that does not live on GitHub" - narrowed, after real
+  # design discussion, to "does not live in a plain repository secret
+  # or an ordinary build/PR job's reach" - see internal/release/
+  # signature.go's own comment on the exact threat model this
+  # protects against and the one it deliberately does not: a GitHub
+  # Environment secret still lives on GitHub, gated by that
+  # Environment's own protection rules, not physically offline). Same
+  # "signing" environment name and ALPINE_ZFSBOOT_PRIVATE_KEY/
+  # ABUILD_PRIVATE_KEY naming convention unidoc-aports' own
+  # build-and-publish.yml already established for this exact pattern -
+  # see that file's own comment on why an Environment secret (Admin-
+  # only to create/overwrite) beats a plain repository secret
+  # (anyone with Write access can touch it - a real, separate risk
+  # from branch protection, since overwriting a secret isn't a git
+  # push and master's own PR+review requirement never sees it).
+  # build-x86_64/build-aarch64/build-tool above run with NO environment
+  # at all and never touch this secret, by construction, not by
+  # convention - a compromised dependency or a malicious PR reaching
+  # one of THOSE jobs still cannot exfiltrate the signing key, because
+  # it is never in scope there to begin with.
+  #
+  # Required Environment setup on GitHub (one-time, done in the repo's
+  # own Settings -> Environments, not in this file):
+  #   1. Create an environment named exactly "signing".
+  #   2. Add ALPINE_ZFSBOOT_PRIVATE_KEY as an ENVIRONMENT secret under
+  #      it (Settings -> Environments -> signing -> Environment
+  #      secrets) - NOT a repository-level secret. Its value is the raw
+  #      content of minisign -G's own generated secret-key file
+  #      (alpine-zfsboot.key), byte for byte.
+  #   3. Protection rules on that environment are optional here (same
+  #      posture as unidoc-aports' own "signing" environment - it
+  #      exists to raise the permission bar on the secret itself, not
+  #      to add approval friction to every release by default): add a
+  #      "Selected tags" deployment restriction (-> v*) and/or a
+  #      required reviewer later if you want either, no workflow change
+  #      needed to add or remove them.
+  #
+  # Fails closed by construction, not by a special check: every step
+  # below runs under `set -e` (bash's own default failure propagation
+  # plus this workflow's own steps having no `|| true`/continue-on-
+  # error anywhere in this job) - a single asset that fails to sign
+  # aborts the whole job before the "Create GitHub release" step ever
+  # runs, so there is no code path that publishes a release with some
+  # assets signed and others silently not.
   publish:
     needs: [build-x86_64, build-aarch64, build-tool]
     runs-on: ubuntu-latest
+    environment: signing
     permissions:
       contents: write
     steps:
@@ -269,11 +318,82 @@ jobs:
           cd out
           sha256sum * | tee SHA256SUMS
 
+      # A pinned, checksum-verified static build of the real upstream
+      # minisign CLI - the release-side SIGNING tool this whole design
+      # deliberately keeps out of alpine-zfsboot's own production
+      # binary (internal/minisign is verify-only, no os/exec - see
+      # that package's own doc comment). Pinned to a specific version +
+      # a real, independently-recorded SHA256 (not "whatever the tag
+      # currently resolves to") so a compromised or replaced upstream
+      # release asset can't silently swap in a different signing tool
+      # here - the exact same supply-chain posture this workflow
+      # already applies to every alpine-zfsboot release asset it
+      # produces itself, turned around onto a tool it depends on.
+      - name: Install minisign (signing tool, pinned + checksum-verified)
+        run: |
+          set -e
+          curl -fsSL -o /tmp/minisign.tar.gz \
+            "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz"
+          echo "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  /tmp/minisign.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/minisign.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/minisign-linux/x86_64/minisign /usr/local/bin/minisign
+          minisign -v
+
+      # The ONLY step in this whole workflow with
+      # ALPINE_ZFSBOOT_PRIVATE_KEY in scope - reconstructs the real
+      # minisign secret-key file from the environment secret into a
+      # runner-local temp file, signs every release asset with it, then
+      # deletes it immediately (defense in depth - the runner itself is
+      # destroyed after this job regardless, but the key file should
+      # not linger on disk any longer than the one command that needs
+      # it). Never echoed, never written to a location
+      # `actions/upload-artifact` or any later step could pick up -
+      # out/*.minisig (the PUBLIC output of signing) is the only thing
+      # that leaves this step.
+      #
+      # -W (no password) at key-generation time is what makes this
+      # step able to sign non-interactively at all - minisign -S
+      # otherwise prompts for the secret key's own password on stdin,
+      # which a CI job has no human present to answer. The
+      # Environment's own access controls (secret scoping + protection
+      # rules, see this job's own top comment) are the real boundary
+      # here, not a second password on top of them.
+      #
+      # Every asset in out/ gets signed except SHA256SUMS itself -
+      # deliberately: SHA256SUMS is superseded by per-file signatures
+      # now (see internal/release/signature.go's own comment on why a
+      # same-origin checksum alone was never real defense), kept only
+      # for tooling that still wants a plain checksum manifest, not
+      # something worth a signature of its own on top of what every
+      # individual file already carries.
+      - name: Sign every release asset (ALPINE_ZFSBOOT_PRIVATE_KEY, signing environment only)
+        env:
+          ALPINE_ZFSBOOT_PRIVATE_KEY: ${{ secrets.ALPINE_ZFSBOOT_PRIVATE_KEY }}
+        run: |
+          set -e
+          if [ -z "${ALPINE_ZFSBOOT_PRIVATE_KEY}" ]; then
+            echo "::error::ALPINE_ZFSBOOT_PRIVATE_KEY is empty - see this workflow's own comment on configuring it as a 'signing' Environment secret. Refusing to publish an unsigned release."
+            exit 1
+          fi
+          keyfile="$(mktemp)"
+          printf '%s' "${ALPINE_ZFSBOOT_PRIVATE_KEY}" > "${keyfile}"
+          trap 'rm -f "${keyfile}"' EXIT
+
+          cd out
+          for f in *; do
+            case "${f}" in
+              SHA256SUMS|*.minisig) continue ;;
+            esac
+            minisign -S -s "${keyfile}" -x "${f}.minisig" \
+              -t "alpine-zfsboot ${GITHUB_REF_NAME} - ${f}" -m "${f}"
+          done
+          ls -la
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           name: alpine-zfsboot ${{ github.ref_name }}
-          body: "Built on Alpine ${{ env.ALPINE_VERSION }}. A self-contained Alpine Linux ZFS bootloader, installer, and remote recovery environment for BIOS and UEFI systems. For each of x86_64/aarch64: .EFI, .iso, and loose vmlinuz/initramfs.img/cmdline.txt (GRUB chainload, and the BIOS FAT payload) - both consoles active, switch live from the menu. Also included: the legacy BIOS boot code (x86_64 only, GPT and MBR partition tables both supported by the same stage1/stage2 files - both read the same FAT/ESP partition UEFI mode uses) and alpine-zfsboot-x86_64/alpine-zfsboot-aarch64 (cmd/tool - the install-time version/update helper). SHA256SUMS covers every asset here."
+          body: "Built on Alpine ${{ env.ALPINE_VERSION }}. A self-contained Alpine Linux ZFS bootloader, installer, and remote recovery environment for BIOS and UEFI systems. For each of x86_64/aarch64: .EFI, .iso, and loose vmlinuz/initramfs.img/cmdline.txt (GRUB chainload, and the BIOS FAT payload) - both consoles active, switch live from the menu. Also included: the legacy BIOS boot code (x86_64 only, GPT and MBR partition tables both supported by the same stage1/stage2 files - both read the same FAT/ESP partition UEFI mode uses) and alpine-zfsboot-x86_64/alpine-zfsboot-aarch64 (cmd/tool - the install-time version/update helper). SHA256SUMS covers every asset here; every asset also carries its own detached minisign .minisig signature, verified in-process by alpine-zfsboot's own install/update before any boot-path write (see internal/minisign in the source tree)."
           generate_release_notes: true
           files: |
             out/*

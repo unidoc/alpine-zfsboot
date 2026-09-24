@@ -2,6 +2,7 @@ package release
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -104,12 +105,16 @@ func TestSourceResolve_LocalFileWinsOverURL(t *testing.T) {
 }
 
 func TestSourceResolve_ExplicitURLWinsOverDefault(t *testing.T) {
+	_, signPriv := withTestTrustedSigningKey(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/explicit" {
+		switch r.URL.Path {
+		case "/explicit":
 			w.Write([]byte("explicit-content"))
-			return
+		case "/explicit.minisig":
+			w.Write([]byte(testSignMinisign(signPriv, []byte("explicit-content"), "test")))
+		default:
+			w.Write([]byte("default-content"))
 		}
-		w.Write([]byte("default-content"))
 	}))
 	defer srv.Close()
 
@@ -124,6 +129,36 @@ func TestSourceResolve_ExplicitURLWinsOverDefault(t *testing.T) {
 	}
 	if string(content) != "explicit-content" {
 		t.Errorf("content = %q, want %q", content, "explicit-content")
+	}
+}
+
+// TestSourceResolve_ExplicitURLWithoutSignatureRefused is the direct
+// regression test for the security-contract question a real review
+// raised: does an explicit --*-url override really deserve to bypass
+// signature verification the same way --*-file does, just because
+// it's explicit? No - see Source.resolve's own doc comment for the
+// full reasoning. This proves it: an explicit URL serving perfectly
+// real content, with no signature published for it at all, is
+// refused, exactly like the resolved-default path already is
+// (TestResolveEFI_MissingSignatureRefused).
+func TestSourceResolve_ExplicitURLWithoutSignatureRefused(t *testing.T) {
+	withTestTrustedSigningKey(t) // a trusted key exists, but nothing signs anything below
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/explicit" {
+			w.Write([]byte("explicit-content"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // no .minisig published at all
+	}))
+	defer srv.Close()
+
+	src := Source{URL: srv.URL + "/explicit"}
+	_, err := src.resolve("", t.TempDir())
+	if err == nil {
+		t.Fatal("resolve on an explicit --*-url with no published signature: want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Errorf("error = %q, want it to mention the signature check", err.Error())
 	}
 }
 
@@ -149,11 +184,14 @@ func TestSourceResolve_FallsBackToDefault(t *testing.T) {
 
 // newFakeReleaseServer serves a fake "latest release" - a tag-
 // resolution API response, a real SHA256SUMS computed from
-// assetContent, and each named asset's own content - everything
-// ResolveBIOS's own default (non-overridden) path now needs (F16,
-// unidoc-alip's PR #5 review). Returns the base URL to point
-// apiLatestReleaseURL/downloadBaseURLTemplate at.
-func newFakeReleaseServer(t *testing.T, tag string, assetContent map[string]string) *httptest.Server {
+// assetContent, each named asset's own content, and (when signPriv is
+// non-nil - pass nil from a test that doesn't need signature coverage
+// at all) a real, correctly-formed <name>.minisig for every asset,
+// signed with signPriv - everything ResolveBIOS's own default
+// (non-overridden) path now needs (F16, unidoc-alip's PR #5 review,
+// and the minisign signature check, issue #2). Returns the base URL
+// to point apiLatestReleaseURL/downloadBaseURLTemplate at.
+func newFakeReleaseServer(t *testing.T, tag string, assetContent map[string]string, signPriv ed25519.PrivateKey) *httptest.Server {
 	t.Helper()
 	var sums strings.Builder
 	for name, content := range assetContent {
@@ -168,6 +206,16 @@ func newFakeReleaseServer(t *testing.T, tag string, assetContent map[string]stri
 		name := r.URL.Path[len("/download/"+tag+"/"):]
 		if name == "SHA256SUMS" {
 			w.Write([]byte(sums.String()))
+			return
+		}
+		if signPriv != nil && strings.HasSuffix(name, ".minisig") {
+			assetName := strings.TrimSuffix(name, ".minisig")
+			content, ok := assetContent[assetName]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Write([]byte(testSignMinisign(signPriv, []byte(content), "test release "+tag+" - "+assetName)))
 			return
 		}
 		content, ok := assetContent[name]
@@ -187,7 +235,13 @@ func TestResolveBIOS_MixedSources(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	_, signPriv := withTestTrustedSigningKey(t)
 	explicitSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".minisig") {
+			assetPath := strings.TrimSuffix(r.URL.Path, ".minisig")
+			w.Write([]byte(testSignMinisign(signPriv, []byte("from-"+assetPath[1:]), "test")))
+			return
+		}
 		w.Write([]byte("from-" + r.URL.Path[1:]))
 	}))
 	defer explicitSrv.Close()
@@ -197,7 +251,7 @@ func TestResolveBIOS_MixedSources(t *testing.T) {
 		"alpine-zfsboot-x86_64-initramfs.img": "real-initrd-bytes",
 		"alpine-zfsboot-x86_64-cmdline.txt":   "real-cmdline-bytes",
 	}
-	fakeRelease := newFakeReleaseServer(t, "v9.9.9", assetContent)
+	fakeRelease := newFakeReleaseServer(t, "v9.9.9", assetContent, signPriv)
 	defer fakeRelease.Close()
 
 	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
@@ -238,6 +292,7 @@ func TestResolveBIOS_MixedSources(t *testing.T) {
 // five default-sourced assets must come from ONE resolved tag and
 // pass SHA256SUMS verification.
 func TestResolveBIOS_DefaultAssetsAreTagPinnedAndChecksumVerified(t *testing.T) {
+	_, signPriv := withTestTrustedSigningKey(t)
 	assetContent := map[string]string{
 		"alpine-zfsboot-x86_64-bios-stage1.bin": "stage1-bytes",
 		"alpine-zfsboot-x86_64-bios-stage2.bin": "stage2-bytes",
@@ -245,7 +300,7 @@ func TestResolveBIOS_DefaultAssetsAreTagPinnedAndChecksumVerified(t *testing.T) 
 		"alpine-zfsboot-x86_64-initramfs.img":   "initrd-bytes",
 		"alpine-zfsboot-x86_64-cmdline.txt":     "cmdline-bytes",
 	}
-	fakeRelease := newFakeReleaseServer(t, "v1.2.3", assetContent)
+	fakeRelease := newFakeReleaseServer(t, "v1.2.3", assetContent, signPriv)
 	defer fakeRelease.Close()
 
 	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
@@ -338,10 +393,11 @@ func TestResolveBIOS_ChecksumMismatchRefused(t *testing.T) {
 // ResolveBIOS's own default fields already use, not a bare
 // releases/latest/download/ fetch.
 func TestResolveEFI_DefaultIsTagPinnedAndChecksumVerified(t *testing.T) {
+	_, signPriv := withTestTrustedSigningKey(t)
 	assetContent := map[string]string{
 		"alpine-zfsboot-x86_64.EFI": "efi-bytes",
 	}
-	fakeRelease := newFakeReleaseServer(t, "v1.2.3", assetContent)
+	fakeRelease := newFakeReleaseServer(t, "v1.2.3", assetContent, signPriv)
 	defer fakeRelease.Close()
 
 	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
@@ -359,6 +415,79 @@ func TestResolveEFI_DefaultIsTagPinnedAndChecksumVerified(t *testing.T) {
 	}
 	if string(got) != "efi-bytes" {
 		t.Errorf("content = %q, want %q", got, "efi-bytes")
+	}
+}
+
+// TestResolveEFI_MissingSignatureRefused is the direct regression
+// test for issue #2 (unidoc-alip's PR #1 review): a default-resolved
+// asset with a matching SHA256SUMS entry but NO .minisig at all must
+// still be refused - checksum agreement alone (same-origin, provable
+// by anything able to serve the asset in the first place) is exactly
+// the gap the signature check exists to close, and this test's own
+// server serves a perfectly self-consistent checksum for content that
+// simply has no signature published for it.
+func TestResolveEFI_MissingSignatureRefused(t *testing.T) {
+	withTestTrustedSigningKey(t) // a trusted key exists, but nothing signs anything below
+	assetContent := map[string]string{"alpine-zfsboot-x86_64.EFI": "efi-bytes"}
+	fakeRelease := newFakeReleaseServer(t, "v1.2.3", assetContent, nil) // signPriv=nil: never serves .minisig
+	defer fakeRelease.Close()
+
+	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
+	apiLatestReleaseURL = fakeRelease.URL + "/api/latest"
+	downloadBaseURLTemplate = fakeRelease.URL + "/download/%s/"
+	defer func() { apiLatestReleaseURL, downloadBaseURLTemplate = origAPI, origDownload }()
+
+	dir := t.TempDir()
+	_, err := ResolveEFI(Source{}, "x86_64", dir)
+	if err == nil {
+		t.Fatal("ResolveEFI with a checksum-valid but entirely unsigned asset: want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Errorf("error = %q, want it to mention the signature check", err.Error())
+	}
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("temp dir has %d leftover file(s) after a missing-signature failure, want 0: %v", len(entries), entries)
+	}
+}
+
+// TestResolveEFI_SignatureFromUntrustedKeyRefused proves a real,
+// well-formed, internally-consistent .minisig - correctly signed, just
+// with a DIFFERENT key than the one this process actually trusts - is
+// refused. The scenario this guards against: an attacker who controls
+// the same origin serving the asset AND its checksums AND some
+// signature, but does not hold alpine-zfsboot's own real offline
+// signing key - exactly the threat issue #2 describes, and exactly
+// why trustedSigningKeys is an embedded, fixed set rather than
+// anything discovered from the download itself.
+func TestResolveEFI_SignatureFromUntrustedKeyRefused(t *testing.T) {
+	_, trustedPriv := withTestTrustedSigningKey(t)
+	_ = trustedPriv // the trusted key exists, but the server below signs with a DIFFERENT one
+	_, attackerPriv := newTestSigningKeypair()
+
+	assetContent := map[string]string{"alpine-zfsboot-x86_64.EFI": "efi-bytes"}
+	fakeRelease := newFakeReleaseServer(t, "v1.2.3", assetContent, attackerPriv)
+	defer fakeRelease.Close()
+
+	origAPI, origDownload := apiLatestReleaseURL, downloadBaseURLTemplate
+	apiLatestReleaseURL = fakeRelease.URL + "/api/latest"
+	downloadBaseURLTemplate = fakeRelease.URL + "/download/%s/"
+	defer func() { apiLatestReleaseURL, downloadBaseURLTemplate = origAPI, origDownload }()
+
+	dir := t.TempDir()
+	_, err := ResolveEFI(Source{}, "x86_64", dir)
+	if err == nil {
+		t.Fatal("ResolveEFI with a signature from an untrusted key: want an error, got nil")
+	}
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("temp dir has %d leftover file(s) after an untrusted-signature failure, want 0: %v", len(entries), entries)
 	}
 }
 
