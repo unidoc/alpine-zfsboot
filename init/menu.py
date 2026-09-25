@@ -1246,7 +1246,27 @@ def _offer_to_end_session(text):
     every other real "are you sure" prompt in this file, e.g. the
     delete-snapshot confirmation) falls through and returns, exactly
     like the plain dialog_msgbox this replaced did.
+
+    ONLY offered over rescue SSH (unidoc-alip's PR #11 review, F1):
+    over SSH, alpine-zfsboot-shell execs this process directly, so
+    exiting really does end just that connection - but on the local
+    console this process is /init's own child (init/init's own
+    "python3 /menu.py" loop), and /init treats ANY exit other than the
+    special 42 as "menu.py missing or crashed", falling straight
+    through to automatic boot (exec /boot-dataset.sh on the default
+    BOOTFS, or die() under ALPINE_ZFSBOOT_FORCED_RESCUE) - see
+    init/init's own comment on that loop. A console operator answering
+    Yes to a question about ending "this rescue SSH session" would
+    instead kexec straight into a boot environment they never picked,
+    with no passphrase re-prompt (the handoff secret is already
+    staged) - the exact opposite of "additive only". IS_SSH_SESSION is
+    the real, transport-based signal for this (see its own module-
+    level comment), checked here instead of guessing from the console/
+    tty state some other way.
     """
+    if not IS_SSH_SESSION:
+        dialog_msgbox("Unlock encrypted root", text)
+        return
     if dialog_yesno("Unlock encrypted root", f"{text}\n\nEnd this rescue SSH session now?", default_no=True):
         sys.exit()
 
