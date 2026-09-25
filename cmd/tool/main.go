@@ -967,6 +967,20 @@ a later step like a partition-table reread or a reboot.`,
 				if stage1File != "" {
 					want, err := os.ReadFile(stage1File)
 					die(err)
+					// Same trim install/update need (see trimStage1Asset's
+					// own doc comment, found on real hardware) - a
+					// --stage1-file passed here is exactly the kind of
+					// real, unmodified release asset (512 bytes, the full
+					// MBR sector) that check exists for, and this verify
+					// path was never updated alongside install/update's
+					// own fix. Without this, `alpine-zfsboot verify
+					// --stage1-file` against a genuine release asset
+					// (alpine-installer's own verify_installation() does
+					// exactly this) failed with the same "512 bytes, want
+					// exactly 440" error trimStage1Asset already fixed
+					// for install/update.
+					want, err = trimStage1Asset(want)
+					die(err)
 					if err := biosboot.VerifyStage1(t.disk, want); err != nil {
 						errs = append(errs, err)
 					}
