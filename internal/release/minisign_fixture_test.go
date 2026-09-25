@@ -74,9 +74,11 @@ func testSignMinisign(priv ed25519.PrivateKey, message []byte, trustedComment st
 }
 
 // withTestTrustedSigningKey swaps trustedSigningKeys for the duration
-// of the caller's own test (t.Cleanup restores the real, production
-// - currently empty, see trustedSigningKeys' own comment - set
-// afterward), and returns the keypair to sign fixtures with.
+// of the caller's own test (t.Cleanup restores the real, embedded
+// production key set afterward - see trustedSigningKeys' own comment;
+// PR #10 review, F4: this comment used to say that set was "currently
+// empty", which stopped being true once the real production key was
+// embedded), and returns the keypair to sign fixtures with.
 func withTestTrustedSigningKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	t.Helper()
 	pub, priv := newTestSigningKeypair()

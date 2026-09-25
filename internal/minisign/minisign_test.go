@@ -1,8 +1,13 @@
 package minisign
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/blake2b"
 )
 
 // Every fixture below came from the REAL, unmodified upstream minisign
@@ -72,14 +77,27 @@ func TestVerify_RealMinisignSignature_ModernAlgorithm(t *testing.T) {
 	}
 }
 
-func TestVerify_RealMinisignSignature_LegacyAlgorithm(t *testing.T) {
+// TestVerify_RealMinisignSignature_LegacyAlgorithmRejected is the
+// regression test for F5 (PR #10 review): a genuine, real-minisign-
+// produced "Ed" (legacy, non-prehashed) signature must be REFUSED, not
+// accepted alongside "ED" - the algorithm tag comes from the
+// (attacker-supplied) .minisig itself, and accepting "Ed" lets an
+// attacker serve a signature's own 64-byte BLAKE2b-512 digest as if it
+// were the asset, then flip the tag to "Ed" so the main check runs
+// over the digest bytes directly and passes (see Verify's own doc
+// comment). This project's release process only ever produces "ED",
+// so there is no legitimate signature this rejection could break -
+// testSigLegacy is still real, upstream-minisign-produced output
+// (unchanged from before F5), proving the rejection is for the
+// algorithm tag alone, not an artifact of a synthesized fixture.
+func TestVerify_RealMinisignSignature_LegacyAlgorithmRejected(t *testing.T) {
 	pk := mustParsePubKey(t, testPubKey)
-	_, comment, err := Verify([]byte(testMessage), []byte(testSigLegacy), []PublicKey{pk})
-	if err != nil {
-		t.Fatalf("Verify (legacy \"Ed\" algorithm): %v", err)
+	_, _, err := Verify([]byte(testMessage), []byte(testSigLegacy), []PublicKey{pk})
+	if err == nil {
+		t.Fatal("Verify with a genuine legacy \"Ed\" signature: want an error, got nil")
 	}
-	if comment != "legacy" {
-		t.Errorf("trusted comment = %q, want %q", comment, "legacy")
+	if !strings.Contains(err.Error(), "\"ED\"") {
+		t.Errorf("error = %q, want it to mention the required \"ED\" algorithm", err.Error())
 	}
 }
 
@@ -151,6 +169,51 @@ func TestVerify_MultipleTrustedKeys_MatchesTheRightOne(t *testing.T) {
 	}
 	if matched.KeyID != real.KeyID {
 		t.Errorf("matched the wrong key: got %x, want %x", matched.KeyID, real.KeyID)
+	}
+}
+
+// TestVerify_AlgorithmConfusion_DigestServedAsAssetRejected is the
+// regression test for the actual attack F5 (PR #10 review) describes,
+// not just the tag check in isolation: take a genuine "ED" signature
+// for some asset A (an Ed25519 signature over BLAKE2b-512(A)), serve
+// the 64-byte digest ITSELF as "the asset" with the same signature's
+// tag flipped to "Ed" - before this package rejected "Ed" outright,
+// the main check ran over exactly those digest bytes (since "Ed" signs
+// the message directly) and passed, and the global (trusted-comment)
+// signature, covering sig||comment and unchanged by the flip, passed
+// too. Confirmed against the real minisign 0.12 binary during review:
+// `minisign -V` accepts this exact substitution, `minisign -V -H`
+// ("require prehashed") refuses it - this package's F5 fix is exactly
+// that -H behavior, unconditionally.
+func TestVerify_AlgorithmConfusion_DigestServedAsAssetRejected(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk := PublicKey{KeyID: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}, Key: pub}
+
+	asset := []byte("genuine alpine-zfsboot-x86_64-cmdline.txt bytes\n")
+	comment := "alpine-zfsboot v1.3.0 - alpine-zfsboot-x86_64-cmdline.txt"
+	digest := blake2b.Sum512(asset)
+	sig := ed25519.Sign(priv, digest[:])
+	global := ed25519.Sign(priv, append(append([]byte(nil), sig...), comment...))
+
+	render := func(algo string) []byte {
+		raw := append([]byte(algo), pk.KeyID[:]...)
+		raw = append(raw, sig...)
+		return []byte(fmt.Sprintf("untrusted comment: x\n%s\ntrusted comment: %s\n%s\n",
+			base64.StdEncoding.EncodeToString(raw), comment, base64.StdEncoding.EncodeToString(global)))
+	}
+
+	// Sanity check: the genuine "ED" signature over the real asset
+	// still verifies - proves the rejection below is specific to the
+	// digest-as-asset substitution, not a broken fixture.
+	if _, _, err := Verify(asset, render("ED"), []PublicKey{pk}); err != nil {
+		t.Fatalf("Verify with the genuine ED signature over the real asset: %v", err)
+	}
+
+	if _, _, err := Verify(digest[:], render("Ed"), []PublicKey{pk}); err == nil {
+		t.Fatal("Verify with the 64-byte digest served as the asset, tag flipped to \"Ed\": want an error, got nil")
 	}
 }
 

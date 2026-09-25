@@ -2,23 +2,37 @@ package release
 
 import (
 	"fmt"
+	neturl "net/url"
 	"os"
+	"strings"
 
 	"github.com/unidoc/alpine-zfsboot/internal/minisign"
 )
 
-// trustedSigningKeys is the small, rotatable set of minisign public
-// keys this package trusts to have signed a downloaded release asset
-// (issue #2, unidoc-alip's PR #1 review: "anything able to serve a
-// malicious .EFI can serve a matching checksum" - a same-origin
-// SHA256SUMS entry, already checked separately via verifyChecksum,
-// proves nothing about WHO produced the bytes, only that they weren't
-// corrupted in transit after the fact. A detached Ed25519 signature
-// from a key release.yml's own signing job holds ONLY as a protected
-// GitHub Environment secret - never a plain repository secret, never
-// committed, never visible to an ordinary build/PR job - is the
-// actual answer. See release.yml's own comment for the exact
-// build-job/signing-job separation this enables).
+// Threat model (unidoc-alip's PR #10 review, F4: several comments in
+// this package used to describe a key posture this code doesn't
+// implement - this paragraph is the one place that's supposed to be
+// accurate, everything else points here instead of re-describing it).
+//
+// What this protects against: a compromised or impersonated download
+// origin or mirror - including an explicit --*-url override, not just
+// the default GitHub-release path (issue #2, unidoc-alip's PR #1
+// review: "anything able to serve a malicious .EFI can serve a
+// matching checksum" - a same-origin SHA256SUMS entry, checked
+// separately via verifyChecksum, proves nothing about WHO produced
+// the bytes, only that they weren't corrupted in transit after the
+// fact).
+//
+// What this does NOT protect against, today: anyone who can get
+// release.yml's own "publish" job to run with ALPINE_ZFSBOOT_PRIVATE_KEY
+// in scope. That is narrower than "everyone with GitHub access" - the
+// "signing" Environment's own protection rules are what actually
+// narrow it (see release.yml's own comment, immediately above the
+// `publish` job, for exactly who that is on THIS repo right now, and
+// why "an Environment secret" alone is not yet the same claim as "a
+// key that does not live on GitHub" issue #2 was originally filed
+// against - PR #10 review, F1). --*-file is trusted as-is, no check
+// at all - see Source.resolve's own comment for why.
 //
 // A slice, not one hardcoded key, specifically so a future signing-
 // key rotation is additive: list the new key ALONGSIDE the old one
@@ -65,15 +79,48 @@ func mustParseTrustedKeys(keys ...trustedKey) []minisign.PublicKey {
 	return parsed
 }
 
+// expectedTrustedComment is exactly the -t argument release.yml's own
+// signing step passes to `minisign -S` for one asset of one release
+// tag (that workflow's own `-t "alpine-zfsboot ${GITHUB_REF_NAME} -
+// ${f}"` line - keep the two in lockstep). minisign.Verify returns
+// this string as the signature's OWN authenticated trusted comment,
+// covered by the global signature and therefore not attacker-
+// controllable - checking it here is what actually binds a genuine
+// signature to the one asset/release slot it was issued for (PR #10
+// review, F2: without this, any genuinely-signed asset verified in
+// ANY slot - another arch, another asset, another release - because a
+// same-origin SHA256SUMS entry, this package's own threat model
+// already assumes forgeable, was otherwise the only thing tying a
+// downloaded file to its name and release).
+func expectedTrustedComment(tag, assetFile string) string {
+	return fmt.Sprintf("alpine-zfsboot %s - %s", tag, assetFile)
+}
+
 // verifySignatureAtURL downloads url's own detached minisign signature
-// (url + ".minisig" - the exact naming convention `minisign -S -m
-// <file>` itself produces; release.yml's own signing job publishes
+// (url's path + ".minisig" - the exact naming convention `minisign -S
+// -m <file>` itself produces; release.yml's own signing job publishes
 // every asset's signature at exactly this sibling path, nothing
-// invented here) and verifies path's real, already-downloaded content
+// invented here; appended to the parsed URL's Path rather than the raw
+// string so a presigned mirror URL's own query string, e.g.
+// `?X-Amz-Signature=...`, isn't corrupted by the suffix - PR #10
+// review, F7) and verifies path's real, already-downloaded content
 // against it using trustedSigningKeys, returning an error on ANY
 // failure: the signature can't be fetched, doesn't parse, matches no
-// trusted key, or doesn't verify. The caller owns removing path on
-// error - this function only ever reads it.
+// trusted key, doesn't verify, or (see expectedTrustedComment above)
+// was genuinely signed but for a different asset or release than this
+// one. The caller owns removing path on error - this function only
+// ever reads it.
+//
+// assetFile is the canonical name being verified (BIOSAssetNames'/
+// AssetName's own value for the slot, NOT the URL's basename - keeps a
+// renamed mirror working, since the review's own suggested fix checks
+// what the asset IS, not what the URL happened to be called). tag is
+// the resolved release tag when known (the default-resolved path,
+// where resolveDefaultAsset/ResolveBIOS already pinned one tag before
+// downloading anything), or "" when it genuinely isn't (an explicit
+// --*-url override) - in that case only the asset name is bound, not
+// a specific release, since there's no tag to bind it to in the first
+// place.
 //
 // Runs for EVERY url-sourced fetch, not only the resolved-default
 // release: an explicit --*-url override (Source.resolve's own URL
@@ -98,8 +145,13 @@ func mustParseTrustedKeys(keys ...trustedKey) []minisign.PublicKey {
 // never "skip this check for now" - the two look identical from a
 // green `alpine-zfsboot update` run right up until the moment they
 // don't.
-func verifySignatureAtURL(url, path, dir string) error {
-	sigPath, err := downloadAsset(url+".minisig", dir)
+func verifySignatureAtURL(url, path, dir, assetFile, tag string) error {
+	sigURL := url + ".minisig"
+	if u, err := neturl.Parse(url); err == nil && u.RawQuery != "" {
+		u.Path += ".minisig"
+		sigURL = u.String()
+	}
+	sigPath, err := downloadAsset(sigURL, dir)
 	if err != nil {
 		return fmt.Errorf("fetching %s's detached signature: %w", url, err)
 	}
@@ -113,8 +165,16 @@ func verifySignatureAtURL(url, path, dir string) error {
 	if err != nil {
 		return fmt.Errorf("reading %s to verify its signature: %w", url, err)
 	}
-	if _, _, err := minisign.Verify(data, sigData, trustedSigningKeys); err != nil {
+	_, comment, err := minisign.Verify(data, sigData, trustedSigningKeys)
+	if err != nil {
 		return fmt.Errorf("%s: signature verification failed: %w", url, err)
+	}
+	if tag != "" {
+		if want := expectedTrustedComment(tag, assetFile); comment != want {
+			return fmt.Errorf("%s: signed as %q, want %q - refusing a signature for a different asset or release", url, comment, want)
+		}
+	} else if !strings.HasPrefix(comment, "alpine-zfsboot ") || !strings.HasSuffix(comment, " - "+assetFile) {
+		return fmt.Errorf("%s: signed as %q, which is not a signature for %s", url, comment, assetFile)
 	}
 	return nil
 }

@@ -11,24 +11,30 @@
 // public key before it's ever accepted, fully in-process: no
 // dependency on the minisign binary at runtime, no os/exec.
 //
-// Signing happens entirely offline, by a human, with the private key
-// that NEVER touches this repository, its CI, or any machine this
-// code runs on - see release.yml's own comment on the release
-// process this enables. The real minisign CLI is the release-side
-// signing tool (and this package's own test oracle - every test
-// fixture here is signed with the actual upstream binary, not
-// synthesized), never a production runtime dependency.
+// Signing happens in release.yml's own "publish" job, under a
+// GitHub Environment ("signing") that scopes the private key away
+// from every other job in that workflow - see internal/release/
+// signature.go's own doc comment for the exact threat model this
+// protects against and the one it deliberately does not (PR #10
+// review, F4: this comment used to claim the key never touches CI at
+// all, which release.yml's own signing step never implemented). The
+// real minisign CLI is the release-side signing tool (and this
+// package's own test oracle - every test fixture here is signed with
+// the actual upstream binary, not synthesized), never a production
+// runtime dependency.
 //
 // Implements the subset of minisign's real file format this project
-// actually needs: Ed25519 detached signatures, both the modern
-// prehashed ("ED", BLAKE2b-512 of the message, minisign's own default
-// since v0.10) and legacy raw ("Ed", straight over the message)
-// variants, plus the second, "global" signature minisign uses to bind
-// the trusted comment to the same signing act (defends against a
-// valid old signature being replayed with a substituted comment - see
-// Verify's own doc comment). No key GENERATION, no password-protected
-// secret-key decryption, no signing - none of that belongs in
-// production code that only ever needs to check a signature someone
+// actually needs: Ed25519 detached signatures using the modern
+// prehashed algorithm ("ED", BLAKE2b-512 of the message, minisign's
+// own default since v0.10 and the only variant this project's release
+// process ever produces - the legacy raw "Ed" tag is recognized only
+// to name it in an error, never accepted, see Verify's own comment,
+// PR #10 review F5), plus the second, "global" signature minisign uses
+// to bind the trusted comment to the same signing act (defends against
+// a valid old signature being replayed with a substituted comment -
+// see Verify's own doc comment). No key GENERATION, no password-
+// protected secret-key decryption, no signing - none of that belongs
+// in production code that only ever needs to check a signature someone
 // else already made.
 package minisign
 
@@ -56,12 +62,14 @@ const (
 
 // algoEd is the legacy, non-prehashed signature algorithm tag (a bare
 // Ed25519 signature straight over the message bytes) - minisign's own
-// "-l/--legacy" flag. algoED is the modern default (Ed25519 over the
-// BLAKE2b-512 digest of the message, not the message itself) - what
-// every signature this project's own release process produces will
-// actually be, but both are accepted here since the wire format makes
-// either trivial to support and there is no reason to refuse a
-// legacy-format signature from the same trusted key.
+// "-l/--legacy" flag. Named here for the wire format's own
+// documentation only; Verify never accepts it (PR #10 review, F5 -
+// see Verify's own comment on why "Ed" is refused outright rather than
+// supported alongside algoED). algoED is the modern default (Ed25519
+// over the BLAKE2b-512 digest of the message, not the message itself)
+// and the only algorithm this package's Verify ever accepts - what
+// every signature this project's own release process actually
+// produces.
 var (
 	algoEd = [2]byte{'E', 'd'}
 	algoED = [2]byte{'E', 'D'}
@@ -144,8 +152,22 @@ func Verify(message []byte, sigData []byte, trusted []PublicKey) (PublicKey, str
 	}
 	var algo [2]byte
 	copy(algo[:], sigRaw[0:2])
-	if algo != algoEd && algo != algoED {
-		return PublicKey{}, "", fmt.Errorf("minisign signature: unrecognized algorithm %q, want \"Ed\" or \"ED\"", algo[:])
+	// Only "ED" (prehashed BLAKE2b-512) is accepted - PR #10 review, F5.
+	// The algorithm tag comes from the attacker-supplied .minisig, and
+	// "Ed" signs the raw MESSAGE bytes directly rather than a fixed-
+	// size digest of them: take a genuine "ED" signature for asset A
+	// (an Ed25519 signature over BLAKE2b-512(A)), flip its tag to "Ed",
+	// and serve the 64-byte digest itself as "the asset" - the main
+	// check now runs over exactly those digest bytes and passes, and
+	// the global (trusted-comment) signature, which covers sig||comment
+	// and neither changed, passes too. This project's own release
+	// process only ever produces "ED" (see this package's own doc
+	// comment), so accepting "Ed" was attack surface with no legitimate
+	// user - exactly upstream minisign's own `-H`/"require prehashed"
+	// behavior, confirmed against the real minisign 0.12 binary: it
+	// accepts the flipped-tag digest without -H and refuses it with -H.
+	if algo != algoED {
+		return PublicKey{}, "", fmt.Errorf("minisign signature: algorithm %q not accepted, want \"ED\" (prehashed)", algo[:])
 	}
 	var keyID [keyIDLen]byte
 	copy(keyID[:], sigRaw[2:2+keyIDLen])

@@ -200,7 +200,11 @@ type Source struct {
 // checksum and signature checks themselves, using their own already-
 // resolved tag/SHA256SUMS context; verifying again here would just be
 // a second, redundant network fetch of the same .minisig.
-func (s Source) resolve(defaultURL, dir string) (string, error) {
+// assetFile is the canonical asset name for this slot (AssetName's or
+// BIOSAssetNames' own value) - only used to bind a URL-sourced
+// signature's own trusted comment to the right slot (PR #10 review,
+// F2); unused by the File and no-override-given branches.
+func (s Source) resolve(defaultURL, assetFile, dir string) (string, error) {
 	if s.File != "" {
 		return copyToTemp(s.File, dir)
 	}
@@ -209,7 +213,10 @@ func (s Source) resolve(defaultURL, dir string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err := verifySignatureAtURL(s.URL, path, dir); err != nil {
+		// tag is unavoidably "" here: an explicit --*-url override has
+		// no resolved release tag to bind against, only the asset name
+		// it claims to be (see verifySignatureAtURL's own doc comment).
+		if err := verifySignatureAtURL(s.URL, path, dir, assetFile, ""); err != nil {
 			os.Remove(path)
 			return "", err
 		}
@@ -236,10 +243,10 @@ func (s Source) resolve(defaultURL, dir string) (string, error) {
 // branch. See that function's own doc comment for the full reasoning
 // on why File and URL are treated differently here.
 func ResolveEFI(src Source, arch, dir string) (string, error) {
-	if src.File != "" || src.URL != "" {
-		return src.resolve("", dir)
-	}
 	assetFile := AssetName(arch)
+	if src.File != "" || src.URL != "" {
+		return src.resolve("", assetFile, dir)
+	}
 	path, err := resolveDefaultAsset(assetFile, dir)
 	if err != nil {
 		return "", fmt.Errorf("resolving %s: %w", assetFile, err)
@@ -389,7 +396,7 @@ func resolveDefaultAsset(assetFile, dir string) (string, error) {
 		os.Remove(path)
 		return "", err
 	}
-	if err := verifySignatureAtURL(tagBase+assetFile, path, dir); err != nil {
+	if err := verifySignatureAtURL(tagBase+assetFile, path, dir, assetFile, tag); err != nil {
 		os.Remove(path)
 		return "", err
 	}
@@ -437,9 +444,10 @@ func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 	}
 
 	var sums map[string]string
-	var tagBase string
+	var tagBase, tag string
 	if needDefault {
-		tag, err := resolveTag()
+		var err error
+		tag, err = resolveTag()
 		if err != nil {
 			return BIOSAssets{}, fmt.Errorf("resolving BIOS assets: %w", err)
 		}
@@ -461,7 +469,7 @@ func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 		if isDefault {
 			defaultURL = tagBase + f.assetFile
 		}
-		path, err := f.source.resolve(defaultURL, dir)
+		path, err := f.source.resolve(defaultURL, f.assetFile, dir)
 		if err != nil {
 			assets.RemoveAll()
 			return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
@@ -472,7 +480,7 @@ func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 				assets.RemoveAll()
 				return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
 			}
-			if err := verifySignatureAtURL(tagBase+f.assetFile, path, dir); err != nil {
+			if err := verifySignatureAtURL(tagBase+f.assetFile, path, dir, f.assetFile, tag); err != nil {
 				os.Remove(path)
 				assets.RemoveAll()
 				return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)

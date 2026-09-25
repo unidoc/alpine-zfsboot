@@ -272,13 +272,27 @@ jobs:
   #      secrets) - NOT a repository-level secret. Its value is the raw
   #      content of minisign -G's own generated secret-key file
   #      (alpine-zfsboot.key), byte for byte.
-  #   3. Protection rules on that environment are optional here (same
-  #      posture as unidoc-aports' own "signing" environment - it
-  #      exists to raise the permission bar on the secret itself, not
-  #      to add approval friction to every release by default): add a
-  #      "Selected tags" deployment restriction (-> v*) and/or a
-  #      required reviewer later if you want either, no workflow change
-  #      needed to add or remove them.
+  #   3. Protection rules on that environment are REQUIRED, not
+  #      optional (PR #10 review, F1 - an earlier version of this
+  #      comment called this step optional, which was wrong: with no
+  #      deployment_branch_policy, GitHub releases an Environment's
+  #      secrets to a job running from ANY ref, so "build jobs don't
+  #      declare environment: signing" is a property of this file, not
+  #      of the repository - a Write-access collaborator can push a
+  #      branch or open a same-repo PR whose workflow adds
+  #      `environment: signing` to any job and reads the secret; no
+  #      Admin needed, no review gate, since branch rulesets only cover
+  #      master/main/dev). Settings -> Environments -> signing ->
+  #      Deployment branches and tags -> Selected branches and tags,
+  #      add ONLY the tag rule `v*` (no branches) - AND add a tag
+  #      ruleset restricting creation/update/deletion of `refs/tags/v*`
+  #      to maintainers/admins, or rule 1 alone is bypassed by pushing
+  #      a `v*` tag at a commit with a modified release.yml. A required
+  #      reviewer on the environment is optional on top of that - the
+  #      closest this setup gets to issue #2's original "key that does
+  #      not live on GitHub" without moving signing fully offline.
+  #      Remaining exposure once both are in place: org/repo admins,
+  #      and anyone who can create a `refs/tags/v*` ref.
   #
   # Fails closed by construction, not by a special check: every step
   # below runs under `set -e` (bash's own default failure propagation
@@ -388,6 +402,33 @@ jobs:
               -t "alpine-zfsboot ${GITHUB_REF_NAME} - ${f}" -m "${f}"
           done
           ls -la
+
+      # PR #10 review, F3: nothing previously checked that
+      # ALPINE_ZFSBOOT_PRIVATE_KEY actually matches the public key
+      # embedded in internal/release/signature.go
+      # (trustedSigningKeys). If the Environment secret ever held a
+      # different key (a regenerated pair, a paste of the wrong file),
+      # the step above would still succeed - minisign -S doesn't know
+      # what any consumer expects - and publish a release that every
+      # real `check`/`install`/`update` then refuses, discovered only
+      # after the fact, with no fix but a new tag. Verifying here, under
+      # the same `set -e`, turns that into a failed job before "Create
+      # GitHub release" ever runs.
+      #
+      # The public key below is duplicated from signature.go on
+      # purpose - there is no third place for both to import from - so
+      # this step fails loudly the moment the two copies ever drift,
+      # rather than silently signing with a key nothing actually
+      # trusts.
+      - name: Verify signatures against the embedded public key
+        run: |
+          set -e
+          pub='RWRYhfIlgmx/lNEckpNnD/XZl8FjxPfsHqwd3aeEwER3Yb/Cw4ZRLF8g'
+          cd out
+          for f in *; do
+            case "${f}" in SHA256SUMS|*.minisig) continue ;; esac
+            minisign -V -q -P "${pub}" -m "${f}" -x "${f}.minisig"
+          done
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
