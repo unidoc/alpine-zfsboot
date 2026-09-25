@@ -473,6 +473,7 @@ mkdir -p "$BUILD_DIR/features.d"
     echo "/etc/alpine-zfsboot-version"
     echo "/menu.py"
     echo "/boot-dataset.sh"
+    echo "/fix-kexec-dtb.py"
     # net-config.sh/rescue-ssh.sh - factored out of /init's own body so
     # both /init and boot-dataset.sh can source the SAME implementation
     # (each is a separate process image by the time boot-dataset.sh
@@ -810,6 +811,7 @@ EOF
 
 cp "$REPO_ROOT/init/menu.py" /menu.py
 cp "$REPO_ROOT/init/boot-dataset.sh" /boot-dataset.sh
+cp "$REPO_ROOT/init/fix-kexec-dtb.py" /fix-kexec-dtb.py
 cp "$REPO_ROOT/init/net-config.sh" /net-config.sh
 cp "$REPO_ROOT/init/rescue-ssh.sh" /rescue-ssh.sh
 cp "$REPO_ROOT/init/pid-alive.sh" /pid-alive.sh
@@ -817,7 +819,7 @@ cp "$REPO_ROOT/init/zfs-unlock.sh" /zfs-unlock.sh
 cp "$REPO_ROOT/init/zfs-unlock" /zfs-unlock
 cp "$REPO_ROOT/init/alpine-zfsboot-shell" /alpine-zfsboot-shell
 cp "$REPO_ROOT/init/dialogrc" /etc/dialogrc
-chmod +x /menu.py /boot-dataset.sh /net-config.sh /rescue-ssh.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
+chmod +x /menu.py /boot-dataset.sh /fix-kexec-dtb.py /net-config.sh /rescue-ssh.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
 
 # cmd/tool's own binary, built by `just build-tool` (a Justfile
 # dependency of the `build` recipe - see Justfile) BEFORE this script
@@ -1030,7 +1032,7 @@ echo "menu.py import check passed against the actual bundled initramfs contents"
 # wrong before, so it fails the BUILD instead of a real boot next time.
 for f in /etc/apk/repositories /etc/apk/keys /etc/apk/world /etc/ssl/certs /etc/ssl/cert.pem \
          /lib/apk/db/installed /etc/dialogrc /etc/alpine-zfsboot-build-stamp /etc/alpine-zfsboot-version \
-         /usr/share/zfs/compatibility.d /etc/shells /boot/alpine-zfsboot; do
+         /usr/share/zfs/compatibility.d /etc/shells /boot/alpine-zfsboot /fix-kexec-dtb.py; do
     if [ ! -e "$verify_dir$f" ]; then
         echo "$f is missing from the bundled initramfs - its content-generation and its alpine-zfsboot.files manifest entry have drifted apart, add/fix the missing one" >&2
         exit 1

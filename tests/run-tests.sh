@@ -284,6 +284,292 @@ if grep -q "^kexec -e$" "$d/log"; then ok "kexec -e called (handoff attempted)";
 rm -rf "$d"
 
 # =============================================================================
+echo "== fix-kexec-dtb.py: finds and zeros a real nonzero /chosen/kaslr-seed, touches nothing else =="
+# Real-hardware-found (QEMU/KVM aarch64 "virt" board, 2026-09-25): QEMU
+# injects a random, nonzero /chosen/kaslr-seed into the live device
+# tree; Alpine's aarch64 kernels don't build CONFIG_RANDOMIZE_BASE, so
+# it's never consumed - kexec-tools' arm64 backend then silently
+# refuses to load ("kexec: setup_2nd_dtb failed.", no detail without
+# -d). This is the regression test for fix-kexec-dtb.py's own core
+# logic: a hand-built, real, spec-valid FDT (encoder below is
+# deliberately independent from the module's own decoder - same
+# format understanding, not the same code) with a genuinely nonzero
+# kaslr-seed goes in, and the fixed copy must have ONLY that property's
+# bytes zeroed - every other byte in the file identical.
+d="$(fresh_env)"
+python3 - "$REPO_ROOT/init/fix-kexec-dtb.py" "$d" > "$d/out" 2>&1 <<'PYEOF'
+import importlib.util, os, struct, sys
+
+fix_kexec_dtb_path, workdir = sys.argv[1], sys.argv[2]
+
+# --- minimal, real, spec-valid FDT encoder (independent of the module
+# under test - see the Flattened Devicetree spec s5.3/s5.4) ---
+FDT_BEGIN_NODE, FDT_END_NODE, FDT_PROP, FDT_END = 1, 2, 3, 9
+
+def build_fdt(kaslr_seed=None):
+    strings, offs, struct_block = bytearray(), {}, bytearray()
+
+    def strid(name):
+        if name not in offs:
+            offs[name] = len(strings)
+            strings.extend(name.encode() + b"\0")
+        return offs[name]
+
+    def align4(b):
+        while len(b) % 4:
+            b.append(0)
+
+    def begin(name):
+        struct_block.extend(struct.pack(">I", FDT_BEGIN_NODE))
+        struct_block.extend(name.encode() + b"\0")
+        align4(struct_block)
+
+    def end():
+        struct_block.extend(struct.pack(">I", FDT_END_NODE))
+
+    def prop(name, data):
+        struct_block.extend(struct.pack(">III", FDT_PROP, len(data), strid(name)))
+        struct_block.extend(data)
+        align4(struct_block)
+
+    begin("")
+    prop("model", b"unit-test,fake-board\0")
+    begin("chosen")
+    prop("bootargs", b"console=ttyS0\0")
+    if kaslr_seed is not None:
+        prop("kaslr-seed", kaslr_seed)
+    end()
+    begin("memory@40000000")
+    prop("device_type", b"memory\0")
+    prop("reg", struct.pack(">4I", 0, 0x40000000, 0, 0x40000000))
+    end()
+    end()
+    struct_block.extend(struct.pack(">I", FDT_END))
+    align4(struct_block)
+
+    mem_rsvmap = struct.pack(">QQ", 0, 0)
+    off_mem_rsvmap = 40
+    off_dt_struct = off_mem_rsvmap + len(mem_rsvmap)
+    off_dt_strings = off_dt_struct + len(struct_block)
+    totalsize = off_dt_strings + len(strings)
+    header = struct.pack(">10I", 0xD00DFEED, totalsize, off_dt_struct,
+                          off_dt_strings, off_mem_rsvmap, 17, 16, 0,
+                          len(strings), len(struct_block))
+    return bytes(header) + mem_rsvmap + bytes(struct_block) + bytes(strings)
+
+spec = importlib.util.spec_from_file_location("fix_kexec_dtb", fix_kexec_dtb_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+seed = bytes([0x47, 0x16, 0xCE, 0x7F, 0xD8, 0x1E, 0x1C, 0x78])
+original = build_fdt(kaslr_seed=seed)
+in_path = os.path.join(workdir, "in.dtb")
+out_path = os.path.join(workdir, "out.dtb")
+open(in_path, "wb").write(original)
+
+mod.LIVE_FDT_PATH = in_path
+sys.argv = ["fix-kexec-dtb.py", out_path]
+result = mod.main()
+
+fixed = open(out_path, "rb").read()
+diff_positions = [i for i, (a, b) in enumerate(zip(original, fixed)) if a != b]
+
+print("exit code:", result)
+print("output file exists:", os.path.exists(out_path))
+print("same length:", len(original) == len(fixed))
+print("bytes changed:", len(diff_positions))
+print("changed region matches seed exactly:",
+      diff_positions != [] and
+      original[diff_positions[0]:diff_positions[-1] + 1] == seed and
+      fixed[diff_positions[0]:diff_positions[-1] + 1] == bytes(8))
+PYEOF
+if grep -qx "exit code: 0" "$d/out" 2>/dev/null \
+   && grep -qx "output file exists: True" "$d/out" \
+   && grep -qx "same length: True" "$d/out" \
+   && grep -qx "bytes changed: 8" "$d/out" \
+   && grep -qx "changed region matches seed exactly: True" "$d/out"; then
+    ok "fix-kexec-dtb.py finds and zeros a real nonzero kaslr-seed, exactly 8 bytes changed, nothing else touched"
+else
+    cat "$d/out" 2>/dev/null; bad "fix-kexec-dtb.py did not correctly zero the kaslr-seed"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== fix-kexec-dtb.py: kaslr-seed absent, already zero, missing fdt, and malformed input - all no-ops, never a false positive or a crash =="
+d="$(fresh_env)"
+python3 - "$REPO_ROOT/init/fix-kexec-dtb.py" "$d" > "$d/out" 2>&1 <<'PYEOF'
+import importlib.util, os, struct, sys
+
+fix_kexec_dtb_path, workdir = sys.argv[1], sys.argv[2]
+FDT_BEGIN_NODE, FDT_END_NODE, FDT_PROP, FDT_END = 1, 2, 3, 9
+
+def build_fdt(kaslr_seed=None):
+    strings, offs, struct_block = bytearray(), {}, bytearray()
+
+    def strid(name):
+        if name not in offs:
+            offs[name] = len(strings)
+            strings.extend(name.encode() + b"\0")
+        return offs[name]
+
+    def align4(b):
+        while len(b) % 4:
+            b.append(0)
+
+    def begin(name):
+        struct_block.extend(struct.pack(">I", FDT_BEGIN_NODE))
+        struct_block.extend(name.encode() + b"\0")
+        align4(struct_block)
+
+    def end():
+        struct_block.extend(struct.pack(">I", FDT_END_NODE))
+
+    def prop(name, data):
+        struct_block.extend(struct.pack(">III", FDT_PROP, len(data), strid(name)))
+        struct_block.extend(data)
+        align4(struct_block)
+
+    begin("")
+    begin("chosen")
+    prop("bootargs", b"console=ttyS0\0")
+    if kaslr_seed is not None:
+        prop("kaslr-seed", kaslr_seed)
+    end()
+    end()
+    struct_block.extend(struct.pack(">I", FDT_END))
+    align4(struct_block)
+
+    mem_rsvmap = struct.pack(">QQ", 0, 0)
+    off_mem_rsvmap = 40
+    off_dt_struct = off_mem_rsvmap + len(mem_rsvmap)
+    off_dt_strings = off_dt_struct + len(struct_block)
+    totalsize = off_dt_strings + len(strings)
+    header = struct.pack(">10I", 0xD00DFEED, totalsize, off_dt_struct,
+                          off_dt_strings, off_mem_rsvmap, 17, 16, 0,
+                          len(strings), len(struct_block))
+    return bytes(header) + mem_rsvmap + bytes(struct_block) + bytes(strings)
+
+spec = importlib.util.spec_from_file_location("fix_kexec_dtb", fix_kexec_dtb_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+def run(label, live_path, out_name):
+    mod.LIVE_FDT_PATH = live_path
+    out_path = os.path.join(workdir, out_name)
+    sys.argv = ["fix-kexec-dtb.py", out_path]
+    rc = mod.main()
+    print(f"{label}: rc={rc} wrote_output={os.path.exists(out_path)}")
+
+absent_path = os.path.join(workdir, "absent-seed.dtb")
+open(absent_path, "wb").write(build_fdt(kaslr_seed=None))
+run("absent", absent_path, "absent-out.dtb")
+
+zero_path = os.path.join(workdir, "zero-seed.dtb")
+open(zero_path, "wb").write(build_fdt(kaslr_seed=bytes(8)))
+run("already-zero", zero_path, "zero-out.dtb")
+
+run("no-fdt-file", os.path.join(workdir, "does-not-exist.dtb"), "missing-out.dtb")
+
+garbage_path = os.path.join(workdir, "garbage.dtb")
+open(garbage_path, "wb").write(b"not an fdt blob, just garbage bytes 1234567890")
+run("garbage", garbage_path, "garbage-out.dtb")
+PYEOF
+if grep -qx "absent: rc=0 wrote_output=False" "$d/out" \
+   && grep -qx "already-zero: rc=0 wrote_output=False" "$d/out" \
+   && grep -qx "no-fdt-file: rc=1 wrote_output=False" "$d/out" \
+   && grep -qx "garbage: rc=1 wrote_output=False" "$d/out"; then
+    ok "fix-kexec-dtb.py is a clean no-op on every case that isn't the real bug - never writes a file, never a nonzero rc on the two genuinely-fine cases"
+else
+    cat "$d/out" 2>/dev/null; bad "fix-kexec-dtb.py did not behave as a safe no-op on one of the non-bug cases"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== boot-dataset.sh: fix-kexec-dtb.py finding nothing to fix -> kexec called with no --dtb= at all (identical to today) =="
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"
+: > "$d/pooldata/boot/initramfs-lts"
+cat > "$d/fake-fix-kexec-dtb.py" <<'EOF'
+import sys
+sys.exit(1)  # "nothing to do" - the real script's own contract on every non-bug platform
+EOF
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    STUB_FIX_KEXEC_DTB_SCRIPT="$d/fake-fix-kexec-dtb.py" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -q -- "-l .*vmlinuz-lts --initrd=.*initramfs-lts --command-line=" "$d/log" \
+   && ! grep -q -- "--dtb=" "$d/log"; then
+    ok "no --dtb= passed when there's nothing to fix - identical kexec invocation to before this change"
+else
+    cat "$d/log" 2>/dev/null; bad "kexec -l invocation changed even though fix-kexec-dtb.py found nothing to fix"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== boot-dataset.sh: fix-kexec-dtb.py finding a real fix -> --dtb= passed to kexec with the fixed path =="
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"
+: > "$d/pooldata/boot/initramfs-lts"
+cat > "$d/fake-fix-kexec-dtb.py" <<EOF
+import sys
+out = sys.argv[1]
+open(out, "wb").write(b"fake fixed dtb bytes")
+print(out)
+EOF
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    STUB_FIX_KEXEC_DTB_SCRIPT="$d/fake-fix-kexec-dtb.py" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -q -- "--dtb=/tmp/kexec-fixed.dtb" "$d/log"; then
+    ok "--dtb=<fixed path> passed to kexec when fix-kexec-dtb.py found and fixed a nonzero kaslr-seed"
+else
+    cat "$d/log" 2>/dev/null; bad "--dtb= was not passed to kexec even though fix-kexec-dtb.py reported a fix"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== boot-dataset.sh: kexec -l failure also prints WHY the kaslr-seed workaround didn't fire =="
+# PR #14 review (F1, unidoc-alip): this is exactly what happened for
+# real in commit ba97630's own bug - fix-kexec-dtb.py missing from the
+# initramfs, kexec_dtb_arg stayed empty, and the console showed the
+# bare "kexec: setup_2nd_dtb failed." with no clue that a workaround
+# had even been attempted. /tmp/kexec-dtb-fix.log (fix-kexec-dtb.py's
+# own stderr) had the real reason the whole time, just never printed.
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"
+: > "$d/pooldata/boot/initramfs-lts"
+# A kexec stub that fails -l with the real kexec-tools message -
+# every other test in this file uses the default always-succeeds stub
+# (tests/stubs/kexec), so this one needs its own STUBS copy.
+stubs_copy="$d/stubs"
+cp -R "$STUBS" "$stubs_copy"
+cat > "$stubs_copy/kexec" <<'EOF'
+#!/bin/sh
+echo "kexec $*" >> "${STUB_LOG:-/dev/null}"
+case " $* " in
+    *" -l "*) echo "kexec: setup_2nd_dtb failed." >&2; echo "kexec: load failed." >&2; exit 255 ;;
+esac
+exit 0
+EOF
+chmod +x "$stubs_copy/kexec"
+cat > "$d/fake-fix-kexec-dtb.py" <<'EOF'
+import sys
+print("fix-kexec-dtb.py: could not parse /sys/firmware/fdt (unrecognized FDT structure token 7 at offset 64) - leaving kexec's own DTB auto-discovery alone", file=sys.stderr)
+sys.exit(1)
+EOF
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    STUB_FIX_KEXEC_DTB_SCRIPT="$d/fake-fix-kexec-dtb.py" \
+    STUBS="$stubs_copy" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -q "setup_2nd_dtb failed" "$d/out" && grep -q "could not parse .*unrecognized FDT structure token" "$d/out"; then
+    ok "kexec -l failure output also shows why fix-kexec-dtb.py's workaround didn't fire"
+else
+    cat "$d/out" 2>/dev/null; bad "kexec -l failure did not also surface fix-kexec-dtb.py's own diagnostic"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== boot-dataset.sh: zpool export failing before the jump stops the boot via fail(), never a silent kexec -e =="
 # Regression test for a real gap a full source audit found: `zpool
 # export "$POOL"` right before the kexec jump was called with its exit
