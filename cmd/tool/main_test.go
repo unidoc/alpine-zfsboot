@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/unidoc/alpine-zfsboot/internal/biosboot"
@@ -650,4 +651,34 @@ func TestWithCleanup(t *testing.T) {
 	if activeCleanup != nil {
 		t.Error("the deferred closure did not reset activeCleanup to nil")
 	}
+}
+
+// TestRunActiveCleanupConcurrent is the regression test for the race
+// main()'s new signal handler introduces: it calls runActiveCleanup()
+// from its own goroutine while a Run closure's goroutine is concurrently
+// setting/resetting activeCleanup via withCleanup - two goroutines
+// touching the same var, where before this fix there was only ever one.
+// `go test -race` only catches an unguarded access if something in the
+// test actually exercises it concurrently; this test's job is to be
+// that exercise, not just to assert a final call count.
+func TestRunActiveCleanupConcurrent(t *testing.T) {
+	t.Cleanup(func() {
+		activeCleanupMu.Lock()
+		activeCleanup = nil
+		activeCleanupMu.Unlock()
+	})
+
+	var calls atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 500 {
+			deferFn := withCleanup(func() { calls.Add(1) })
+			deferFn()
+		}
+	}()
+	for range 500 {
+		runActiveCleanup()
+	}
+	<-done
 }

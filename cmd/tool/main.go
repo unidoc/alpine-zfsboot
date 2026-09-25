@@ -26,9 +26,12 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -58,6 +61,21 @@ import (
 var version = "dev"
 
 func main() {
+	// A killing signal (Ctrl-C, an SSH session dropping, a closed
+	// terminal) bypasses deferred cleanup exactly like os.Exit does -
+	// found live, not hypothetically: a status/verify run left its own
+	// ESP mount and MountESP's temp mountpoint dir behind on a real
+	// host after being interrupted mid-run. Routes through the same
+	// activeCleanup already built for die()'s os.Exit bypass, so both
+	// gaps close through one mechanism.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		<-sigCh
+		runActiveCleanup()
+		os.Exit(1)
+	}()
+
 	rootCmd := &cobra.Command{
 		Use:     "alpine-zfsboot",
 		Short:   "alpine-zfsboot by UniDoc - the authoritative management interface for an installed alpine-zfsboot boot environment",
@@ -99,10 +117,12 @@ func detectArch() string {
 	}
 }
 
-// activeCleanup, if non-nil, is called by die() before os.Exit - a full
-// source audit found os.Exit bypasses every deferred t.cleanup() a
+// activeCleanup, if non-nil, is called (via runActiveCleanup) by die()
+// before os.Exit and by main()'s own signal handler before it too - a
+// full source audit found os.Exit bypasses every deferred t.cleanup() a
 // command already registered (Go never runs pending defers across
-// os.Exit), so any die() call anywhere after discover() succeeded -
+// os.Exit, and the same is true of a process killed by an unhandled
+// signal), so any die() call anywhere after discover() succeeded -
 // which every status/verify/update/install Run closure does - leaked
 // the ESP mount: MountESP's own temp mountpoint directory, and worse,
 // the ESP itself staying mounted with nothing left in this process
@@ -115,16 +135,32 @@ func detectArch() string {
 // discover()-calling Run closures right after discover() succeeds;
 // reset to nil by the same closure's own deferred cleanup, so a
 // (currently unreachable, but not structurally prevented) later die()
-// can't double-call an already-unmounted cleanup.
-var activeCleanup func()
+// can't double-call an already-unmounted cleanup. Guarded by a mutex
+// since main()'s signal handler now reads it from a separate goroutine
+// than the one that sets/clears it.
+var (
+	activeCleanupMu sync.Mutex
+	activeCleanup   func()
+)
+
+// runActiveCleanup is the one place that reads-then-calls
+// activeCleanup - both die() and main()'s signal handler go through
+// this instead of touching the var directly, so there's exactly one
+// lock/read/call sequence to get right.
+func runActiveCleanup() {
+	activeCleanupMu.Lock()
+	cleanup := activeCleanup
+	activeCleanupMu.Unlock()
+	if cleanup != nil {
+		cleanup()
+	}
+}
 
 func die(err error) {
 	if err == nil {
 		return
 	}
-	if activeCleanup != nil {
-		activeCleanup()
-	}
+	runActiveCleanup()
 	fmt.Fprintln(os.Stderr, "alpine-zfsboot:", err)
 	os.Exit(1)
 }
@@ -135,9 +171,13 @@ func die(err error) {
 // OWN enclosing function returns, so this can't set the defer up on
 // the caller's behalf - only hand back what to defer).
 func withCleanup(cleanup func()) func() {
+	activeCleanupMu.Lock()
 	activeCleanup = cleanup
+	activeCleanupMu.Unlock()
 	return func() {
+		activeCleanupMu.Lock()
 		activeCleanup = nil
+		activeCleanupMu.Unlock()
 		cleanup()
 	}
 }
