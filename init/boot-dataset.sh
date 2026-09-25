@@ -1109,7 +1109,7 @@ fi
 kexec_dtb_arg=""
 kexec_dtb_fixed="$(python3 "${STUB_FIX_KEXEC_DTB_SCRIPT:-/fix-kexec-dtb.py}" /tmp/kexec-fixed.dtb 2>/tmp/kexec-dtb-fix.log)" || true
 if [ -n "$kexec_dtb_fixed" ] && [ -r "$kexec_dtb_fixed" ]; then
-    msg "worked around a nonzero /chosen/kaslr-seed in the live device tree (see /tmp/kexec-dtb-fix.log) - passing --dtb=$kexec_dtb_fixed to kexec"
+    msg "worked around a nonzero /chosen/kaslr-seed in the live device tree - passing --dtb=$kexec_dtb_fixed to kexec"
     kexec_dtb_arg="--dtb=$kexec_dtb_fixed"
 fi
 
@@ -1117,6 +1117,17 @@ if ! kexec -l "$kernel" --initrd="$kexec_initrd" \
     ${kexec_dtb_arg:+"$kexec_dtb_arg"} \
     --command-line="$full_cmdline" 2>/tmp/kexec-l.log; then
     cat /tmp/kexec-l.log
+    # fix-kexec-dtb.py's own stderr (why the kaslr-seed workaround
+    # didn't fire, if it didn't) - real-host-found (PR #14 review,
+    # unidoc-alip): this is exactly where ba97630's bug showed up
+    # (fix-kexec-dtb.py missing from the initramfs, kexec_dtb_arg empty,
+    # console showing the same bare "setup_2nd_dtb failed." as if this
+    # workaround didn't exist at all) - printing this log is what would
+    # have made that diagnosable from the console alone.
+    if [ -s /tmp/kexec-dtb-fix.log ]; then
+        msg "the kaslr-seed DTB workaround (fix-kexec-dtb.py) did not apply:"
+        cat /tmp/kexec-dtb-fix.log
+    fi
     fail "kexec -l failed for $DATASET"
 fi
 

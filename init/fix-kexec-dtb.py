@@ -111,7 +111,7 @@ def find_and_zero_kaslr_seed(data):
             strp = off_dt_strings + nameoff
             nul = data.index(b"\0", strp)
             propname = data[strp:nul].decode()
-            if (path_stack and path_stack[-1] == "chosen"
+            if (path_stack == ["", "chosen"]
                     and propname == "kaslr-seed"):
                 found_offset, found_len = pos, plen
             pos = (pos + plen + 3) & ~3
@@ -147,7 +147,7 @@ def main():
 
     try:
         changed = find_and_zero_kaslr_seed(data)
-    except (ValueError, IndexError) as e:
+    except (ValueError, IndexError, struct.error) as e:
         print(f"fix-kexec-dtb.py: could not parse {LIVE_FDT_PATH} ({e}) - leaving kexec's own DTB auto-discovery alone", file=sys.stderr)
         return 1
 

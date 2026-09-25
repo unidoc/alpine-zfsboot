@@ -143,16 +143,29 @@ var (
 	activeCleanup   func()
 )
 
-// runActiveCleanup is the one place that reads-then-calls
+// runActiveCleanup is the one place that reads, calls, and clears
 // activeCleanup - both die() and main()'s signal handler go through
-// this instead of touching the var directly, so there's exactly one
-// lock/read/call sequence to get right.
+// this instead of touching the var directly. The whole thing runs
+// under the lock, not just the read: die()'s os.Exit path made
+// activeCleanup the only other caller until main()'s signal handler
+// added a second one, and with two real callers a lock that only
+// guards the pointer read leaves two live races - a handler that sees
+// nil mid-unmount and exits without waiting for it, and a handler and
+// a Run closure's own deferred cleanup both calling MountESP's cleanup
+// (the second unmount(2) then fails and prints a "remains mounted"
+// warning about a mount that's actually already gone). Holding the
+// lock across the call fixes both: cleanup runs at most once across
+// die(), the signal handler, and the defer, and a caller that arrives
+// while another is running blocks until it finishes instead of racing
+// past it. Safe from deadlock only because no cleanup ever calls back
+// into runActiveCleanup/die - MountESP's cleanup (unmount + rmdir)
+// never does.
 func runActiveCleanup() {
 	activeCleanupMu.Lock()
-	cleanup := activeCleanup
-	activeCleanupMu.Unlock()
-	if cleanup != nil {
-		cleanup()
+	defer activeCleanupMu.Unlock()
+	if activeCleanup != nil {
+		activeCleanup()
+		activeCleanup = nil
 	}
 }
 
@@ -169,17 +182,16 @@ func die(err error) {
 // remainder of the calling Run closure, and returns a func the caller
 // must immediately `defer` itself (defer only ever delays until its
 // OWN enclosing function returns, so this can't set the defer up on
-// the caller's behalf - only hand back what to defer).
+// the caller's behalf - only hand back what to defer). That returned
+// func is just runActiveCleanup itself - each process runs exactly one
+// Run closure with one withCleanup call active at a time, so "run
+// whatever cleanup activeCleanup currently holds" and "run the
+// cleanup this call just registered" are the same thing here.
 func withCleanup(cleanup func()) func() {
 	activeCleanupMu.Lock()
 	activeCleanup = cleanup
 	activeCleanupMu.Unlock()
-	return func() {
-		activeCleanupMu.Lock()
-		activeCleanup = nil
-		activeCleanupMu.Unlock()
-		cleanup()
-	}
+	return runActiveCleanup
 }
 
 func confirm(prompt string) bool {

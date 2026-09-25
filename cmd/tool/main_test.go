@@ -624,6 +624,14 @@ func TestSelectBootPool(t *testing.T) {
 // process along with everything it's trying to prove - the same
 // os.Exit constraint every other test in this file already works
 // around.
+//
+// PR #14 review (F2, unidoc-alip): withCleanup's returned func is now
+// literally runActiveCleanup - die() and a Run closure's own deferred
+// cleanup are two callers of the SAME function, and it runs the
+// registered cleanup at most once (guarded by the lock, cleared right
+// after the call) rather than once per caller. This test's second call
+// asserts exactly that: a call after cleanup has already run is a safe
+// no-op, not a second cleanup.
 func TestWithCleanup(t *testing.T) {
 	t.Cleanup(func() { activeCleanup = nil }) // don't leak into other tests
 
@@ -635,21 +643,22 @@ func TestWithCleanup(t *testing.T) {
 	}
 	// Simulates exactly what die() does on a failure reached after
 	// discover() succeeded, without invoking its own os.Exit.
-	activeCleanup()
+	runActiveCleanup()
 	if called != 1 {
-		t.Fatalf("activeCleanup() call count = %d, want 1", called)
-	}
-
-	// The deferred closure a real Run closure actually defers - confirm
-	// it ALSO calls cleanup (the normal-return path) and resets
-	// activeCleanup afterward (so a later die() in some other command
-	// invocation can't double-call an already-unmounted cleanup).
-	deferFn()
-	if called != 2 {
-		t.Fatalf("deferred closure call count = %d, want 2", called)
+		t.Fatalf("runActiveCleanup() call count = %d, want 1", called)
 	}
 	if activeCleanup != nil {
-		t.Error("the deferred closure did not reset activeCleanup to nil")
+		t.Error("runActiveCleanup did not reset activeCleanup to nil")
+	}
+
+	// The deferred closure a real Run closure actually defers - IS
+	// runActiveCleanup (see withCleanup's own doc comment), so calling
+	// it again after die()'s own call already ran must be a no-op, not
+	// a second cleanup - this is exactly the "die() then defer" ordering
+	// that used to double-call cleanup before F2.
+	deferFn()
+	if called != 1 {
+		t.Fatalf("deferred closure call count after an already-run cleanup = %d, want 1 (no double-call)", called)
 	}
 }
 

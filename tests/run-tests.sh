@@ -528,6 +528,48 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+echo "== boot-dataset.sh: kexec -l failure also prints WHY the kaslr-seed workaround didn't fire =="
+# PR #14 review (F1, unidoc-alip): this is exactly what happened for
+# real in commit ba97630's own bug - fix-kexec-dtb.py missing from the
+# initramfs, kexec_dtb_arg stayed empty, and the console showed the
+# bare "kexec: setup_2nd_dtb failed." with no clue that a workaround
+# had even been attempted. /tmp/kexec-dtb-fix.log (fix-kexec-dtb.py's
+# own stderr) had the real reason the whole time, just never printed.
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"
+: > "$d/pooldata/boot/initramfs-lts"
+# A kexec stub that fails -l with the real kexec-tools message -
+# every other test in this file uses the default always-succeeds stub
+# (tests/stubs/kexec), so this one needs its own STUBS copy.
+stubs_copy="$d/stubs"
+cp -R "$STUBS" "$stubs_copy"
+cat > "$stubs_copy/kexec" <<'EOF'
+#!/bin/sh
+echo "kexec $*" >> "${STUB_LOG:-/dev/null}"
+case " $* " in
+    *" -l "*) echo "kexec: setup_2nd_dtb failed." >&2; echo "kexec: load failed." >&2; exit 255 ;;
+esac
+exit 0
+EOF
+chmod +x "$stubs_copy/kexec"
+cat > "$d/fake-fix-kexec-dtb.py" <<'EOF'
+import sys
+print("fix-kexec-dtb.py: could not parse /sys/firmware/fdt (unrecognized FDT structure token 7 at offset 64) - leaving kexec's own DTB auto-discovery alone", file=sys.stderr)
+sys.exit(1)
+EOF
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    STUB_FIX_KEXEC_DTB_SCRIPT="$d/fake-fix-kexec-dtb.py" \
+    STUBS="$stubs_copy" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -q "setup_2nd_dtb failed" "$d/out" && grep -q "could not parse .*unrecognized FDT structure token" "$d/out"; then
+    ok "kexec -l failure output also shows why fix-kexec-dtb.py's workaround didn't fire"
+else
+    cat "$d/out" 2>/dev/null; bad "kexec -l failure did not also surface fix-kexec-dtb.py's own diagnostic"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== boot-dataset.sh: zpool export failing before the jump stops the boot via fail(), never a silent kexec -e =="
 # Regression test for a real gap a full source audit found: `zpool
 # export "$POOL"` right before the kexec jump was called with its exit
