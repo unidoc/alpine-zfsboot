@@ -1205,20 +1205,70 @@ def unlock_encrypted_root():
         dialog_msgbox("Unlock encrypted root", f"{BOOTFS} is not encrypted - nothing to unlock.")
         return
     if status["keystatus"] == "available" and status["handoff_ready"]:
-        dialog_msgbox("Unlock encrypted root",
-                       f"{status['encryptionroot']} is already UNLOCKED - kexec handoff READY.")
+        _offer_to_end_session(f"{status['encryptionroot']} is already UNLOCKED - kexec handoff READY.")
         return
     subprocess.run([ZFS_UNLOCK_SH, "unlock", status["encryptionroot"]])
     status = encryption_status(BOOTFS)
     if status["keystatus"] != "available":
         dialog_msgbox("Unlock encrypted root", f"{status['encryptionroot']} is still LOCKED.")
     elif status["handoff_ready"]:
-        dialog_msgbox("Unlock encrypted root",
-                       f"{status['encryptionroot']} is UNLOCKED - kexec handoff READY. Boot will not prompt again.")
+        _offer_to_end_session(
+            f"{status['encryptionroot']} is UNLOCKED - kexec handoff READY. Boot will not prompt again.")
     else:
         dialog_msgbox("Unlock encrypted root",
                        f"{status['encryptionroot']} is UNLOCKED, but kexec handoff is NOT READY - "
                        "boot will re-prompt for the passphrase after kexec. Try 'Unlock encrypted root' again to fix this.")
+
+
+def _offer_to_end_session(text):
+    """Issue #7: after a successful "Unlock encrypted root" (this run,
+    or already-unlocked-before-this-run), the operator may have
+    nothing left to do here - unlocking is often the LAST step of a
+    rescue session, not just one among several (contrast this with
+    unlock_encrypted_root()'s own docstring on the "unlock while
+    inspecting/chrooting, THEN boot" workflow, which is exactly why
+    this is a yes/no CHOICE, not an unconditional exit: auto-closing
+    the connection the moment unlock succeeds would defeat that other
+    workflow for anyone who still wants to chroot in or check
+    diagnostics first).
+
+    Before this, the success message was a plain dialog_msgbox with no
+    way to leave from here - reported directly from real hardware
+    (Hetzner, over rescue SSH): the operator had to disconnect their
+    own SSH client by hand (~.), leaving the success dialog on screen
+    with "Connection to ... closed" overlaid on top of it.
+
+    Yes -> sys.exit() (a plain exit - NOT the special exit(42)
+    select_console() uses for its own live-console relaunch, which
+    means something specific to /init and does not apply here), which
+    ends this process and, with it, dropbear's session for this
+    connection. No (the default - default_no=True, same convention as
+    every other real "are you sure" prompt in this file, e.g. the
+    delete-snapshot confirmation) falls through and returns, exactly
+    like the plain dialog_msgbox this replaced did.
+
+    ONLY offered over rescue SSH (unidoc-alip's PR #11 review, F1):
+    over SSH, alpine-zfsboot-shell execs this process directly, so
+    exiting really does end just that connection - but on the local
+    console this process is /init's own child (init/init's own
+    "python3 /menu.py" loop), and /init treats ANY exit other than the
+    special 42 as "menu.py missing or crashed", falling straight
+    through to automatic boot (exec /boot-dataset.sh on the default
+    BOOTFS, or die() under ALPINE_ZFSBOOT_FORCED_RESCUE) - see
+    init/init's own comment on that loop. A console operator answering
+    Yes to a question about ending "this rescue SSH session" would
+    instead kexec straight into a boot environment they never picked,
+    with no passphrase re-prompt (the handoff secret is already
+    staged) - the exact opposite of "additive only". IS_SSH_SESSION is
+    the real, transport-based signal for this (see its own module-
+    level comment), checked here instead of guessing from the console/
+    tty state some other way.
+    """
+    if not IS_SSH_SESSION:
+        dialog_msgbox("Unlock encrypted root", text)
+        return
+    if dialog_yesno("Unlock encrypted root", f"{text}\n\nEnd this rescue SSH session now?", default_no=True):
+        sys.exit()
 
 
 def lock_encrypted_root():

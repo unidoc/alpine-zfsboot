@@ -3442,6 +3442,243 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+echo "== menu.py: unlock_encrypted_root() offers to end the rescue-SSH session when already-ready, and Yes actually exits (SSH only) =="
+# Issue #7, unidoc-alip's PR #11 review, F2: SSH_CONNECTION is now set
+# explicitly - _offer_to_end_session() is gated on IS_SSH_SESSION (F1),
+# so without this the Yes prompt would never even appear and this test
+# would silently degenerate into testing the wrong thing depending on
+# whether the runner happens to have SSH_* set.
+d="$(fresh_env)"
+mkdir -p "$d/encfs" "$d/root/tmp"
+printf 'staged-secret' > "$d/root/tmp/zfs-key.zroot_ROOT_alpine"
+cat > "$d/encfs/zfs" <<'EOF'
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$ds:$prop" in
+            "zroot/ROOT/alpine:encryptionroot") echo "zroot/ROOT/alpine" ;;
+            "zroot/ROOT/alpine:keystatus") echo "available" ;;
+            *) echo "-" ;;
+        esac
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$d/encfs/zfs"
+env -u SSH_TTY SSH_CONNECTION="10.0.0.1 1 10.0.0.2 22" \
+    PATH="$d/encfs:$PATH" STUB_LOG="$d/log" STUB_ROOT="$d/root" \
+    python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+
+yesno_calls = []
+menu.dialog_yesno = lambda title, text, default_no=True: (yesno_calls.append((title, text, default_no)), True)[1]
+
+try:
+    menu.unlock_encrypted_root()
+    print("returned normally - BUG, sys.exit() should have fired")
+except SystemExit:
+    print("SystemExit raised - correct")
+
+title, text, default_no = yesno_calls[0]
+print("dialog title:", title)
+print("dialog default_no:", default_no)
+print("dialog mentions READY:", "kexec handoff READY" in text)
+print("dialog asks to end session:", "End this rescue SSH session now?" in text)
+PYEOF
+if grep -qx "SystemExit raised - correct" "$d/out" \
+   && grep -qx "dialog default_no: True" "$d/out" \
+   && grep -qx "dialog mentions READY: True" "$d/out" \
+   && grep -qx "dialog asks to end session: True" "$d/out"; then
+    ok "unlock_encrypted_root() offers Yes/No to end the session (default No) and Yes really exits (already-ready, SSH)"
+else
+    cat "$d/out"; bad "unlock_encrypted_root() did not offer to end the session as expected (already-ready, SSH)"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== menu.py: unlock_encrypted_root() offers to end the session after UNLOCKING THIS RUN too, and Yes actually exits (SSH only) =="
+# unidoc-alip's PR #11 review, F2: the test above only exercises the
+# "already unlocked before this run" early return (lines ~1207-1209) -
+# it never reaches the actual #7 scenario, the branch at ~1214-1216
+# that runs AFTER a real subprocess.run([ZFS_UNLOCK_SH, ...]) call.
+# keystatus starts "unavailable" and only flips to "available" once
+# STUB_ZFS_UNLOCK_SH's own stub has actually run (mirroring how the
+# real zfs-unlock changes keystatus) - proving this specific branch,
+# not just the early-return one, offers the prompt and really exits.
+# Asserting the stub was called is what makes this a different branch
+# from the test above, not just the same assertions run twice.
+d="$(fresh_env)"
+mkdir -p "$d/encfs" "$d/root/tmp"
+cat > "$d/encfs/zfs" <<EOF
+#!/bin/sh
+echo "zfs \$*" >> "\${STUB_LOG:-/dev/null}"
+case "\$1" in
+    get)
+        prop="\$5"; ds="\$6"
+        case "\$ds:\$prop" in
+            "zroot/ROOT/alpine:encryptionroot") echo "zroot/ROOT/alpine" ;;
+            "zroot/ROOT/alpine:keystatus")
+                if [ -e "$d/marker" ]; then echo available; else echo unavailable; fi ;;
+            *) echo "-" ;;
+        esac
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$d/encfs/zfs"
+cat > "$d/encfs/zfs-unlock" <<EOF
+#!/bin/sh
+echo "zfs-unlock \$*" >> "\${STUB_LOG:-/dev/null}"
+: > "$d/marker"
+printf 'staged-secret' > "$d/root/tmp/zfs-key.zroot_ROOT_alpine"
+EOF
+chmod +x "$d/encfs/zfs-unlock"
+env -u SSH_TTY SSH_CONNECTION="10.0.0.1 1 10.0.0.2 22" \
+    PATH="$d/encfs:$PATH" STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_ZFS_UNLOCK_SH="$d/encfs/zfs-unlock" \
+    python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+
+yesno_calls = []
+menu.dialog_yesno = lambda title, text, default_no=True: (yesno_calls.append((title, text, default_no)), True)[1]
+
+try:
+    menu.unlock_encrypted_root()
+    print("returned normally - BUG, sys.exit() should have fired")
+except SystemExit:
+    print("SystemExit raised - correct")
+
+title, text, default_no = yesno_calls[0]
+print("dialog title:", title)
+print("dialog default_no:", default_no)
+print("dialog mentions READY:", "kexec handoff READY" in text)
+print("dialog asks to end session:", "End this rescue SSH session now?" in text)
+PYEOF
+if grep -qx "SystemExit raised - correct" "$d/out" \
+   && grep -qx "dialog default_no: True" "$d/out" \
+   && grep -qx "dialog mentions READY: True" "$d/out" \
+   && grep -qx "dialog asks to end session: True" "$d/out" \
+   && grep -q "^zfs-unlock unlock zroot/ROOT/alpine$" "$d/log" 2>/dev/null; then
+    ok "unlock_encrypted_root() offers Yes/No and Yes really exits after unlocking THIS run (the actual #7 scenario)"
+else
+    cat "$d/out"; cat "$d/log" 2>/dev/null; bad "unlock_encrypted_root() did not offer to end the session after unlocking this run"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== menu.py: unlock_encrypted_root() answering No returns to the main menu, exactly like the old plain dialog did (SSH) =="
+d="$(fresh_env)"
+mkdir -p "$d/encfs" "$d/root/tmp"
+printf 'staged-secret' > "$d/root/tmp/zfs-key.zroot_ROOT_alpine"
+cat > "$d/encfs/zfs" <<'EOF'
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$ds:$prop" in
+            "zroot/ROOT/alpine:encryptionroot") echo "zroot/ROOT/alpine" ;;
+            "zroot/ROOT/alpine:keystatus") echo "available" ;;
+            *) echo "-" ;;
+        esac
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$d/encfs/zfs"
+env -u SSH_TTY SSH_CONNECTION="10.0.0.1 1 10.0.0.2 22" \
+    PATH="$d/encfs:$PATH" STUB_LOG="$d/log" STUB_ROOT="$d/root" \
+    python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+menu.dialog_yesno = lambda title, text, default_no=True: False
+menu.unlock_encrypted_root()
+print("returned normally - correct")
+PYEOF
+if grep -qx "returned normally - correct" "$d/out"; then
+    ok "unlock_encrypted_root() answering No falls through and returns, same as before this feature"
+else
+    cat "$d/out"; bad "unlock_encrypted_root() did not return normally on No"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== menu.py: unlock_encrypted_root() on the LOCAL CONSOLE never offers to end a session - old plain msgbox, no exit (F1 negative control) =="
+# unidoc-alip's PR #11 review, F1 (must-fix): over SSH, menu.py IS the
+# login shell (alpine-zfsboot-shell execs it), so exiting ends just
+# that connection. On the local console menu.py is /init's own child -
+# ANY exit other than the special 42 is /init's "menu.py missing or
+# crashed" fallback, which kexecs straight into the default boot
+# environment with no passphrase re-prompt (the handoff secret is
+# already staged). A console operator must never be asked "end this
+# rescue SSH session?" and must never have Yes actually exit the
+# process - this is the direct regression test for that, with
+# SSH_CONNECTION/SSH_TTY explicitly unset (not just "happens to be
+# unset on this runner"). menu.dialog_yesno is stubbed to explode if
+# called at all - it must never even be reached here.
+d="$(fresh_env)"
+mkdir -p "$d/encfs" "$d/root/tmp"
+printf 'staged-secret' > "$d/root/tmp/zfs-key.zroot_ROOT_alpine"
+cat > "$d/encfs/zfs" <<'EOF'
+#!/bin/sh
+echo "zfs $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+    get)
+        prop="$5"; ds="$6"
+        case "$ds:$prop" in
+            "zroot/ROOT/alpine:encryptionroot") echo "zroot/ROOT/alpine" ;;
+            "zroot/ROOT/alpine:keystatus") echo "available" ;;
+            *) echo "-" ;;
+        esac
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$d/encfs/zfs"
+env -u SSH_CONNECTION -u SSH_TTY \
+    PATH="$d/encfs:$PATH" STUB_LOG="$d/log" STUB_ROOT="$d/root" \
+    python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+
+def _boom(*a, **kw):
+    raise AssertionError("dialog_yesno must never be called on the local console")
+menu.dialog_yesno = _boom
+
+msgbox_calls = []
+menu.dialog_msgbox = lambda title, text: msgbox_calls.append((title, text))
+
+try:
+    menu.unlock_encrypted_root()
+    print("returned normally - correct")
+except SystemExit as e:
+    print(f"SystemExit({e.code!r}) raised - BUG, must never exit on the local console")
+except AssertionError as e:
+    print(f"AssertionError: {e}")
+
+print("msgbox_call_count:", len(msgbox_calls))
+if msgbox_calls:
+    print("msgbox mentions READY:", "kexec handoff READY" in msgbox_calls[0][1])
+    print("msgbox asks to end session:", "End this rescue SSH session now?" in msgbox_calls[0][1])
+PYEOF
+if grep -qx "returned normally - correct" "$d/out" \
+   && grep -qx "msgbox_call_count: 1" "$d/out" \
+   && grep -qx "msgbox mentions READY: True" "$d/out" \
+   && grep -qx "msgbox asks to end session: False" "$d/out"; then
+    ok "unlock_encrypted_root() on the local console shows the old plain msgbox and never offers/exits"
+else
+    cat "$d/out"; bad "unlock_encrypted_root() on the local console did not behave like the pre-#7 plain msgbox"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== menu.py: deploy() refuses to zpool create over an already-imported pool =="
 d="$(fresh_env)"
 cat > "$d/stub-zpool" <<'EOF'
