@@ -473,6 +473,7 @@ mkdir -p "$BUILD_DIR/features.d"
     echo "/etc/alpine-zfsboot-version"
     echo "/menu.py"
     echo "/boot-dataset.sh"
+    echo "/fix-kexec-dtb.py"
     # net-config.sh/rescue-ssh.sh - factored out of /init's own body so
     # both /init and boot-dataset.sh can source the SAME implementation
     # (each is a separate process image by the time boot-dataset.sh
@@ -1031,7 +1032,7 @@ echo "menu.py import check passed against the actual bundled initramfs contents"
 # wrong before, so it fails the BUILD instead of a real boot next time.
 for f in /etc/apk/repositories /etc/apk/keys /etc/apk/world /etc/ssl/certs /etc/ssl/cert.pem \
          /lib/apk/db/installed /etc/dialogrc /etc/alpine-zfsboot-build-stamp /etc/alpine-zfsboot-version \
-         /usr/share/zfs/compatibility.d /etc/shells /boot/alpine-zfsboot; do
+         /usr/share/zfs/compatibility.d /etc/shells /boot/alpine-zfsboot /fix-kexec-dtb.py; do
     if [ ! -e "$verify_dir$f" ]; then
         echo "$f is missing from the bundled initramfs - its content-generation and its alpine-zfsboot.files manifest entry have drifted apart, add/fix the missing one" >&2
         exit 1
