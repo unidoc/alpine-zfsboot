@@ -810,6 +810,7 @@ EOF
 
 cp "$REPO_ROOT/init/menu.py" /menu.py
 cp "$REPO_ROOT/init/boot-dataset.sh" /boot-dataset.sh
+cp "$REPO_ROOT/init/fix-kexec-dtb.py" /fix-kexec-dtb.py
 cp "$REPO_ROOT/init/net-config.sh" /net-config.sh
 cp "$REPO_ROOT/init/rescue-ssh.sh" /rescue-ssh.sh
 cp "$REPO_ROOT/init/pid-alive.sh" /pid-alive.sh
@@ -817,7 +818,7 @@ cp "$REPO_ROOT/init/zfs-unlock.sh" /zfs-unlock.sh
 cp "$REPO_ROOT/init/zfs-unlock" /zfs-unlock
 cp "$REPO_ROOT/init/alpine-zfsboot-shell" /alpine-zfsboot-shell
 cp "$REPO_ROOT/init/dialogrc" /etc/dialogrc
-chmod +x /menu.py /boot-dataset.sh /net-config.sh /rescue-ssh.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
+chmod +x /menu.py /boot-dataset.sh /fix-kexec-dtb.py /net-config.sh /rescue-ssh.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
 
 # cmd/tool's own binary, built by `just build-tool` (a Justfile
 # dependency of the `build` recipe - see Justfile) BEFORE this script
