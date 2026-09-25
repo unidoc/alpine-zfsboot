@@ -165,15 +165,64 @@ type Source struct {
 // always a fresh file in dir regardless of which source it came from
 // - a local-file source and a downloaded one are indistinguishable to
 // every caller downstream, same cleanup contract either way.
-func (s Source) resolve(defaultURL, dir string) (string, error) {
+//
+// Security contract, made explicit per a real review question (does
+// an explicit --*-url really deserve to bypass signature verification
+// just because it's explicit?): File and URL are NOT treated the same
+// here, deliberately.
+//
+//   - File: copied as-is, no signature check, no network fetch of any
+//     kind. An explicit local path is an operator's OWN bytes already
+//     in hand (their own build, a copy from wherever they already
+//     trust it) - there is no URL to fetch a signature FROM, and
+//     inventing a "look for a sibling .minisig next to the local file
+//     too" convention here would silently change what --*-file has
+//     always meant (use exactly this file, no questions asked) into
+//     something conditionally stricter depending on what else happens
+//     to sit in the same directory. If that trust model is ever wrong
+//     for a given deployment, the fix is not using --*-file at all.
+//   - URL, whether an explicit override OR the caller's own resolved
+//     default: downloaded, THEN signature-verified via
+//     verifySignatureAtURL against trustedSigningKeys, unconditionally.
+//     "An operator typed a custom URL" is not a reason to skip
+//     verifying what actually came back over the wire - a remote fetch
+//     of an executable boot artifact gets the real cryptographic check
+//     every single time a network round-trip is involved, full stop.
+//     An operator who wants to point at their own internal mirror only
+//     has to ALSO serve that mirror's own <file>.minisig (a straight
+//     copy of the one the real release publishes - the trusted key
+//     doesn't care which URL byte-identical content was fetched from).
+//
+// Only the CALLER-supplied defaultURL path (the tag-pinned resolved
+// release, reached when neither File nor URL is set) skips the
+// signature check HERE - not because it's exempt, but because
+// resolveDefaultAsset/ResolveBIOS's own loop already run BOTH the
+// checksum and signature checks themselves, using their own already-
+// resolved tag/SHA256SUMS context; verifying again here would just be
+// a second, redundant network fetch of the same .minisig.
+// assetFile is the canonical asset name for this slot (AssetName's or
+// BIOSAssetNames' own value) - only used to bind a URL-sourced
+// signature's own trusted comment to the right slot (PR #10 review,
+// F2); unused by the File and no-override-given branches.
+func (s Source) resolve(defaultURL, assetFile, dir string) (string, error) {
 	if s.File != "" {
 		return copyToTemp(s.File, dir)
 	}
-	url := s.URL
-	if url == "" {
-		url = defaultURL
+	if s.URL != "" {
+		path, err := downloadAsset(s.URL, dir)
+		if err != nil {
+			return "", err
+		}
+		// tag is unavoidably "" here: an explicit --*-url override has
+		// no resolved release tag to bind against, only the asset name
+		// it claims to be (see verifySignatureAtURL's own doc comment).
+		if err := verifySignatureAtURL(s.URL, path, dir, assetFile, ""); err != nil {
+			os.Remove(path)
+			return "", err
+		}
+		return path, nil
 	}
-	return downloadAsset(url, dir)
+	return downloadAsset(defaultURL, dir)
 }
 
 // ResolveEFI returns a temp-file path for arch's UEFI .EFI artifact,
@@ -186,16 +235,18 @@ func (s Source) resolve(defaultURL, dir string) (string, error) {
 // (resolveDefaultAsset, below) - it used to fetch straight from
 // baseURL (releases/latest/download/), unpinned and unverified, the
 // exact class of gap the original F16 fix closed for BIOS but never
-// carried over to UEFI. An explicit override (a custom --efi-file or
-// --efi-url) is still resolved via Source.resolve with no checksum
-// check, same reasoning as every explicit BIOS override: it was never
-// claiming to BE the official release asset, so there is nothing
-// legitimate to verify it against.
+// carried over to UEFI. An explicit --efi-file/--efi-url override
+// still skips CHECKSUM verification (it was never claiming to BE the
+// official release asset, so there's no SHA256SUMS entry legitimate
+// to check it against) - but --efi-url, unlike --efi-file, DOES still
+// get real SIGNATURE verification, via Source.resolve's own URL
+// branch. See that function's own doc comment for the full reasoning
+// on why File and URL are treated differently here.
 func ResolveEFI(src Source, arch, dir string) (string, error) {
-	if src.File != "" || src.URL != "" {
-		return src.resolve("", dir)
-	}
 	assetFile := AssetName(arch)
+	if src.File != "" || src.URL != "" {
+		return src.resolve("", assetFile, dir)
+	}
 	path, err := resolveDefaultAsset(assetFile, dir)
 	if err != nil {
 		return "", fmt.Errorf("resolving %s: %w", assetFile, err)
@@ -345,6 +396,10 @@ func resolveDefaultAsset(assetFile, dir string) (string, error) {
 		os.Remove(path)
 		return "", err
 	}
+	if err := verifySignatureAtURL(tagBase+assetFile, path, dir, assetFile, tag); err != nil {
+		os.Remove(path)
+		return "", err
+	}
 	return path, nil
 }
 
@@ -362,7 +417,10 @@ func resolveDefaultAsset(assetFile, dir string) (string, error) {
 // local file or URL) is NOT checksum-checked against the official
 // release's sums - it was never claiming to BE that release's asset
 // in the first place, so there's nothing legitimate to verify it
-// against.
+// against. SIGNATURE verification is a separate question, handled
+// uniformly by Source.resolve itself (see that function's own doc
+// comment): a --*-url override still gets it, a --*-file override
+// still doesn't.
 func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 	names := BIOSAssetName(arch)
 	fields := []struct {
@@ -386,9 +444,10 @@ func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 	}
 
 	var sums map[string]string
-	var tagBase string
+	var tagBase, tag string
 	if needDefault {
-		tag, err := resolveTag()
+		var err error
+		tag, err = resolveTag()
 		if err != nil {
 			return BIOSAssets{}, fmt.Errorf("resolving BIOS assets: %w", err)
 		}
@@ -410,13 +469,18 @@ func ResolveBIOS(src BIOSSources, arch, dir string) (BIOSAssets, error) {
 		if isDefault {
 			defaultURL = tagBase + f.assetFile
 		}
-		path, err := f.source.resolve(defaultURL, dir)
+		path, err := f.source.resolve(defaultURL, f.assetFile, dir)
 		if err != nil {
 			assets.RemoveAll()
 			return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
 		}
 		if isDefault {
 			if err := verifyChecksum(f.assetFile, path, sums); err != nil {
+				os.Remove(path)
+				assets.RemoveAll()
+				return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
+			}
+			if err := verifySignatureAtURL(tagBase+f.assetFile, path, dir, f.assetFile, tag); err != nil {
 				os.Remove(path)
 				assets.RemoveAll()
 				return BIOSAssets{}, fmt.Errorf("resolving %s: %w", f.name, err)
