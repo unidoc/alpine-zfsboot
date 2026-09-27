@@ -3,7 +3,7 @@
 
 #include "pe_sections.h"
 #include "initrd.h"
-#include "cmdline.h"
+#include "cmdline_core.h"
 
 /*
  * alpine-zfsboot's own EFI loader.
@@ -63,10 +63,43 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
 		(UINTN)linux_sec.data, linux_sec.size,
 		(UINTN)initrd_sec.data, initrd_sec.size);
 
-	status = ascii_to_cmdline16((CHAR8 *)cmdline_sec.data, &cmdline16, &cmdline16_size);
-	if (EFI_ERROR(status)) {
-		Print(L"alpine-zfsboot: cmdline conversion failed: %r\n", status);
-		return status;
+	/*
+	 * Firmware-supplied boot options for THIS image - whatever a boot
+	 * manager's own "edit boot options" screen passed (e.g. rEFInd's
+	 * own, shown in its log as "Using load options '...'" right before
+	 * this loader starts). loaded_image->LoadOptions was already being
+	 * read above (for ImageBase/ImageSize) but never otherwise used -
+	 * every operator-typed boot option was silently discarded, with no
+	 * way to override anything in this project's own embedded
+	 * .cmdline short of rebuilding the whole .EFI. Real gap, found
+	 * live: an operator on OVH/Kimsufi-class bare metal (whose serial-
+	 * console redirection lands on a different port than this build's
+	 * own embedded console= assumes) had no way to pass
+	 * alpine-zfsboot.console=ttyS1 at boot time to fix it - editing
+	 * rEFInd's own boot options did nothing, because nothing here ever
+	 * looked at them.
+	 *
+	 * Appended after the embedded cmdline (space-separated), not
+	 * prepended - matching every other alpine-zfsboot.* key's own
+	 * "last one wins" convention (see init/init's own
+	 * apply_zfsboot_kv()/select_console()): an operator's own boot-time
+	 * addition should override the build's own baked-in default, the
+	 * same way it already does for every other project-defined key.
+	 */
+	{
+		UINTN load_options_len = load_options_strnlen16(
+			(CHAR16 *)loaded_image->LoadOptions,
+			loaded_image->LoadOptionsSize / sizeof(CHAR16));
+		UINTN total_chars = combined_cmdline16_len((CHAR8 *)cmdline_sec.data, load_options_len);
+
+		cmdline16 = AllocatePool(total_chars * sizeof(CHAR16));
+		if (cmdline16 == NULL) {
+			Print(L"alpine-zfsboot: out of memory building cmdline\n");
+			return EFI_OUT_OF_RESOURCES;
+		}
+		build_combined_cmdline16((CHAR8 *)cmdline_sec.data,
+			(CHAR16 *)loaded_image->LoadOptions, load_options_len, cmdline16);
+		cmdline16_size = (UINT32)(total_chars * sizeof(CHAR16));
 	}
 	Print(L"alpine-zfsboot: cmdline: %s\n", cmdline16);
 

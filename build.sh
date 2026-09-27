@@ -790,6 +790,22 @@ mkdir -p "$BUILD_DIR/features.d"
 # rejected) ramoops chain was via real QEMU testing - if this glob
 # matches nothing at build time, mkinitfs should be checked to confirm
 # whether it warns about that or just silently omits the module.
+#
+# ixgbe + its real dependency chain (dca/mdio_devres/libphy/mdio/
+# xfrm_algo): confirmed the hard way on a real Kimsufi/OVH bare-metal
+# box (Intel Xeon-D, PCI id 8086:15ad - Ethernet Connection X552/X557-
+# AT 10GBASE-T) - the rescue environment had NO network interface at
+# all, because this project deliberately uses mkinitfs's narrow `dhcp`
+# feature instead of `network` (see the comment above FEATURES=, this
+# is the exact tradeoff that comment warns about). X552/X557-AT is not
+# a one-off part - it's the integrated 10GbE controller on Xeon-D SoCs,
+# which is what OVH/Kimsufi/Hetzner commonly rack, so this is added to
+# the default set rather than left as a per-fleet FEATURES= addition.
+# Zero firmware needed (confirmed: this .ko's own modinfo firmware=
+# field is empty), unlike ice/i40e. Dependency chain confirmed via
+# modinfo against a real (non-Alpine, Debian 6.12) kernel tree - same
+# proxy-not-Alpine caveat as the driver-size research this came out of;
+# not yet independently confirmed against Alpine's own linux-lts build.
 cat > "$BUILD_DIR/features.d/alpine-zfsboot.modules" <<'EOF'
 kernel/drivers/virtio/virtio_pci.ko*
 kernel/drivers/virtio/virtio_mmio.ko*
@@ -807,6 +823,12 @@ kernel/drivers/hid/usbhid/usbhid.ko*
 kernel/drivers/hid/hid-generic.ko*
 kernel/drivers/hid/hid.ko*
 kernel/drivers/firmware/efi/efi-pstore.ko*
+kernel/drivers/net/ethernet/intel/ixgbe/ixgbe.ko*
+kernel/drivers/dca/dca.ko*
+kernel/drivers/net/mdio.ko*
+kernel/drivers/net/phy/mdio_devres.ko*
+kernel/drivers/net/phy/libphy.ko*
+kernel/net/xfrm/xfrm_algo.ko*
 EOF
 
 cp "$REPO_ROOT/init/menu.py" /menu.py

@@ -218,7 +218,31 @@ def _parse_menu_timeout():
         return 10
 
 
+# Real hardware found (Kimsufi/OVH-class bare metal, IPMI Serial-Over-
+# LAN): the countdown below used to start the instant this process
+# reached it, with no allowance for a remote console that hasn't
+# finished re-attaching yet after THIS reboot - SOL sessions commonly
+# take a few real seconds to relay data again post-reset. A short
+# alpine-zfsboot.timeout= (10s, the reported case) can then elapse
+# entirely - silently auto-booting the default - before the operator's
+# own viewer ever reconnects, indistinguishable from "the menu never
+# came up at all". See main()'s own unconditional pause, right before
+# the real countdown starts, and /init's own MENU_GRACE for the
+# alpine-zfsboot.menu_grace= cmdline key this comes from. Same
+# never-raises defensiveness as _parse_menu_timeout() above, for the
+# exact same reason (see that function's own comment) - this is read
+# at IMPORT time too.
+def _parse_menu_grace():
+    raw = os.environ.get("ALPINE_ZFSBOOT_MENU_GRACE", "5") or "5"
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        print(f"menu.py: alpine-zfsboot.menu_grace={raw!r} is not a whole number - using the default (5s) instead", file=sys.stderr)
+        return 5
+
+
 MENU_TIMEOUT = _parse_menu_timeout()
+MENU_GRACE = _parse_menu_grace()
 # Which real tty /init actually attached this process to (see /init's
 # own select_console()) - switch_console() below needs to know this to
 # compute "the other one(s)". Empty/wrong over SSH - dropbear's own
@@ -1307,6 +1331,22 @@ def recovery_shell():
     recovery shell" should do. subprocess.run() (a plain child, waited
     on, not exec'd) is what chroot_be()/deploy() already used for the
     same kind of shell-out and never had this problem.
+
+    Real operator gap found live, closed here: this is the one place
+    an operator can run zpool/zfs commands by hand - the natural place
+    to actually FIX a pool-import failure (a real case: an ambiguous
+    stale pool label from an old, unrelated install, `zpool labelclear`
+    then a manual `zpool import`). Returning to the menu used to just
+    relaunch it with the SAME frozen POOL_IMPORT_ERROR this process
+    started with - fixing the real problem by hand still needed a full
+    hardware reboot to actually take effect, since nothing ever re-ran
+    the import or told /init to. If POOL_IMPORT_ERROR was set when this
+    shell was entered, exit(43) instead of returning normally - /init's
+    own main loop (see its header comment on this exact code)
+    re-attempts the import before relaunching a fresh menu.py, which
+    reads whatever actually comes out of that retry, success or not. A
+    session entered with a working pool (no error) has nothing to
+    retry and just returns to the menu normally, same as before.
     """
     if POOL_IMPORT_ERROR:
         print(f"alpine-zfsboot recovery shell - NO pool imported ({POOL_IMPORT_ERROR}).")
@@ -1316,6 +1356,9 @@ def recovery_shell():
     print("'apk add <package>' works too (see 'Network' in the menu if it can't reach the mirror)")
     os.environ["PS1"] = "\\[\\e[1;32m\\]alpine-zfsboot\\[\\e[0m\\] \\w # "
     _run_interactive(["/bin/bash"])
+    if POOL_IMPORT_ERROR:
+        print("alpine-zfsboot: retrying pool import before returning to the menu...")
+        sys.exit(43)
 
 
 def parse_source(src):
@@ -3106,6 +3149,48 @@ def main():
         # itself was never consulted because the pool never imported.
         default_item = len(_items()) - 1
     else:
+        # See MENU_GRACE's own module-level comment - real, unconditional
+        # wall-clock time for a remote console (IPMI SOL and similar)
+        # that hasn't finished re-attaching after this exact reboot yet,
+        # BEFORE the real, timeout-critical countdown below ever starts
+        # ticking. A plain print, not dialog - genuinely nothing to
+        # navigate here yet, and a console that reattaches partway
+        # through this pause still gets to see this line (whatever's
+        # already been written to a real serial line is not lost the
+        # way an in-progress ncurses redraw would be).
+        #
+        # _cancellable, not a bare time.sleep(): an operator's Ctrl-C
+        # here means exactly what it means everywhere else in this file
+        # - "I'm here, stop waiting" - not "crash". Adversarial review
+        # (PR review, real-hardware-shaped reasoning, not yet confirmed
+        # live) found the bare form left this one call still routing
+        # through main()'s own top-level handler, which only catches
+        # Exception, not KeyboardInterrupt (see _cancellable's own much
+        # longer comment for the real, confirmed bug that exists to
+        # prevent everywhere else) - an operator pressing Ctrl-C here
+        # to signal "I'm watching" would have crashed this process
+        # instead, and /init's own loop treats any nonzero exit as
+        # "fall through to automatic boot" - the exact opposite of what
+        # that keypress meant.
+        #
+        # Re-flushing immediately after, whether or not the sleep ran
+        # to completion, for the same reason the flush above this
+        # block already exists (see its own comment): the single most
+        # natural thing an operator does while watching "waiting Ns for
+        # this console to be ready..." is press Enter to test whether a
+        # just-reattached remote console is live - without this, that
+        # keystroke sits buffered and gets delivered to the very first
+        # countdown dialog as an instant "confirm the highlighted item"
+        # (Boot default), reproducing the exact symptom this whole
+        # feature exists to fix, just delayed by MENU_GRACE seconds
+        # instead of eliminated.
+        if MENU_GRACE > 0:
+            print(f"alpine-zfsboot: waiting {MENU_GRACE}s for this console to be ready before showing the menu...")
+            _cancellable(time.sleep, MENU_GRACE)
+            try:
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except (OSError, termios.error):
+                pass
         remaining = MENU_TIMEOUT
         while remaining > 0:
             # The last tick is clamped to whatever's actually left, so

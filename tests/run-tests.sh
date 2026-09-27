@@ -268,6 +268,167 @@ fi
 rm -rf "$d"
 
 # =============================================================================
+echo "== menu.py: a malformed persisted alpine-zfsboot.menu_grace= must not abort import =="
+# Same defensiveness, same reason, as alpine-zfsboot.timeout= above -
+# _parse_menu_grace() follows _parse_menu_timeout()'s own never-raises
+# shape exactly (see that function's own comment for the real
+# import-time-crash bug this class of parser exists to prevent).
+d="$(fresh_env)"
+ALPINE_ZFSBOOT_MENU_GRACE="5s" python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>"$d/err" || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+print("imported ok, MENU_GRACE =", menu.MENU_GRACE)
+PYEOF
+if grep -q "imported ok, MENU_GRACE = 5$" "$d/out"; then
+    ok "menu.py imports successfully with a malformed menu_grace, falling back to the documented default (5)"
+else
+    cat "$d/out" "$d/err"; bad "menu.py import crashed (or fell back to the wrong value) on a malformed alpine-zfsboot.menu_grace="
+fi
+if grep -q "not a whole number" "$d/err"; then
+    ok "a diagnostic is printed for the malformed menu_grace value, not a silent fallback"
+else
+    cat "$d/err"; bad "no diagnostic printed for the malformed alpine-zfsboot.menu_grace="
+fi
+rm -rf "$d"
+
+d="$(fresh_env)"
+ALPINE_ZFSBOOT_MENU_GRACE="" python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+print("imported ok, MENU_GRACE =", menu.MENU_GRACE)
+PYEOF
+if grep -q "imported ok, MENU_GRACE = 5$" "$d/out"; then
+    ok "an empty (but present) alpine-zfsboot.menu_grace= also falls back to the documented default (5), same as unset"
+else
+    cat "$d/out"; bad "an empty alpine-zfsboot.menu_grace= did not fall back correctly"
+fi
+rm -rf "$d"
+
+d="$(fresh_env)"
+ALPINE_ZFSBOOT_MENU_GRACE="0" python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+print("imported ok, MENU_GRACE =", menu.MENU_GRACE)
+PYEOF
+if grep -q "imported ok, MENU_GRACE = 0$" "$d/out"; then
+    ok "alpine-zfsboot.menu_grace=0 (an operator who wants the OLD, no-pause behavior back) is honored exactly"
+else
+    cat "$d/out"; bad "alpine-zfsboot.menu_grace=0 was not honored"
+fi
+rm -rf "$d"
+
+d="$(fresh_env)"
+ALPINE_ZFSBOOT_MENU_GRACE="-5" python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+print("imported ok, MENU_GRACE =", menu.MENU_GRACE)
+PYEOF
+if grep -q "imported ok, MENU_GRACE = 0$" "$d/out"; then
+    ok "a negative alpine-zfsboot.menu_grace= is clamped to 0, not a negative sleep duration"
+else
+    cat "$d/out"; bad "a negative alpine-zfsboot.menu_grace= was not clamped to 0"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== menu.py: Ctrl-C during the MENU_GRACE pause is cancelled cleanly, not a crash =="
+# PR review (adversarial, pre-real-hardware) found main()'s own grace
+# pause called time.sleep() bare - main()'s top-level handler only
+# catches Exception, not KeyboardInterrupt (see _cancellable's own long
+# comment for the real, confirmed bug that pattern already exists to
+# prevent everywhere else in this file), so an operator's Ctrl-C during
+# "waiting Ns for this console to be ready..." - the single most likely
+# thing an operator does to signal "I'm here" - crashed this process
+# instead, and /init's own loop treats any nonzero exit as "fall
+# through to automatic boot": the opposite of what that keypress meant.
+# Fixed by routing the sleep through _cancellable(), same as every
+# other interruptible action in this file. This test patches time.sleep
+# itself to raise KeyboardInterrupt (same technique as the real
+# _cancellable() test above) and drives the EXACT expression main()
+# now evaluates, not a re-implementation of it.
+d="$(fresh_env)"
+python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys, termios
+sys.path.insert(0, sys.argv[1])
+import menu
+
+def boom(_):
+    raise KeyboardInterrupt
+
+menu.time.sleep = boom
+print("result:", menu._cancellable(menu.time.sleep, 5))
+try:
+    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+except (OSError, termios.error):
+    pass
+print("still running after Ctrl-C during grace")
+PYEOF
+if grep -q "cancelled (Ctrl-C)" "$d/out" && grep -qx "result: None" "$d/out" && grep -q "still running after Ctrl-C during grace" "$d/out"; then
+    ok "_cancellable(time.sleep, N) genuinely survives a KeyboardInterrupt raised mid-call"
+else
+    cat "$d/out"; bad "_cancellable(time.sleep, N) did not handle a KeyboardInterrupt as expected"
+fi
+rm -rf "$d"
+
+# The above proves _cancellable() itself is safe when called this way -
+# it does NOT prove main() actually calls it that way rather than a
+# bare time.sleep(MENU_GRACE) (main() has real dialog/tty side effects,
+# not practical to invoke directly in this harness - see this file's
+# own NOTE further down on what that class of test can and cannot
+# prove). This closes that gap with a plain source check instead.
+if grep -q '_cancellable(time\.sleep, MENU_GRACE)' "$REPO_ROOT/init/menu.py"; then
+    ok "main() actually routes the MENU_GRACE sleep through _cancellable(), not a bare time.sleep()"
+else
+    bad "main() does not call _cancellable(time.sleep, MENU_GRACE) - Ctrl-C during the grace pause would crash uncaught regardless of _cancellable's own correctness"
+fi
+
+# No automated negative control here (deliberately, not an oversight):
+# the OLD shape (a bare time.sleep() call reaching an except-Exception
+# handler that does NOT catch KeyboardInterrupt) really does let it
+# propagate all the way to the top of the interpreter - confirmed BY
+# HAND while writing this test, not guessed - but CPython's own
+# top-level handling of an uncaught KeyboardInterrupt specifically
+# resets SIGINT to its default action and re-raises the real SIGNAL
+# against itself, rather than just exiting like any other uncaught
+# exception. Run directly (no setsid) that took down the whole
+# surrounding shell's process group, not just the one python3
+# subprocess - a real, confirmed hazard, not theoretical. Isolating it
+# with setsid avoids that blast radius, but then the very same default-
+# SIGINT termination kills the process before Python's own traceback-
+# printing exception hook ever runs, so there's no stdout/stderr
+# evidence left to grep for either way - a clean, safe, INFORMATIVE
+# negative control for this exact shape isn't practical to automate
+# here. The positive test above (_cancellable() genuinely catching it)
+# is real coverage of the actual fix; this paragraph is the negative
+# control's own write-up instead of the test itself.
+
+# =============================================================================
+echo "== menu.py: stdin is re-flushed after the MENU_GRACE pause, not just before it =="
+# PR review found the pre-existing tcflush (the one right after
+# _establish_controlling_terminal(), see its own comment for the real
+# bug IT closes) runs BEFORE the new grace pause, not after - so a
+# keystroke buffered DURING the pause (an operator pressing Enter to
+# test whether a just-reattached remote console is live, the single
+# most natural thing to do while watching "waiting Ns...") sailed
+# straight through to the very first countdown dialog as an instant
+# "confirm the highlighted item (Boot default)" - reproducing the exact
+# symptom this whole feature exists to fix, just delayed by MENU_GRACE
+# seconds instead of eliminated. This greps main()'s own source for a
+# second tcflush call textually AFTER the MENU_GRACE sleep, rather than
+# driving a real pty race (this harness's own dot-sourced subshells
+# have no controlling terminal at all - see this file's own NOTE further
+# down on what that class of test can and cannot prove).
+if awk '/_cancellable\(time\.sleep, MENU_GRACE\)/{f=1} f && /termios\.tcflush/{print; found=1} /remaining = MENU_TIMEOUT/{exit} END{exit !found}' "$REPO_ROOT/init/menu.py"; then
+    ok "a tcflush call exists after the MENU_GRACE sleep, before the countdown loop starts"
+else
+    bad "no tcflush found between the MENU_GRACE sleep and the countdown loop - a keystroke buffered during the grace pause would reach the first dialog unflushed"
+fi
+
+# =============================================================================
 echo "== boot-dataset.sh: single kernel present -> that one, kexec'd =="
 d="$(fresh_env)"
 mkdir -p "$d/pooldata/boot"
@@ -2074,6 +2235,7 @@ cat > "$STUBS/zpool.importfail" <<'EOF'
 #!/bin/sh
 echo "zpool $*" >> "${STUB_LOG:-/dev/null}"
 case "$1" in
+    list) exit 1 ;;
     import) exit 1 ;;
     get) echo "${STUB_BOOTFS:--}" ;;
     status) echo "${STUB_POOL_HEALTH:-pool is healthy}" ;;
@@ -2109,6 +2271,191 @@ else
 fi
 rm -f "$STUBS/zpool.importfail"
 rm -rf "$d"
+
+# =============================================================================
+echo "== init: attempt_pool_import() can be re-run - a fixed pool state is picked up fresh, not frozen from the first call =="
+# Real operator gap this whole feature exists to close: the pool-
+# import + bootfs-check + bootcheck-gating block used to run exactly
+# once, before menu.py's own loop even starts - factored into
+# attempt_pool_import() (see its own comment in init/init)
+# specifically so recovery_shell()'s new exit(43) signal (see its own
+# comment in menu.py) can call it again, later, after an operator has
+# fixed something by hand in there (the real reported case: an
+# ambiguous stale pool label, `zpool labelclear` then a manual `zpool
+# import`). This calls the REAL function twice, with a stub zpool
+# that fails the first time (an ambiguity error, matching the real
+# report) and succeeds the second (once "fixed") - proving a second
+# call genuinely produces a fresh result, not a repeat of the first,
+# which is exactly the bug this closes (nothing but a full reboot ever
+# ran this code a second time before today).
+d="$(fresh_env)"
+func_src="$(sed -n '/^attempt_pool_import() {/,/^}/p' "$REPO_ROOT/init/init")"
+mkdir -p "$d/state"
+cat > "$d/zpool-stub.sh" <<EOF
+#!/bin/sh
+case "\$1" in
+    list)
+        # Real behavior: once the operator's own manual "zpool
+        # labelclear" + "zpool import" fixed things (before ever
+        # returning to the menu), the pool is ALREADY imported by the
+        # time attempt_pool_import() runs again - "\$d/state/fixed"
+        # models exactly that.
+        if [ -e "$d/state/fixed" ]; then
+            echo zroot
+            exit 0
+        fi
+        exit 1
+        ;;
+    import)
+        echo "cannot import 'zroot': more than one matching pool" >&2
+        exit 1
+        ;;
+    get) echo "zroot/ROOT/alpine" ;;
+    status) echo "pool 'zroot' is healthy" ;;
+esac
+exit 0
+EOF
+chmod +x "$d/zpool-stub.sh"
+cat > "$d/attempt-pool-import-test.sh" <<EOF
+msg() { echo "MSG: \$*"; }
+start_rescue_ssh() { echo "START_RESCUE_SSH_CALLED"; return 1; }
+zpool() { "$d/zpool-stub.sh" "\$@"; }
+zfs() { printf '%s\t%s\n' "-" "default"; }
+POOL=zroot
+ALPINE_ZFSBOOT_BOOTCHECK=""
+ALPINE_ZFSBOOT_BOOTCHECK_MAX=""
+$func_src
+attempt_pool_import
+echo "call1: POOL_IMPORT_ERROR=[\$POOL_IMPORT_ERROR]"
+touch "$d/state/fixed"
+attempt_pool_import
+echo "call2: POOL_IMPORT_ERROR=[\$POOL_IMPORT_ERROR] BOOTFS=[\$BOOTFS]"
+EOF
+busybox ash "$d/attempt-pool-import-test.sh" >"$d/out" 2>&1
+if grep -qF "call1: POOL_IMPORT_ERROR=[zpool import -f -N -d /dev zroot failed" "$d/out" \
+   && grep -qxF "call2: POOL_IMPORT_ERROR=[] BOOTFS=[zroot/ROOT/alpine]" "$d/out"; then
+    ok "attempt_pool_import() re-run after the underlying problem is fixed produces a fresh, successful result - not the frozen first failure"
+else
+    cat "$d/out"; bad "attempt_pool_import() did not produce a fresh result on a second call"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== init: attempt_pool_import() skips zpool import entirely when the pool is already imported =="
+# A real, CRITICAL gap an adversarial review found in the first version
+# of this fix: "zpool import" itself fails with "a pool with that name
+# already exists" if $POOL is already imported (-f does not override
+# this - it only overrides the in-use-by-another-host check) - which is
+# EXACTLY the state after an operator's own manual "zpool import" in
+# the recovery shell, and also exactly the state on a retry of the
+# "pool imported fine but has no bootfs property" failure (the first
+# attempt_pool_import() call already imported it before failing the
+# bootfs check). Without the "zpool list" guard, a retry after either
+# real fix would report a NEW, misleading "already exists" failure
+# instead of succeeding. This stub's "zpool import" ALWAYS fails that
+# way - proving the fix works means proving that stub is never even
+# reached once the pool is already imported.
+d="$(fresh_env)"
+func_src="$(sed -n '/^attempt_pool_import() {/,/^}/p' "$REPO_ROOT/init/init")"
+cat > "$d/attempt-pool-import-test.sh" <<EOF
+msg() { echo "MSG: \$*"; }
+start_rescue_ssh() { echo "START_RESCUE_SSH_CALLED"; return 1; }
+zpool() {
+    case "\$1" in
+        list) echo zroot; return 0 ;;
+        import)
+            echo "cannot import 'zroot': a pool with that name already exists" >&2
+            return 1
+            ;;
+        get) echo "zroot/ROOT/alpine" ;;
+        status) echo "pool 'zroot' is healthy" ;;
+    esac
+    return 0
+}
+zfs() { printf '%s\t%s\n' "-" "default"; }
+POOL=zroot
+ALPINE_ZFSBOOT_BOOTCHECK=""
+ALPINE_ZFSBOOT_BOOTCHECK_MAX=""
+$func_src
+attempt_pool_import
+echo "POOL_IMPORT_ERROR=[\$POOL_IMPORT_ERROR] BOOTFS=[\$BOOTFS]"
+EOF
+busybox ash "$d/attempt-pool-import-test.sh" >"$d/out" 2>&1
+if grep -qxF "POOL_IMPORT_ERROR=[] BOOTFS=[zroot/ROOT/alpine]" "$d/out"; then
+    ok "attempt_pool_import() treats an already-imported pool as success, never calling the failing zpool import"
+else
+    cat "$d/out"; bad "attempt_pool_import() did not skip zpool import for an already-imported pool"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== menu.py: recovery_shell() exits(43) to request a pool-import retry ONLY if POOL_IMPORT_ERROR was set, otherwise returns normally =="
+# The other half of the same fix: recovery_shell() must not ask for a
+# retry when there was nothing to retry (a session entered with a
+# perfectly healthy pool, just for apk add / network debugging /
+# whatever else - see this function's own comment). _run_interactive
+# is stubbed to a no-op so this doesn't need a real pty/bash.
+d="$(fresh_env)"
+python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/healthy.out" 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+menu._run_interactive = lambda argv: None
+menu.POOL_IMPORT_ERROR = ""
+try:
+    menu.recovery_shell()
+    print("returned normally, no exit")
+except SystemExit as e:
+    print(f"UNEXPECTED sys.exit({e.code})")
+PYEOF
+python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/broken.out" 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+menu._run_interactive = lambda argv: None
+menu.POOL_IMPORT_ERROR = "zpool import -f -N -d /dev zroot failed: boom"
+try:
+    menu.recovery_shell()
+    print("UNEXPECTED: returned normally")
+except SystemExit as e:
+    print(f"sys.exit({e.code})")
+PYEOF
+if grep -qx "returned normally, no exit" "$d/healthy.out" \
+   && grep -qx "sys.exit(43)" "$d/broken.out"; then
+    ok "recovery_shell() only requests a retry (exit 43) when POOL_IMPORT_ERROR was actually set, returns normally otherwise"
+else
+    cat "$d/healthy.out"; cat "$d/broken.out"
+    bad "recovery_shell()'s exit(43) gating did not behave as expected"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== init: the menu.py exit-code dispatch calls attempt_pool_import() on 43, not on 42 or a real crash =="
+# Extracts the REAL case statement verbatim out of init/init (not a
+# reimplementation) - proves the actual dispatch logic, not just that
+# the right literal "43" appears somewhere in the file.
+dispatch_src="$(sed -n '/^    python3 \/menu\.py$/,/esac/p' "$REPO_ROOT/init/init")"
+for rc in 42 43 1; do
+    d="$(fresh_env)"
+    cat > "$d/dispatch-test.sh" <<EOF
+calls=0
+attempt_pool_import() { calls=\$((calls + 1)); }
+python3() { return $rc; }
+$dispatch_src
+echo "rc=$rc calls=\$calls"
+EOF
+    busybox ash "$d/dispatch-test.sh" >"$d/out" 2>&1
+    case "$rc" in
+        43) want="rc=43 calls=1" ;;
+        *)  want="rc=$rc calls=0" ;;
+    esac
+    if grep -qx "$want" "$d/out"; then
+        ok "menu_rc=$rc: attempt_pool_import() call count is correct ($want)"
+    else
+        cat "$d/out"; bad "menu_rc=$rc: expected '$want'"
+    fi
+    rm -rf "$d"
+done
 
 # =============================================================================
 echo "== init: bootcheck - armed:K below the threshold -> auto-boot proceeds, not forced rescue =="
@@ -2994,6 +3341,178 @@ if ! grep -qi "unrecognized option alpine-zfsboot.version" "$d/out" 2>/dev/null 
     ok "version=/buildstamp= produce no warning, while a genuinely unrecognized key on the SAME cmdline still does"
 else
     cat "$d/out"; bad "version=/buildstamp= warned as unrecognized, or the catch-all stopped catching real typos"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== init: an operator-chosen serial console gets its line settings (baud/parity/bits) set explicitly =="
+# Real hardware found (OVH/Kimsufi bare metal, IPMI Serial-Over-LAN): a
+# console picked ONLY via alpine-zfsboot's own runtime preference layers
+# (FAT config/NVRAM/cmdline - see select_console()'s own comment) rather
+# than the one embedded in CONSOLE_CMDLINE at build time was never
+# touched by the kernel's own console= parsing, so it kept whatever line
+# settings the UART/kernel driver defaulted to - observed as complete
+# silence (not garbage - silence) on a real remote SOL session attached
+# to exactly such a tty. The raw fd redirect this project already does
+# (exec < /dev/$ACTIVE_TTY ...) is firmware/console=-independent and
+# correct on its own; bytes sent at the wrong baud rate to a fixed-rate
+# remote listener are just as invisible as if nothing were sent. This
+# can't be exercised as a real serial-line behavior test in this harness
+# (same limitation already accepted for the sibling `stty rows 24 cols
+# 80` geometry call right next to it - no real tty here), so this is a
+# static source check: the exact stty invocation must exist, scoped only
+# to the non-tty0 (real serial) branch of the case statement, matching
+# CONSOLE_CMDLINE's own 115200n8 convention.
+if awk '
+    /case "\$ACTIVE_TTY" in/ { in_case=1 }
+    in_case && /^[[:space:]]*\*\)/ { in_star=1 }
+    in_star && /_apply_console_line_settings "\$ACTIVE_CONSOLE_OPTS"/ { found=1 }
+    in_star && /esac/ { exit }
+    END { exit !found }
+' "$REPO_ROOT/init/init"; then
+    ok "the serial-console (non-tty0) branch applies explicit line settings via _apply_console_line_settings"
+else
+    bad "no _apply_console_line_settings call found in the serial-console branch - an operator-chosen console not already in CONSOLE_CMDLINE would stay silent"
+fi
+
+# =============================================================================
+echo "== init: alpine-zfsboot.console= accepts a full kernel console=-style <baud><parity><bits> suffix, not just a bare tty name =="
+# The user's own real, explicit follow-up ask: a bare tty name always
+# fell back to a hardcoded 115200n8 (the fix right above this test) -
+# but before this, a value WITH options (e.g. "ttyS1,9600n7", the exact
+# same "ttySn,<baud><parity><bits>" shape the kernel's own console=
+# already uses, and what CONSOLE_CMDLINE itself bakes in - see
+# build.sh) was compared WHOLE against bare candidate names like
+# "ttyS1" everywhere in select_console() - which can never match, so
+# the override silently never applied at all; only a bare name with NO
+# options ever actually worked. Extracts _parse_console_spec() and
+# _apply_console_line_settings() verbatim (not a reimplementation) and
+# runs them for real under busybox ash - the same real-execution
+# discipline as the guard-block test above, not just a text/grep check.
+extract_console_helpers() {
+    sed -n '/^_parse_console_spec()/,/^}/p; /^_apply_console_line_settings()/,/^}/p' "$REPO_ROOT/init/init"
+}
+run_console_spec() {
+    busybox ash -c "
+$(extract_console_helpers)
+msg() { echo \"MSG: \$*\"; }
+stty() { echo \"STTY-CALL: \$*\"; }
+_parse_console_spec '$1'
+echo \"tty=\$_CONSOLE_SPEC_TTY opts=\$_CONSOLE_SPEC_OPTS\"
+_apply_console_line_settings \"\$_CONSOLE_SPEC_OPTS\"
+"
+}
+d="$(fresh_env)"
+run_console_spec "ttyS1" >"$d/bare.out" 2>&1
+run_console_spec "ttyS1,9600n7" >"$d/full.out" 2>&1
+run_console_spec "ttyS1,57600e8" >"$d/even.out" 2>&1
+run_console_spec "ttyS1,38400o6" >"$d/odd.out" 2>&1
+run_console_spec "ttyS1,garbage" >"$d/bad.out" 2>&1
+ok_all=1
+if grep -qx "tty=ttyS1 opts=" "$d/bare.out" && grep -qx "STTY-CALL: 115200 cs8 -parenb -cstopb" "$d/bare.out"; then
+    ok "a bare tty name (no options) still defaults to 115200n8"
+else
+    cat "$d/bare.out"; bad "a bare tty name did not default to 115200n8"; ok_all=0
+fi
+if grep -qx "tty=ttyS1 opts=9600n7" "$d/full.out" && grep -qx "STTY-CALL: 9600 cs7 -parenb -cstopb" "$d/full.out"; then
+    ok "a full spec (ttyS1,9600n7) is split correctly and applies the EXACT requested baud/parity/bits, not just 115200n8"
+else
+    cat "$d/full.out"; bad "a full baud/parity/bits spec was not applied correctly"; ok_all=0
+fi
+if grep -qx "STTY-CALL: 57600 cs8 parenb -parodd -cstopb" "$d/even.out"; then
+    ok "even parity (e) maps to the correct stty flags"
+else
+    cat "$d/even.out"; bad "even parity did not map correctly"; ok_all=0
+fi
+if grep -qx "STTY-CALL: 38400 cs6 parenb parodd -cstopb" "$d/odd.out"; then
+    ok "odd parity (o) maps to the correct stty flags"
+else
+    cat "$d/odd.out"; bad "odd parity did not map correctly"; ok_all=0
+fi
+if grep -q "WARNING:.*not in <baud><parity" "$d/bad.out" && grep -qx "STTY-CALL: 115200 cs8 -parenb -cstopb" "$d/bad.out"; then
+    ok "malformed line options warn and fall back to 115200n8, without crashing"
+else
+    cat "$d/bad.out"; bad "malformed line options did not warn-and-fall-back as expected"
+fi
+rm -rf "$d"
+
+# The tests above prove _parse_console_spec/_apply_console_line_settings
+# are correct IN ISOLATION - they do NOT prove select_console() itself
+# actually calls _parse_console_spec before each of its own layer 2/3/4
+# comparisons, rather than comparing the whole raw preference string
+# against a bare candidate name directly (the exact old, silently-
+# broken-for-any-spec-with-options shape this whole feature replaces).
+# Confirmed the hard way while writing this: reverting JUST that one
+# integration point (restoring the old `[ "$tty" = "$pref" ]` direct
+# compare) left every test above still passing, since none of them
+# exercises select_console() itself - a real coverage gap, not
+# hypothetical. Static source checks close it (select_console() has
+# real mount/efivar side effects, not practical to invoke directly in
+# this harness - see this file's own NOTE elsewhere on that class of
+# limitation).
+if grep -c '_parse_console_spec "\$pref"' "$REPO_ROOT/init/init" | grep -qx 2 \
+   && grep -q '_parse_console_spec "\$ZFSBOOT_CONSOLE_CMDLINE"' "$REPO_ROOT/init/init"; then
+    ok "select_console() calls _parse_console_spec for all three preference layers (FAT config, NVRAM, cmdline)"
+else
+    bad "select_console() does not call _parse_console_spec for one or more layers - a console=ttySn,<opts> value would silently never match any candidate in that layer"
+fi
+
+# =============================================================================
+echo "== init: an operator-chosen console that can't actually be opened falls back instead of killing /init =="
+# Fable-model adversarial review (same review that led to the stty fix
+# right above): the real `exec < "/dev/$ACTIVE_TTY"` this project uses
+# to attach to the operator's chosen console is the `exec` SPECIAL
+# BUILTIN - a redirection failure there exits the WHOLE non-interactive
+# shell (confirmed directly, not assumed - see the negative control
+# below), not just "that one command". /dev/ttyS1-3 nodes commonly
+# EXIST on real x86 hardware with no real UART behind them
+# (PORT_UNKNOWN) - select_console()'s own candidate filter only checks
+# existence, not that opening the node actually works - so an operator
+# who remotely persists a bad alpine-zfsboot.console= (a typo, or a
+# port that's real on one fleet box but not another) could kill /init
+# outright: a kernel panic loop on unattended physical hardware, worse
+# than the silent-console problem this whole feature exists to fix.
+#
+# Extracts the REAL guard block verbatim out of init/init (not a
+# reimplementation of it) and actually runs it under busybox ash
+# against a genuinely nonexistent device path, proving the fallback
+# both fires AND survives - not just that the right text is present.
+guard_block="$(sed -n '/if ! ( : < "\/dev\/\$ACTIVE_TTY" )/,/^        fi$/p' "$REPO_ROOT/init/init")"
+if [ -z "$guard_block" ]; then
+    bad "could not find the open-test guard block in init/init at all - did it move or get removed?"
+else
+    d="$(fresh_env)"
+    busybox ash -c '
+        msg() { echo "MSG: $*"; }
+        ACTIVE_TTY="does-not-exist-$$"
+        KERNEL_ACTIVE_TTY="tty0"
+        '"$guard_block"'
+        echo "SURVIVED, ACTIVE_TTY=$ACTIVE_TTY"
+    ' >"$d/out" 2>&1
+    if grep -q "WARNING:.*could not be opened - falling back to tty0" "$d/out" \
+       && grep -qx "SURVIVED, ACTIVE_TTY=tty0" "$d/out"; then
+        ok "a console that can't be opened falls back to KERNEL_ACTIVE_TTY, and /init survives to say so"
+    else
+        cat "$d/out"; bad "the real guard block did not fall back and survive as expected"
+    fi
+    rm -rf "$d"
+fi
+
+# Real negative control: the OLD shape (the bare `exec <
+# "/dev/$ACTIVE_TTY"` line on its own, no guard) really does bring the
+# whole shell down on the exact same unopenable path - proves the test
+# above is exercising the actual bug class, not passing regardless of
+# whether the guard does anything.
+d="$(fresh_env)"
+busybox ash -c '
+    ACTIVE_TTY="does-not-exist-$$"
+    exec < "/dev/$ACTIVE_TTY" > "/dev/$ACTIVE_TTY" 2>&1
+    echo "UNREACHABLE"
+' >"$d/out" 2>&1 || true
+if ! grep -q "UNREACHABLE" "$d/out"; then
+    ok "negative control: the bare, unguarded exec really does kill the shell on an unopenable console, uncaught"
+else
+    cat "$d/out"; bad "negative control did not behave as expected - the positive test above may not prove what it claims to"
 fi
 rm -rf "$d"
 
