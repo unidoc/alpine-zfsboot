@@ -34,7 +34,7 @@ ifeq ($(ARCH),x86_64)
 CFLAGS += -mno-red-zone
 endif
 
-OBJS = main.o pe_sections.o initrd.o cmdline.o
+OBJS = main.o pe_sections.o initrd.o cmdline_core.o
 
 all: loader.efi
 

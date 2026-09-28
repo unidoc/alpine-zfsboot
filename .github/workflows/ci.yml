@@ -59,6 +59,14 @@ jobs:
       - name: Run tests/run-tests.sh
         run: ./tests/run-tests.sh
 
+      # PR #16 review (F5): efi/cmdline_core_test.c was only ever run
+      # locally by hand - a "9/9" that could rot silently without CI
+      # ever re-checking it. Pure host C (no gnu-efi headers needed,
+      # see cmdline_core.h's own ALPINE_ZFSBOOT_CMDLINE_TEST shim), so
+      # this runner's own `cc` is enough - no new dependency.
+      - name: efi/cmdline_core_test.c
+        run: cc -std=c11 -Wall -Wextra -Werror -DALPINE_ZFSBOOT_CMDLINE_TEST -o /tmp/cmdline_core_test efi/cmdline_core_test.c && /tmp/cmdline_core_test
+
   kernel-integration-test:
     # tests/kernel-integration-test.sh's own header comment for the
     # full why - boots a REAL Linux kernel in QEMU against a real,

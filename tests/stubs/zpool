@@ -1,6 +1,20 @@
 #!/bin/sh
 echo "zpool $*" >> "${STUB_LOG:-/dev/null}"
 case "$1" in
+    list)
+        # Real "not imported yet" by default - attempt_pool_import()'s
+        # own "already imported, skip the real import" guard (see its
+        # comment in init/init) needs this to genuinely fail here so
+        # every test relying on the real "zpool import -f -N -d /dev
+        # $POOL" line actually running still sees it. Set
+        # STUB_ZPOOL_ALREADY_IMPORTED=1 for a test that specifically
+        # wants the already-imported path instead.
+        if [ "${STUB_ZPOOL_ALREADY_IMPORTED:-}" = "1" ]; then
+            echo pool
+            exit 0
+        fi
+        exit 1
+        ;;
     get)
         echo "${STUB_BOOTFS:--}"
         ;;

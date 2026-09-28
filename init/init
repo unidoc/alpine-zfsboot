@@ -80,6 +80,19 @@ RESCUE_LIB_DIR="$(cd "$_dir" && pwd)"
 
 POOL="zroot"
 MENU_TIMEOUT=2
+# Real hardware found (Kimsufi/OVH-class bare metal, IPMI Serial-Over-
+# LAN): the interactive countdown starts the instant menu.py reaches
+# it, with no allowance for a remote console that hasn't finished
+# re-attaching yet after this exact reboot - SOL sessions commonly take
+# a few real seconds to relay data again post-reset. With a short
+# alpine-zfsboot.timeout= (10s in the reported case), the whole
+# countdown can elapse - silently auto-booting the default - before the
+# operator's own viewer ever reconnects, which looks indistinguishable
+# from "the menu never came up at all". menu.py's own main() pauses
+# this many seconds, unconditionally, right before the real countdown
+# starts (see its own comment) - configurable for the same reason
+# MENU_TIMEOUT is: no single value is right for every BMC/console.
+MENU_GRACE=5
 
 msg() {
     echo "alpine-zfsboot: $*" > /dev/kmsg 2>/dev/null
@@ -435,6 +448,7 @@ apply_zfsboot_kv() {
     case "$kv" in
         alpine-zfsboot.pool=*) POOL="${kv#alpine-zfsboot.pool=}" ;;
         alpine-zfsboot.timeout=*) MENU_TIMEOUT="${kv#alpine-zfsboot.timeout=}" ;;
+        alpine-zfsboot.menu_grace=*) MENU_GRACE="${kv#alpine-zfsboot.menu_grace=}" ;;
         alpine-zfsboot.net=*) ALPINE_ZFSBOOT_NET="${kv#alpine-zfsboot.net=}" ;;
         alpine-zfsboot.ipv4.address=*) ALPINE_ZFSBOOT_IPV4_ADDRESS="${kv#alpine-zfsboot.ipv4.address=}" ;;
         alpine-zfsboot.ipv4.gateway=*) ALPINE_ZFSBOOT_IPV4_GATEWAY="${kv#alpine-zfsboot.ipv4.gateway=}" ;;
@@ -834,7 +848,95 @@ read_efivar_console_pref() {
     tail -c +5 "$EFIVAR_PATH" 2>/dev/null | tr -d '\0'
 }
 
+# _parse_console_spec SPEC - splits SPEC into _CONSOLE_SPEC_TTY (bare
+# tty name, e.g. "ttyS1" - what every candidate-matching comparison in
+# select_console() below already needs) and _CONSOLE_SPEC_OPTS
+# (everything after the first comma, or empty) - two globals rather
+# than a return value, same idiom ACTIVE_TTY/KERNEL_ACTIVE_TTY already
+# use throughout this file. Real gap this closes: a value like
+# "ttyS1,115200n1" (the kernel's OWN console=ttySn,<baud><parity><bits>
+# convention, which an operator naturally reaches for since
+# CONSOLE_CMDLINE already bakes in exactly this shape - see build.sh)
+# used to be compared WHOLE against bare candidate names like "ttyS1"
+# in every layer below - which can never match, so the override
+# silently never applied at all. Only a bare tty name with no options
+# ever actually worked before this.
+_parse_console_spec() {
+    case "$1" in
+        *,*) _CONSOLE_SPEC_TTY="${1%%,*}"; _CONSOLE_SPEC_OPTS="${1#*,}" ;;
+        *)   _CONSOLE_SPEC_TTY="$1"; _CONSOLE_SPEC_OPTS="" ;;
+    esac
+}
+
+# _apply_console_line_settings OPTS - parses a kernel console=-style
+# "<baud><parity n/e/o><bits 5-8>" suffix (e.g. "115200n8" - the exact
+# same convention CONSOLE_CMDLINE already bakes in for its own serial
+# console, see build.sh) into real stty flags. Applies to whatever tty
+# is already on this process's own stdin (see the exec redirect right
+# before this is called in the main loop) - same "already redirected,
+# operate on stdin implicitly" idiom the existing `stty rows 24 cols 80`
+# geometry call already uses.
+#
+# Falls back to 115200n8 (the already-shipped, real-hardware-verified
+# default for a bare tty name with no explicit options) on: no options
+# given at all, a non-numeric/missing baud, or anything not matching
+# the accepted shape - never raises, same never-crash defensiveness
+# _parse_menu_timeout()/_parse_menu_grace() (see init/menu.py) already
+# follow for the same reason: a malformed operator-supplied value must
+# degrade to a safe default, not take the whole boot down.
+#
+# PR #16 review (F2): the kernel's own console= grammar this is meant
+# to mirror is actually "<baud><parity><bits><flow>", with parity/bits
+# BOTH optional (defaulting to n8) and an optional trailing "r" for
+# RTS/CTS flow control - not the "all three or nothing" shape this
+# function originally required. That meant the single most natural
+# thing an operator would type for e.g. a 9600-baud BMC,
+# alpine-zfsboot.console=ttyS1,9600, silently got REPLACED with
+# 115200 - exactly the silent-console symptom this whole feature exists
+# to fix, now self-inflicted on a console the operator explicitly
+# configured. Fixed: baud is still parsed the same way (longest leading
+# digit run); an optional trailing "r" is stripped first for the flow
+# flag; whatever's left is at most one parity character (defaulting to
+# n) and a bits digit (defaulting to 8) - matching the kernel's own
+# optionality, not just its character set.
+#
+# PR #16 review (F3): this also used to run unconditionally on the
+# kernel's OWN already-registered console (e.g. plain
+# alpine-zfsboot.console=ttyS0 with no options, when ttyS0 is already
+# what CONSOLE_CMDLINE told the kernel to use) - forcing 115200n8 onto
+# a line the kernel's own console= parsing already configured
+# correctly, which only matters when that rate isn't 115200 to begin
+# with (e.g. a EXTRA_CMDLINE override, or firmware LoadOptions per fix
+# #1 above), but is still needless churn when it's a no-op. A bare name
+# (no explicit options) that already names a live kernel console now
+# returns without touching the line at all.
+_apply_console_line_settings() {
+    opts="$1"
+    if [ -n "$opts" ]; then
+        baud="${opts%%[!0-9]*}"
+        rest="${opts#"$baud"}"
+        flow=""
+        case "$rest" in *r) flow=crtscts; rest="${rest%r}" ;; esac
+        parity_char="${rest%"${rest#?}"}"
+        bits="${rest#?}"
+        [ -n "$parity_char" ] || parity_char=n
+        [ -n "$bits" ] || bits=8
+        if [ -n "$baud" ]; then
+            case "$parity_char$bits" in
+                n[5678]) stty "$baud" "cs$bits" -parenb -cstopb $flow 2>/dev/null; return ;;
+                e[5678]) stty "$baud" "cs$bits" parenb -parodd -cstopb $flow 2>/dev/null; return ;;
+                o[5678]) stty "$baud" "cs$bits" parenb parodd -cstopb $flow 2>/dev/null; return ;;
+            esac
+        fi
+        msg "WARNING: alpine-zfsboot.console= line options '$opts' not in <baud><parity><bits> form (parity/bits optional - e.g. 9600, 115200n8, 9600n8r) - using 115200n8 instead"
+    elif [ -n "$ACTIVE_TTY" ] && grep -qw "$ACTIVE_TTY" "$ROOTFS/sys/class/tty/console/active" 2>/dev/null; then
+        return   # the kernel's own console= already set this line's rate
+    fi
+    stty 115200 cs8 -parenb -cstopb 2>/dev/null
+}
+
 ACTIVE_TTY=tty0
+ACTIVE_CONSOLE_OPTS=""
 select_console() {
     candidates=""
     # ttyS1/ttyS2 alongside ttyS0/ttyAMA0 - confirmed a real need on
@@ -873,27 +975,54 @@ select_console() {
         done
     done
 
+    # Saved here, BEFORE any of layers 2-4 below can override it - this
+    # is the one candidate guaranteed to actually work (it's what the
+    # kernel itself is already using), so it's the fallback the main
+    # loop's own open-test (see its own comment) resets to if an
+    # operator's remotely-persisted choice turns out to name a /dev
+    # node that exists but has no real UART behind it. No explicit line
+    # options for this one - the kernel already configured its own
+    # registered console correctly via its own console= parsing.
+    KERNEL_ACTIVE_TTY="$ACTIVE_TTY"
+    ACTIVE_CONSOLE_OPTS=""
+
     # Layer 2: FAT config (canonical machine default) - fresh read
     # every call, see this function's own header comment for why.
+    # _parse_console_spec (see its own comment) splits an optional
+    # kernel console=-style ",<baud><parity><bits>" suffix off the bare
+    # tty name before comparing against candidates - a spec WITH options
+    # never matched a bare candidate name before this existed.
     pref="$(read_fat_console_pref)"
+    _parse_console_spec "$pref"
     for tty in $candidates; do
-        [ "$tty" = "$pref" ] && ACTIVE_TTY="$pref"
+        if [ "$tty" = "$_CONSOLE_SPEC_TTY" ]; then
+            ACTIVE_TTY="$tty"
+            ACTIVE_CONSOLE_OPTS="$_CONSOLE_SPEC_OPTS"
+        fi
     done
 
     # Layer 3: UEFI NVRAM (operator's own persisted runtime choice) -
     # UEFI only, also a fresh read every call.
     if [ -d "$ROOTFS/sys/firmware/efi" ]; then
         pref="$(read_efivar_console_pref)"
+        _parse_console_spec "$pref"
         for tty in $candidates; do
-            [ "$tty" = "$pref" ] && ACTIVE_TTY="$pref"
+            if [ "$tty" = "$_CONSOLE_SPEC_TTY" ]; then
+                ACTIVE_TTY="$tty"
+                ACTIVE_CONSOLE_OPTS="$_CONSOLE_SPEC_OPTS"
+            fi
         done
     fi
 
     # Layer 4: explicit kernel cmdline - always wins, unconditionally,
     # every call (ZFSBOOT_CONSOLE_CMDLINE is a single boot-time value
     # by its own nature - see apply_zfsboot_kv()'s own comment).
+    _parse_console_spec "$ZFSBOOT_CONSOLE_CMDLINE"
     for tty in $candidates; do
-        [ "$tty" = "$ZFSBOOT_CONSOLE_CMDLINE" ] && ACTIVE_TTY="$ZFSBOOT_CONSOLE_CMDLINE"
+        if [ "$tty" = "$_CONSOLE_SPEC_TTY" ]; then
+            ACTIVE_TTY="$tty"
+            ACTIVE_CONSOLE_OPTS="$_CONSOLE_SPEC_OPTS"
+        fi
     done
 }
 
@@ -936,10 +1065,48 @@ modprobe zfs 2>/dev/null
 # but only as the last resort if python3/menu.py itself is what's
 # broken). ALPINE_ZFSBOOT_POOL_IMPORT_ERROR, once set, is what tells menu.py
 # to show that state instead of assuming a normal, bootable pool.
-POOL_IMPORT_ERROR=""
+#
+# A function, not inline - real operator gap found live: a pool-import
+# failure caused by something genuinely fixable from the Recovery shell
+# (a real case: an ambiguous stale pool label from an old install,
+# `zpool import` refusing to guess between two same-named pools) left
+# an operator who fixed it BY HAND in there (zpool labelclear, then
+# their own manual zpool import) with no way back to a working boot
+# short of a full hardware reboot - exiting the shell just relaunched
+# menu.py, which still only had the FROZEN, already-failed
+# ALPINE_ZFSBOOT_POOL_IMPORT_ERROR from before they fixed anything
+# (this whole block used to run exactly once, here, before the
+# menu.py loop even starts). recovery_shell()'s own new exit(43)
+# convention (see its own comment in menu.py) now calls this same
+# function again on the way back - re-collecting a real, FRESH result
+# instead of replaying the stale one. Safe to call more than once in
+# the same boot: start_rescue_ssh is documented idempotent (see its
+# own header comment), and the bootcheck block below only ever READS
+# org.alpinezfsboot:bootcheck - boot-dataset.sh is the ONE place that
+# ever increments it (see that file's own comment on this), so
+# re-running this function's own read-and-decide logic can't
+# double-count a real attempt.
+attempt_pool_import() {
+    POOL_IMPORT_ERROR=""
 
-msg "importing pool: $POOL"
-if ! zpool import -f -N -d /dev "$POOL" 2>/tmp/zpool-import.log; then
+    msg "importing pool: $POOL"
+    # zpool list, not just "try import and see": a retry (see this
+    # function's own header comment) can find $POOL ALREADY imported -
+    # either because the operator's own manual `zpool import` (the
+    # exact motivating case) already did it, or because the FIRST call
+    # this boot already imported it fine and only failed the later
+    # bootfs check below. `zpool import` itself then fails with "a pool
+    # with that name already exists" - `-f` does not override this, it
+    # only overrides the in-use-by-another-system hostid check - which
+    # would make a retry report a NEW, misleading failure right after
+    # the operator did everything right. Confirmed the hard way by a
+    # real adversarial review of this exact function: both real retry
+    # paths (manual import in the recovery shell, and the no-bootfs
+    # case where THIS function's own first call already imported the
+    # pool before failing) hit this.
+    if zpool list -H -o name "$POOL" >/dev/null 2>&1; then
+        msg "pool $POOL is already imported"
+    elif ! zpool import -f -N -d /dev "$POOL" 2>/tmp/zpool-import.log; then
     cat /tmp/zpool-import.log
     POOL_IMPORT_ERROR="zpool import -f -N -d /dev $POOL failed: $(cat /tmp/zpool-import.log | tr '\n' ' ')"
     msg "WARNING: $POOL_IMPORT_ERROR"
@@ -1062,6 +1229,9 @@ if [ -z "$POOL_IMPORT_ERROR" ] && [ "$ALPINE_ZFSBOOT_BOOTCHECK" != "off" ]; then
     fi
 fi
 export ALPINE_ZFSBOOT_FORCED_RESCUE
+}
+
+attempt_pool_import
 
 # Worth importing any OTHER pool that's reachable right now too (e.g.
 # a second disk plugged in for a rescue, or a golden-image source
@@ -1076,6 +1246,7 @@ for extra in $(zpool import -d /dev 2>/dev/null | sed -n 's/^   pool: //p'); do
 done
 
 export ALPINE_ZFSBOOT_MENU_TIMEOUT="$MENU_TIMEOUT"
+export ALPINE_ZFSBOOT_MENU_GRACE="$MENU_GRACE"
 
 # menu.py always runs now (see this file's own header comment) - the
 # loop, not a single run, is what makes menu.py's own switch_console()
@@ -1101,6 +1272,57 @@ while :; do
     # meaningful, so it's skipped there; the test only needs
     # ACTIVE_TTY itself, not the physical redirect.
     if [ -z "$ROOTFS" ]; then
+        # A Fable-model adversarial review of the operator-remote-
+        # console-selection feature (select_console()'s own layers 2-4)
+        # found a real, serious hole this closes: `exec <
+        # "/dev/$ACTIVE_TTY"` below is the actual `exec` special
+        # builtin, and POSIX/busybox ash both exit the WHOLE (non-
+        # interactive) shell outright if that redirection fails - which
+        # it genuinely can, since /dev/ttyS1-3 nodes commonly EXIST on
+        # real x86 hardware even with no real UART wired to them
+        # (PORT_UNKNOWN, confirmed against a real system's own
+        # /sys/class/tty/ttyS*/type) - select_console()'s own candidate
+        # filter only checks the node EXISTS, not that opening it
+        # actually works. An operator who persists
+        # alpine-zfsboot.console= naming such a node (a typo, or a port
+        # that's real on one box in the fleet but not another) would
+        # kill /init outright - a kernel panic loop on unattended
+        # physical hardware, worse than the silent-console problem this
+        # whole feature exists to fix.
+        #
+        # PR #16 review (F1), confirmed against a real kernel: a plain
+        # `: < "/dev/$tty"` open only fails for a node with no driver
+        # registered at all (ENXIO) - it SUCCEEDS on exactly the
+        # PORT_UNKNOWN case this comment describes (8250 registers all
+        # nr_uarts lines as PORT_UNKNOWN nodes that open fine; only
+        # writes/ioctls on them return EIO). So the open-test used to
+        # pass on a dead line, /init would `exec` onto it anyway, and
+        # the operator got a silent auto-boot (menu.py's own writes and
+        # its error handler's print both fail on a EIO tty, so it exits
+        # 120, and /init's loop treats that as "fall through to
+        # automatic boot") - not the kernel-panic-loop this comment
+        # originally described, but still the wrong outcome. `stty -g`
+        # actually exercises the line (a termios ioctl), so it fails
+        # with EIO on PORT_UNKNOWN too, while still succeeding on tty0,
+        # ptys, and a real working UART. A subshell for the same reason
+        # as before (redirection failure inside `( ... )` only fails
+        # THAT subshell, not this one - confirmed the difference
+        # directly: `busybox ash -c 'exec < /nonexistent; echo
+        # SURVIVED'` never prints and exits nonzero, but wrapping the
+        # same redirection in a subshell first and checking its exit
+        # status does not bring this shell down) falls back to
+        # KERNEL_ACTIVE_TTY - the one candidate guaranteed to work,
+        # since select_console() derived it from the kernel's own
+        # already-live /dev/console. ACTIVE_CONSOLE_OPTS is reset too
+        # (same review, second finding): otherwise the dead tty's own
+        # line options (e.g. a operator-chosen 9600n7) would get applied
+        # to the fallback kernel console below instead of being dropped
+        # with the tty that carried them.
+        if ! ( stty -g < "/dev/$ACTIVE_TTY" >/dev/null 2>&1 ); then
+            msg "WARNING: /dev/$ACTIVE_TTY (the selected console) could not be opened - falling back to $KERNEL_ACTIVE_TTY"
+            ACTIVE_TTY="$KERNEL_ACTIVE_TTY"
+            ACTIVE_CONSOLE_OPTS=""
+        fi
         exec < "/dev/$ACTIVE_TTY" > "/dev/$ACTIVE_TTY" 2>&1
     fi
 
@@ -1129,6 +1351,52 @@ while :; do
             ;;
         *)
             TERM=ansi
+            # Line settings (baud/parity/bits), not just geometry below -
+            # real hardware found (OVH/Kimsufi bare metal, IPMI Serial-
+            # Over-LAN): an operator-chosen console (alpine-zfsboot.console=,
+            # any of the three layers select_console() reads) that is NOT
+            # the one embedded in CONSOLE_CMDLINE at build time (see
+            # build.sh) was never touched by the kernel's own console=
+            # parsing at all - console= is what makes the KERNEL configure
+            # a given serial line's baud rate when it registers that line
+            # as a console. A tty picked ONLY via this project's own
+            # runtime preference layers sits at 9600n8 instead -
+            # confirmed against the kernel's own serial_core.c
+            # (uart_register_driver() hardcodes init_termios.c_cflag to
+            # B9600|CS8|CREAD|HUPCL|CLOCAL for every line the kernel
+            # itself never registered as a console), not merely "some
+            # unpredictable default" - observed as complete silence, not
+            # garbage, on a real IPMI SOL session attached to exactly
+            # such a tty (a fixed-rate remote listener never frames
+            # 9600-baud bytes correctly), which is a real, separate
+            # problem from "wrong tty selected": the raw fd redirect above
+            # is already correct and firmware/console=-independent (SOL
+            # relays the physical UART, not "whatever the kernel calls a
+            # console"), but bytes written at the wrong baud rate over a
+            # real serial line are exactly as invisible to a fixed-rate
+            # remote listener as if nothing had been sent at all. Setting
+            # 115200n8 explicitly - the same rate CONSOLE_CMDLINE already
+            # hardcodes for its own baked-in serial console, and the
+            # near-universal default for IPMI/BMC SOL implementations -
+            # makes an operator-chosen console usable WITHOUT a
+            # hardware-specific rebuild: one generic image, any real
+            # ttyS*/ttyAMA* an operator names via the FAT config/NVRAM/
+            # cmdline layers just works, matching the whole point of
+            # those three layers existing at all. A no-op, not a risk, on
+            # a tty that's already at this rate (e.g. ttyS0, already
+            # configured this way by the kernel's own console= handling).
+            #
+            # Not always 115200n8 unconditionally though - an operator
+            # whose real hardware genuinely needs a different rate can
+            # say so directly, in the value itself, the exact same
+            # "ttySn,<baud><parity><bits>" shape the kernel's own
+            # console= already uses (e.g.
+            # alpine-zfsboot.console=ttyS1,9600n7) - ACTIVE_CONSOLE_OPTS
+            # is whatever select_console() parsed out of that (empty for
+            # a bare tty name, which is exactly when this still falls
+            # back to 115200n8 - see _apply_console_line_settings's own
+            # comment).
+            _apply_console_line_settings "$ACTIVE_CONSOLE_OPTS"
             # A raw serial line carries NO terminal-geometry
             # negotiation of its own, at any layer - confirmed the
             # hard way on a real, reported "the TUI is corrupted"
@@ -1192,7 +1460,30 @@ while :; do
     # already in place for the "not found" case - a menu.py bug now
     # costs a fallback to automatic boot, never a full reboot cycle.
     python3 /menu.py
-    [ "$?" = 42 ] || break
+    menu_rc=$?
+    # 42: switch_console()'s own long-established "relaunch me" signal
+    # (see this loop's own header comment) - console preference was
+    # already persisted, select_console() picks it up fresh next
+    # iteration, nothing else to do here.
+    #
+    # 43: recovery_shell()'s own NEW signal (see its own comment in
+    # menu.py) - the operator was in there specifically because
+    # POOL_IMPORT_ERROR was set, and may have just fixed the real
+    # underlying problem by hand (the exact real case this exists for:
+    # zpool labelclear on a stale ambiguous pool label, then a manual
+    # zpool import). Re-running attempt_pool_import() here, before the
+    # next python3 /menu.py, is what makes that fix actually visible
+    # without a full reboot - menu.py re-reads
+    # ALPINE_ZFSBOOT_POOL_IMPORT_ERROR (and BOOTFS/FORCED_RESCUE) fresh
+    # from its own environment every time it's re-executed as a new
+    # process, so re-exporting a genuinely fresh result here is the
+    # whole fix; menu.py itself needed no change beyond deciding when
+    # to ask for this.
+    case "$menu_rc" in
+        42) ;;
+        43) attempt_pool_import ;;
+        *) break ;;
+    esac
 done
 msg "menu.py exited (python3/menu.py missing or crashed) - falling back to automatic boot"
 
