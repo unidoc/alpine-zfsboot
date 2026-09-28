@@ -11,6 +11,16 @@ UINTN load_options_strnlen16(CHAR16 *s, UINTN max_chars)
 	return n;
 }
 
+int load_options_is_text(CHAR16 *s, UINTN len)
+{
+	UINTN i;
+
+	for (i = 0; i < len; i++)
+		if (s[i] != (CHAR16)'\t' && (s[i] < 0x20 || s[i] > 0x7e))
+			return 0;
+	return 1;
+}
+
 static UINTN ascii_strlen(CHAR8 *ascii)
 {
 	UINTN n = 0;

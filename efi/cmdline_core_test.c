@@ -127,6 +127,50 @@ int main(void)
 		check("zero-length (but non-NULL) load options behaves like none", matches_ascii(out, "console=tty0") && n == strlen("console=tty0") + 1);
 	}
 
+	/* 8. PR #16 review (F4): load_options_is_text - plain printable
+	 * ASCII (the real, common case: an operator-typed boot option)
+	 * passes. */
+	{
+		CHAR16 s[64];
+		UINTN len = encode16("alpine-zfsboot.console=ttyS1,9600n7", s);
+		check("load_options_is_text accepts plain ASCII", load_options_is_text(s, len));
+	}
+
+	/* 9. A UEFI Shell invocation's own leading image path (backslash,
+	 * still plain ASCII) must also pass - this is a real, expected
+	 * shape (see main.c's own comment), not something to reject. */
+	{
+		CHAR16 s[64];
+		UINTN len = encode16("\\loader.efi alpine-zfsboot.console=ttyS1", s);
+		check("load_options_is_text accepts a UEFI Shell image-path prefix", load_options_is_text(s, len));
+	}
+
+	/* 10. Tab is explicitly allowed (the one non-printable exception). */
+	{
+		CHAR16 s[2] = { (CHAR16)'\t', (CHAR16)'x' };
+		check("load_options_is_text accepts an embedded tab", load_options_is_text(s, 2));
+	}
+
+	/* 11. Zero length is vacuously text (nothing to reject) - callers
+	 * are expected to already skip the append entirely for len 0; this
+	 * just documents the function doesn't need a separate guard for it. */
+	check("load_options_is_text(_, 0) is text (vacuously)", load_options_is_text((CHAR16 *)0, 0));
+
+	/* 12. The real motivating case: a GUID (or any non-ASCII CHAR16
+	 * value) anywhere in the buffer must be rejected - this is
+	 * EDK2's own auto-created-option shape (see main.c's comment). */
+	{
+		CHAR16 s[4] = { (CHAR16)'a', (CHAR16)0x8967, (CHAR16)'b', (CHAR16)'c' };
+		check("load_options_is_text rejects a non-ASCII CHAR16 (GUID-shaped)", !load_options_is_text(s, 4));
+	}
+
+	/* 13. A C0 control character other than tab (e.g. a raw NUL word
+	 * from Dell's full EFI_LOAD_OPTION struct shape) is rejected too. */
+	{
+		CHAR16 s[3] = { (CHAR16)'a', 0x0001, (CHAR16)'b' };
+		check("load_options_is_text rejects a non-tab control character", !load_options_is_text(s, 3));
+	}
+
 	printf(failed ? "\n== FAILED ==\n" : "\n== all passed ==\n");
 	return failed;
 }

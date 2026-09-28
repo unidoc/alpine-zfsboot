@@ -3184,7 +3184,21 @@ def main():
         # (Boot default), reproducing the exact symptom this whole
         # feature exists to fix, just delayed by MENU_GRACE seconds
         # instead of eliminated.
-        if MENU_GRACE > 0:
+        #
+        # PR #16 review (F6): unconditional means this also ran over
+        # rescue SSH (the session is by definition already attached -
+        # there is no remote-console reattach to wait for), and on every
+        # 42/43 relaunch (the operator just pressed a key, seconds ago -
+        # not a fresh reboot). Gating on IS_SSH_SESSION closes the SSH
+        # case, which also happens to be the common one: every normal
+        # boot was 5s slower by default otherwise. The relaunch case is
+        # left alone - it would need /init itself to remember this
+        # isn't the first menu.py of the boot (e.g. exporting
+        # ALPINE_ZFSBOOT_MENU_GRACE=0 after its loop's first iteration),
+        # a bigger change than this nit-level fix, and the local-
+        # console/VM case is harmless enough (an extra 5s on a console
+        # nobody's remotely reattaching to) to leave as-is too.
+        if MENU_GRACE > 0 and not IS_SSH_SESSION:
             print(f"alpine-zfsboot: waiting {MENU_GRACE}s for this console to be ready before showing the menu...")
             _cancellable(time.sleep, MENU_GRACE)
             try:

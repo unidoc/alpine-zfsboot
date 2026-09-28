@@ -880,30 +880,57 @@ _parse_console_spec() {
 # Falls back to 115200n8 (the already-shipped, real-hardware-verified
 # default for a bare tty name with no explicit options) on: no options
 # given at all, a non-numeric/missing baud, or anything not matching
-# the exact <parity><bits> shape - never raises, same never-crash
-# defensiveness _parse_menu_timeout()/_parse_menu_grace() (see
-# init/menu.py) already follow for the same reason: a malformed
-# operator-supplied value must degrade to a safe default, not take the
-# whole boot down.
+# the accepted shape - never raises, same never-crash defensiveness
+# _parse_menu_timeout()/_parse_menu_grace() (see init/menu.py) already
+# follow for the same reason: a malformed operator-supplied value must
+# degrade to a safe default, not take the whole boot down.
+#
+# PR #16 review (F2): the kernel's own console= grammar this is meant
+# to mirror is actually "<baud><parity><bits><flow>", with parity/bits
+# BOTH optional (defaulting to n8) and an optional trailing "r" for
+# RTS/CTS flow control - not the "all three or nothing" shape this
+# function originally required. That meant the single most natural
+# thing an operator would type for e.g. a 9600-baud BMC,
+# alpine-zfsboot.console=ttyS1,9600, silently got REPLACED with
+# 115200 - exactly the silent-console symptom this whole feature exists
+# to fix, now self-inflicted on a console the operator explicitly
+# configured. Fixed: baud is still parsed the same way (longest leading
+# digit run); an optional trailing "r" is stripped first for the flow
+# flag; whatever's left is at most one parity character (defaulting to
+# n) and a bits digit (defaulting to 8) - matching the kernel's own
+# optionality, not just its character set.
+#
+# PR #16 review (F3): this also used to run unconditionally on the
+# kernel's OWN already-registered console (e.g. plain
+# alpine-zfsboot.console=ttyS0 with no options, when ttyS0 is already
+# what CONSOLE_CMDLINE told the kernel to use) - forcing 115200n8 onto
+# a line the kernel's own console= parsing already configured
+# correctly, which only matters when that rate isn't 115200 to begin
+# with (e.g. a EXTRA_CMDLINE override, or firmware LoadOptions per fix
+# #1 above), but is still needless churn when it's a no-op. A bare name
+# (no explicit options) that already names a live kernel console now
+# returns without touching the line at all.
 _apply_console_line_settings() {
     opts="$1"
     if [ -n "$opts" ]; then
         baud="${opts%%[!0-9]*}"
         rest="${opts#"$baud"}"
-        case "$rest" in
-            [neo][5678])
-                parity_char="${rest%?}"
-                bits="${rest#?}"
-                if [ -n "$baud" ]; then
-                    case "$parity_char" in
-                        n) stty "$baud" "cs$bits" -parenb -cstopb 2>/dev/null; return ;;
-                        e) stty "$baud" "cs$bits" parenb -parodd -cstopb 2>/dev/null; return ;;
-                        o) stty "$baud" "cs$bits" parenb parodd -cstopb 2>/dev/null; return ;;
-                    esac
-                fi
-                ;;
-        esac
-        msg "WARNING: alpine-zfsboot.console= line options '$opts' not in <baud><parity n/e/o><bits 5-8> form (e.g. 115200n8) - using 115200n8 instead"
+        flow=""
+        case "$rest" in *r) flow=crtscts; rest="${rest%r}" ;; esac
+        parity_char="${rest%"${rest#?}"}"
+        bits="${rest#?}"
+        [ -n "$parity_char" ] || parity_char=n
+        [ -n "$bits" ] || bits=8
+        if [ -n "$baud" ]; then
+            case "$parity_char$bits" in
+                n[5678]) stty "$baud" "cs$bits" -parenb -cstopb $flow 2>/dev/null; return ;;
+                e[5678]) stty "$baud" "cs$bits" parenb -parodd -cstopb $flow 2>/dev/null; return ;;
+                o[5678]) stty "$baud" "cs$bits" parenb parodd -cstopb $flow 2>/dev/null; return ;;
+            esac
+        fi
+        msg "WARNING: alpine-zfsboot.console= line options '$opts' not in <baud><parity><bits> form (parity/bits optional - e.g. 9600, 115200n8, 9600n8r) - using 115200n8 instead"
+    elif [ -n "$ACTIVE_TTY" ] && grep -qw "$ACTIVE_TTY" "$ROOTFS/sys/class/tty/console/active" 2>/dev/null; then
+        return   # the kernel's own console= already set this line's rate
     fi
     stty 115200 cs8 -parenb -cstopb 2>/dev/null
 }
@@ -1261,19 +1288,40 @@ while :; do
         # that's real on one box in the fleet but not another) would
         # kill /init outright - a kernel panic loop on unattended
         # physical hardware, worse than the silent-console problem this
-        # whole feature exists to fix. A plain subshell open-test
-        # (redirection failure inside `( ... )` only fails THAT
-        # subshell, not this one - confirmed the difference directly:
-        # `busybox ash -c 'exec < /nonexistent; echo SURVIVED'` never
-        # prints and exits nonzero, but wrapping the same redirection in
-        # a subshell first and checking its exit status does not bring
-        # this shell down) falls back to KERNEL_ACTIVE_TTY - the one
-        # candidate guaranteed to work, since select_console() derived
-        # it from the kernel's own already-live /dev/console - rather
-        # than letting a bad remote choice take the whole box down.
-        if ! ( : < "/dev/$ACTIVE_TTY" ) 2>/dev/null; then
+        # whole feature exists to fix.
+        #
+        # PR #16 review (F1), confirmed against a real kernel: a plain
+        # `: < "/dev/$tty"` open only fails for a node with no driver
+        # registered at all (ENXIO) - it SUCCEEDS on exactly the
+        # PORT_UNKNOWN case this comment describes (8250 registers all
+        # nr_uarts lines as PORT_UNKNOWN nodes that open fine; only
+        # writes/ioctls on them return EIO). So the open-test used to
+        # pass on a dead line, /init would `exec` onto it anyway, and
+        # the operator got a silent auto-boot (menu.py's own writes and
+        # its error handler's print both fail on a EIO tty, so it exits
+        # 120, and /init's loop treats that as "fall through to
+        # automatic boot") - not the kernel-panic-loop this comment
+        # originally described, but still the wrong outcome. `stty -g`
+        # actually exercises the line (a termios ioctl), so it fails
+        # with EIO on PORT_UNKNOWN too, while still succeeding on tty0,
+        # ptys, and a real working UART. A subshell for the same reason
+        # as before (redirection failure inside `( ... )` only fails
+        # THAT subshell, not this one - confirmed the difference
+        # directly: `busybox ash -c 'exec < /nonexistent; echo
+        # SURVIVED'` never prints and exits nonzero, but wrapping the
+        # same redirection in a subshell first and checking its exit
+        # status does not bring this shell down) falls back to
+        # KERNEL_ACTIVE_TTY - the one candidate guaranteed to work,
+        # since select_console() derived it from the kernel's own
+        # already-live /dev/console. ACTIVE_CONSOLE_OPTS is reset too
+        # (same review, second finding): otherwise the dead tty's own
+        # line options (e.g. a operator-chosen 9600n7) would get applied
+        # to the fallback kernel console below instead of being dropped
+        # with the tty that carried them.
+        if ! ( stty -g < "/dev/$ACTIVE_TTY" >/dev/null 2>&1 ); then
             msg "WARNING: /dev/$ACTIVE_TTY (the selected console) could not be opened - falling back to $KERNEL_ACTIVE_TTY"
             ACTIVE_TTY="$KERNEL_ACTIVE_TTY"
+            ACTIVE_CONSOLE_OPTS=""
         fi
         exec < "/dev/$ACTIVE_TTY" > "/dev/$ACTIVE_TTY" 2>&1
     fi

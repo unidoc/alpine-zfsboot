@@ -787,25 +787,41 @@ mkdir -p "$BUILD_DIR/features.d"
 # hyphens to underscores in .ko filenames) is real-kernel-source-
 # confirmed as of this writing, but has NOT been verified against
 # Alpine's actual built linux-virt module tree the way the (since-
-# rejected) ramoops chain was via real QEMU testing - if this glob
-# matches nothing at build time, mkinitfs should be checked to confirm
-# whether it warns about that or just silently omits the module.
+# rejected) ramoops chain was via real QEMU testing. If this glob
+# matches nothing at build time: answered by the ixgbe entry below
+# (PR #16 review, F7) - mkinitfs silently omits a glob that matches
+# nothing, no warning at all, confirmed for real on aarch64 where three
+# of that entry's own hand-listed globs matched nothing.
 #
-# ixgbe + its real dependency chain (dca/mdio_devres/libphy/mdio/
-# xfrm_algo): confirmed the hard way on a real Kimsufi/OVH bare-metal
-# box (Intel Xeon-D, PCI id 8086:15ad - Ethernet Connection X552/X557-
-# AT 10GBASE-T) - the rescue environment had NO network interface at
-# all, because this project deliberately uses mkinitfs's narrow `dhcp`
+# ixgbe: confirmed the hard way on a real Kimsufi/OVH bare-metal box
+# (Intel Xeon-D, PCI id 8086:15ad - Ethernet Connection X552/X557-AT
+# 10GBASE-T) - the rescue environment had NO network interface at all,
+# because this project deliberately uses mkinitfs's narrow `dhcp`
 # feature instead of `network` (see the comment above FEATURES=, this
 # is the exact tradeoff that comment warns about). X552/X557-AT is not
 # a one-off part - it's the integrated 10GbE controller on Xeon-D SoCs,
 # which is what OVH/Kimsufi/Hetzner commonly rack, so this is added to
 # the default set rather than left as a per-fleet FEATURES= addition.
 # Zero firmware needed (confirmed: this .ko's own modinfo firmware=
-# field is empty), unlike ice/i40e. Dependency chain confirmed via
-# modinfo against a real (non-Alpine, Debian 6.12) kernel tree - same
-# proxy-not-Alpine caveat as the driver-size research this came out of;
-# not yet independently confirmed against Alpine's own linux-lts build.
+# field is empty), unlike ice/i40e.
+#
+# PR #16 review (F7): only ixgbe.ko* is listed, not its own dependency
+# chain - mkinitfs pulls those in on its own by resolving modules.dep
+# (confirmed against real Alpine linux-lts + mkinitfs, both arches: the
+# same modules land in the initramfs whether or not the deps are also
+# listed here explicitly). An earlier version of this comment hand-
+# listed dca/mdio_devres/libphy/mdio/xfrm_algo from a Debian kernel
+# tree's own modinfo output as a proxy for Alpine's - checked for real
+# against Alpine's own linux-lts + mkinitfs since, and it was already
+# wrong: Alpine's real chain is dca/hwmon/mdio_devres/libphy/mdio/
+# mdio-bus/libie_fwlog (no xfrm_algo), and on aarch64 dca.ko doesn't
+# exist at all while libphy/mdio_devres are built directly into the
+# kernel - three of those six hand-listed globs matched nothing there.
+# mkinitfs did not warn about that - it silently omits a glob that
+# matches nothing (this also answers the open question the efi-pstore
+# entry above asks about that same behavior). A hand-listed dependency
+# chain goes stale against the next kernel; letting mkinitfs resolve
+# its own modules.dep does not.
 cat > "$BUILD_DIR/features.d/alpine-zfsboot.modules" <<'EOF'
 kernel/drivers/virtio/virtio_pci.ko*
 kernel/drivers/virtio/virtio_mmio.ko*
@@ -824,11 +840,6 @@ kernel/drivers/hid/hid-generic.ko*
 kernel/drivers/hid/hid.ko*
 kernel/drivers/firmware/efi/efi-pstore.ko*
 kernel/drivers/net/ethernet/intel/ixgbe/ixgbe.ko*
-kernel/drivers/dca/dca.ko*
-kernel/drivers/net/mdio.ko*
-kernel/drivers/net/phy/mdio_devres.ko*
-kernel/drivers/net/phy/libphy.ko*
-kernel/net/xfrm/xfrm_algo.ko*
 EOF
 
 cp "$REPO_ROOT/init/menu.py" /menu.py

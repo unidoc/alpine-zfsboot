@@ -85,12 +85,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systab)
 	 * apply_zfsboot_kv()/select_console()): an operator's own boot-time
 	 * addition should override the build's own baked-in default, the
 	 * same way it already does for every other project-defined key.
+	 *
+	 * PR #16 review (F4): launched from a UEFI Shell instead, LoadOptions
+	 * starts with this image's own path (e.g. "\loader.efi
+	 * alpine-zfsboot.console=ttyS1") - a harmless extra token once
+	 * appended, since apply_zfsboot_kv() (init/init) already ignores
+	 * anything it doesn't recognize as one of its own keys.
 	 */
 	{
 		UINTN load_options_len = load_options_strnlen16(
 			(CHAR16 *)loaded_image->LoadOptions,
 			loaded_image->LoadOptionsSize / sizeof(CHAR16));
-		UINTN total_chars = combined_cmdline16_len((CHAR8 *)cmdline_sec.data, load_options_len);
+		UINTN total_chars;
+
+		/*
+		 * PR #16 review (F4): LoadOptions is an opaque buffer, not
+		 * guaranteed to be text - see load_options_is_text()'s own
+		 * comment for the two real non-text shapes this guards
+		 * against (Dell's full EFI_LOAD_OPTION struct, EDK2's
+		 * auto-created-option GUID). Appending either verbatim would
+		 * put binary garbage into what the kernel then parses as its
+		 * own command line - worse than just ignoring it.
+		 */
+		if (load_options_len > 0 &&
+		    !load_options_is_text((CHAR16 *)loaded_image->LoadOptions, load_options_len)) {
+			Print(L"alpine-zfsboot: ignoring non-text LoadOptions (%d bytes)\n",
+				(UINTN)loaded_image->LoadOptionsSize);
+			load_options_len = 0;
+		}
+
+		total_chars = combined_cmdline16_len((CHAR8 *)cmdline_sec.data, load_options_len);
 
 		cmdline16 = AllocatePool(total_chars * sizeof(CHAR16));
 		if (cmdline16 == NULL) {

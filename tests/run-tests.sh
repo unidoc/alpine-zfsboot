@@ -386,6 +386,19 @@ else
     bad "main() does not call _cancellable(time.sleep, MENU_GRACE) - Ctrl-C during the grace pause would crash uncaught regardless of _cancellable's own correctness"
 fi
 
+# PR #16 review (F6): the pause used to be unconditional - it also ran
+# over rescue SSH (the session is by definition already attached, no
+# remote-console reattach to wait for) and on every 42/43 relaunch.
+# Gating on IS_SSH_SESSION closes the SSH case (the common one - every
+# normal boot was 5s slower by default otherwise). Same "static source
+# check, main() itself isn't practical to invoke directly" reasoning as
+# the check right above.
+if grep -q 'if MENU_GRACE > 0 and not IS_SSH_SESSION:' "$REPO_ROOT/init/menu.py"; then
+    ok "the MENU_GRACE pause is gated on IS_SSH_SESSION - it does not run over rescue SSH, which never needed it"
+else
+    bad "the MENU_GRACE pause is not gated on IS_SSH_SESSION - every rescue SSH session waits out the pause needlessly"
+fi
+
 # No automated negative control here (deliberately, not an oversight):
 # the OLD shape (a bare time.sleep() call reaching an except-Exception
 # handler that does NOT catch KeyboardInterrupt) really does let it
@@ -3408,6 +3421,9 @@ run_console_spec "ttyS1,9600n7" >"$d/full.out" 2>&1
 run_console_spec "ttyS1,57600e8" >"$d/even.out" 2>&1
 run_console_spec "ttyS1,38400o6" >"$d/odd.out" 2>&1
 run_console_spec "ttyS1,garbage" >"$d/bad.out" 2>&1
+run_console_spec "ttyS1,9600" >"$d/baud-only.out" 2>&1
+run_console_spec "ttyS1,9600n8r" >"$d/flow.out" 2>&1
+run_console_spec "ttyS1,9600e" >"$d/bits-omitted.out" 2>&1
 ok_all=1
 if grep -qx "tty=ttyS1 opts=" "$d/bare.out" && grep -qx "STTY-CALL: 115200 cs8 -parenb -cstopb" "$d/bare.out"; then
     ok "a bare tty name (no options) still defaults to 115200n8"
@@ -3433,6 +3449,64 @@ if grep -q "WARNING:.*not in <baud><parity" "$d/bad.out" && grep -qx "STTY-CALL:
     ok "malformed line options warn and fall back to 115200n8, without crashing"
 else
     cat "$d/bad.out"; bad "malformed line options did not warn-and-fall-back as expected"
+fi
+# PR #16 review (F2): the kernel's own console= grammar makes parity and
+# bits BOTH optional (defaulting to n8), plus an optional trailing "r"
+# flow flag - the most natural operator input for a 9600-baud BMC,
+# "ttyS1,9600", used to be REJECTED (warned, then forced to 115200,
+# the exact silent-console symptom this feature exists to fix, now
+# self-inflicted on an explicitly configured console).
+if grep -qx "STTY-CALL: 9600 cs8 -parenb -cstopb" "$d/baud-only.out"; then
+    ok "baud-only (ttyS1,9600) is accepted, not rejected as malformed"
+else
+    cat "$d/baud-only.out"; bad "baud-only console= spec was not accepted"; ok_all=0
+fi
+if grep -qx "STTY-CALL: 9600 cs8 -parenb -cstopb crtscts" "$d/flow.out"; then
+    ok "a trailing 'r' flow flag (ttyS1,9600n8r) enables crtscts"
+else
+    cat "$d/flow.out"; bad "the 'r' flow flag was not applied"; ok_all=0
+fi
+if grep -qx "STTY-CALL: 9600 cs8 parenb -parodd -cstopb" "$d/bits-omitted.out"; then
+    ok "bits-omitted (ttyS1,9600e) defaults bits to 8, not rejected as malformed"
+else
+    cat "$d/bits-omitted.out"; bad "a bits-omitted console= spec was not accepted"; ok_all=0
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== init: _apply_console_line_settings skips stty for a bare name that's already a registered kernel console (F3) =="
+# PR #16 review (F3): a bare alpine-zfsboot.console=ttyS0 (no options),
+# where ttyS0 is ALREADY what the kernel's own console= parsing
+# registered, used to force 115200n8 onto it unconditionally - needless
+# churn on a line the kernel already configured correctly. Real
+# execution under busybox ash, with a fake $ROOTFS/sys/class/tty/
+# console/active standing in for the kernel's own real one.
+d="$(fresh_env)"
+mkdir -p "$d/sys/class/tty/console"
+echo "ttyS0" > "$d/sys/class/tty/console/active"
+run_console_spec_rootfs() {
+    busybox ash -c "
+$(extract_console_helpers)
+msg() { echo \"MSG: \$*\"; }
+stty() { echo \"STTY-CALL: \$*\"; }
+ROOTFS='$d'
+ACTIVE_TTY='$1'
+_parse_console_spec '$2'
+_apply_console_line_settings \"\$_CONSOLE_SPEC_OPTS\"
+echo end
+"
+}
+run_console_spec_rootfs "ttyS0" "ttyS0" >"$d/is-console.out" 2>&1
+run_console_spec_rootfs "ttyS1" "ttyS1" >"$d/not-console.out" 2>&1
+if ! grep -q "STTY-CALL" "$d/is-console.out" && grep -qx "end" "$d/is-console.out"; then
+    ok "a bare name naming the already-registered kernel console makes no stty call at all"
+else
+    cat "$d/is-console.out"; bad "a bare name for the kernel's own console still called stty"
+fi
+if grep -qx "STTY-CALL: 115200 cs8 -parenb -cstopb" "$d/not-console.out"; then
+    ok "a bare name for a DIFFERENT tty (not the kernel console) still defaults to 115200n8"
+else
+    cat "$d/not-console.out"; bad "a bare name for a non-console tty did not default to 115200n8"
 fi
 rm -rf "$d"
 
@@ -3473,11 +3547,24 @@ echo "== init: an operator-chosen console that can't actually be opened falls ba
 # outright: a kernel panic loop on unattended physical hardware, worse
 # than the silent-console problem this whole feature exists to fix.
 #
+# PR #16 review (F1): the original `: < "/dev/$tty"` open-test passes
+# on the exact PORT_UNKNOWN case this comment names (confirmed against
+# a real kernel: 8250 registers all nr_uarts lines, and a plain open
+# succeeds on them - only writes/ioctls return EIO). `stty -g` performs
+# a real termios ioctl, so it fails on PORT_UNKNOWN too - this repo's
+# own test harness has no privileged access to a real PORT_UNKNOWN
+# node (that needs real kernel tty nodes - see the review's own
+# tests/poc_16_tty_open.sh, run under a privileged container, for that
+# specific coverage), but the "path does not exist at all" case below
+# still proves the guard fires and /init survives either way, and now
+# also proves ACTIVE_CONSOLE_OPTS is dropped on fallback (the review's
+# second, smaller finding).
+#
 # Extracts the REAL guard block verbatim out of init/init (not a
 # reimplementation of it) and actually runs it under busybox ash
 # against a genuinely nonexistent device path, proving the fallback
 # both fires AND survives - not just that the right text is present.
-guard_block="$(sed -n '/if ! ( : < "\/dev\/\$ACTIVE_TTY" )/,/^        fi$/p' "$REPO_ROOT/init/init")"
+guard_block="$(sed -n '/if ! ( stty -g < "\/dev\/\$ACTIVE_TTY" >\/dev\/null 2>&1 )/,/^        fi$/p' "$REPO_ROOT/init/init")"
 if [ -z "$guard_block" ]; then
     bad "could not find the open-test guard block in init/init at all - did it move or get removed?"
 else
@@ -3486,14 +3573,15 @@ else
         msg() { echo "MSG: $*"; }
         ACTIVE_TTY="does-not-exist-$$"
         KERNEL_ACTIVE_TTY="tty0"
+        ACTIVE_CONSOLE_OPTS="9600n7"
         '"$guard_block"'
-        echo "SURVIVED, ACTIVE_TTY=$ACTIVE_TTY"
+        echo "SURVIVED, ACTIVE_TTY=$ACTIVE_TTY, ACTIVE_CONSOLE_OPTS=$ACTIVE_CONSOLE_OPTS"
     ' >"$d/out" 2>&1
     if grep -q "WARNING:.*could not be opened - falling back to tty0" "$d/out" \
-       && grep -qx "SURVIVED, ACTIVE_TTY=tty0" "$d/out"; then
-        ok "a console that can't be opened falls back to KERNEL_ACTIVE_TTY, and /init survives to say so"
+       && grep -qx "SURVIVED, ACTIVE_TTY=tty0, ACTIVE_CONSOLE_OPTS=" "$d/out"; then
+        ok "a console that can't be opened falls back to KERNEL_ACTIVE_TTY (dropping its own line options), and /init survives to say so"
     else
-        cat "$d/out"; bad "the real guard block did not fall back and survive as expected"
+        cat "$d/out"; bad "the real guard block did not fall back, drop ACTIVE_CONSOLE_OPTS, and survive as expected"
     fi
     rm -rf "$d"
 fi
