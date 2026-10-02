@@ -1192,20 +1192,36 @@ add_section() {
     objcopy_args="$objcopy_args --add-section $name=$file --change-section-vma $name=$vma"
 }
 
-# CONSOLE_CMDLINE always puts BOTH console= entries on the cmdline -
-# an earlier version of this project also built separate single-
+# CONSOLE_CMDLINE is tty0-only, on both arches - no serial console= is
+# ever baked into the default build. This is the final, settled state
+# after several iterations (UEFI NVRAM, dual-console-always, flip-the-
+# order-but-keep-both) that each turned out to still assume the build
+# itself needs to know about serial consoles. It doesn't: a serial
+# console is purely a config matter an operator opts into themselves,
+# via alpine-zfsboot.console= in EFI/ALPINE/config - written at INSTALL
+# time, when the operator already has full access by definition (not
+# discovered reactively by booting first). select_console()'s own
+# Layer 2 (FAT config) matches a persisted preference against real
+# /dev node existence, not kernel console= registration at all - see
+# that function's own comment in init/init - so a serial-only bare-
+# metal machine (Kimsufi/OVH-class, IPMI Serial-over-LAN, no VGA at
+# all) with its console configured in EFI/ALPINE/config works
+# correctly regardless of what's baked into this cmdline. The pre-boot
+# "press TAB to interrupt" screen (_boot_args_interrupt() in init/init)
+# covers the one real remaining gap - it polls a persisted FAT-config
+# console too, even when it isn't kernel-registered - and is also how
+# an operator installing fresh on such a machine gets in at all: boot,
+# TAB, set console=ttyS1 for just this one boot, install, write the
+# same value into EFI/ALPINE/config while already in there.
+#
+# An even earlier version of this project also built separate single-
 # console (vga-only/serial-only) variants selectable via a
 # CONSOLE_NAME build-time choice, three variants x two arches, six
-# .EFI files total. Dropped: init/init's own select_console() and
-# menu.py's switch_console() already make the single "auto" build
-# behave correctly for every case a single-console build was ever for
-# (it picks whichever console is actually being watched, honors a
-# persisted preference, and switches live, FreeBSD-loader-style) - the
-# separate builds were never buying anything the always-both-consoles
-# build didn't already handle, just multiplying the release matrix.
-# The kernel logs boot messages to every console listed here, but only
-# the LAST one becomes /dev/console - that's exactly what
-# select_console() picks between.
+# .EFI files total - dropped for the same underlying reason: a single
+# build's own runtime console-selection logic already covers every
+# case those separate builds were ever for, so they only multiplied
+# the release matrix without buying anything real.
+#
 # nomodeset was tried here and REMOVED - a real Hetzner Cloud CAX
 # (aarch64) boot still showed "display output not active" with it set,
 # and this project ships no vendor KMS driver at all (see the driver-
@@ -1219,21 +1235,20 @@ add_section() {
 # hardware, was two independent bugs stacked on top of each other:
 #
 # 1. Console ORDER. select_console() in init/init picks ACTIVE_TTY by
-#    "last console= wins", the kernel's own convention (see its comment
-#    for the /sys/class/tty/console/active mechanics). aarch64 used to
-#    list tty0 first, ttyAMA0 last, same shape as x86_64 below - which
-#    made ttyAMA0 (serial, unreachable on Hetzner Cloud - no serial
-#    console access there at all) the interactive target instead of
-#    tty0 (the only console the Hetzner VNC viewer shows). Confirmed on
-#    a real boot: with the old order, ACTIVE_TTY/fd 0/1/2/the kernel's
-#    own preferred console all agreed on ttyAMA0, and the on-screen menu
-#    never responded to a single keypress. x86_64 was never affected -
-#    the interactive target being "wrong" there doesn't matter, because
-#    vgacon backs tty0 independently of console= order entirely, so
-#    x86_64 gives no signal either way on this question. Swapped to
-#    ttyAMA0 first, tty0 last for aarch64 - confirmed via the same
-#    real-boot instrumentation (ACTIVE_TTY, /proc/consoles' C flag, and
-#    fd 0/1/2 all landing on tty0) that this is now correct.
+#    "last console= wins", the kernel's own convention (see its own
+#    comment for the /sys/class/tty/console/active mechanics) - back
+#    when this build still registered more than one console at all,
+#    getting the order wrong silently routed the interactive menu to a
+#    console nobody could actually reach (aarch64's own cmdline used to
+#    list tty0 first, ttyAMA0 last, making unreachable serial the
+#    interactive target on a VNC-only Hetzner Cloud VM with no serial
+#    access at all - confirmed via a real boot showing ACTIVE_TTY/fd
+#    0/1/2/the kernel's own preferred console all agreeing on ttyAMA0,
+#    and the on-screen menu never responding to a keypress). Moot now
+#    that every build registers tty0 only, but this is WHY ordering
+#    (and later, registration at all) turned out to matter so much -
+#    kept here as the real incident that started this whole design
+#    thread, not just an abstract concern.
 #
 # 2. Missing USB/HID input stack. Even with console order fixed, the
 #    on-screen menu still didn't respond to a keypress - /proc/bus/
@@ -1247,8 +1262,9 @@ add_section() {
 #    the on-screen menu responds.
 #
 # Both were necessary; neither alone was sufficient - fixed console
-# order with no input driver still shows a dead keyboard, and a working
-# input driver routed to the wrong tty (the old order) is equally dead.
+# order (or, now, registration) with no input driver still shows a dead
+# keyboard, and a working input driver routed to the wrong tty is
+# equally dead.
 #
 # fbcon=nodefer (aarch64 only): Alpine's aarch64 lts kernel config sets
 # CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y (confirmed by reading
@@ -1260,8 +1276,24 @@ add_section() {
 # never actually hit (virtio_gpu's own fb0 came up fine without it too)
 # - harmless either way, and there's no evidence against keeping it.
 case "$ARCH" in
-    x86_64)  CONSOLE_CMDLINE="console=tty0 console=ttyS0,115200n8" ;;
-    aarch64) CONSOLE_CMDLINE="console=ttyAMA0,115200n8 console=tty0 fbcon=nodefer" ;;
+    # tty0 ONLY, on both arches - no serial console= baked into the
+    # default build at all. The build itself has no built-in knowledge
+    # of serial - tty0 is the one sensible default, and serial is purely
+    # a config matter an operator opts into, via alpine-zfsboot.console=
+    # in EFI/ALPINE/config (written at INSTALL time, when the operator
+    # already has full access - not something that needs to be reached
+    # by booting first). select_console()'s own Layer 2 (FAT config) matches
+    # against real /dev node existence, not kernel console=
+    # registration, so a configured serial console works correctly
+    # here regardless of whether it's ALSO on this baked cmdline - this
+    # line only ever decided what happens with NO config at all, and
+    # that answer is now unconditionally tty0, full stop. See
+    # _boot_args_interrupt()'s own comment for the one real knock-on
+    # fix this required (its pre-boot TAB-interrupt poll list used to
+    # come from kernel-registered consoles only, which would have
+    # missed a configured-but-not-kernel-registered serial console).
+    x86_64)  CONSOLE_CMDLINE="console=tty0" ;;
+    aarch64) CONSOLE_CMDLINE="console=tty0 fbcon=nodefer" ;;
 esac
 
 # kexec_load_disabled=0: Alpine's own linux-lts/linux-virt kernels

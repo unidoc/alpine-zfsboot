@@ -724,7 +724,8 @@ fi
 # is exported by /init (or inherited through menu.py's own environment,
 # which got it from /init the same way) - reuse it here so the target
 # system logs to the exact same console, same tty0/ttyS0/ttyS1/ttyS2/
-# ttyAMA0 -> baud mapping switch_console() offers (see menu.py). Only added
+# ttyAMA0 -> baud mapping select_console() resolves (see init/init).
+# Only added
 # if $extra_cmdline doesn't already name its own console= - an explicit
 # persisted choice there is a deliberate override, not an oversight to
 # paper over.

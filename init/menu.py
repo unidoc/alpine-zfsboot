@@ -202,7 +202,8 @@ PCI_DEVICES_ROOT = os.environ.get("STUB_ROOT", "") + "/sys/bus/pci/devices"
 # before main()'s own try/except (further down) exists to catch
 # anything, so one bad character in that config file killed menu.py on
 # EVERY subsequent boot, on every console: no recovery shell, no
-# console switch, no previous-boot diagnostics, no unlock screen - the
+# boot-environment selection, no previous-boot diagnostics, no unlock
+# screen - the
 # entire rescue menu, permanently gone, with /init's own fallback being
 # straight to automatic boot (see /init's own "menu.py exited... falling
 # back to automatic boot" log line). _parse_menu_timeout() can never
@@ -244,8 +245,8 @@ def _parse_menu_grace():
 MENU_TIMEOUT = _parse_menu_timeout()
 MENU_GRACE = _parse_menu_grace()
 # Which real tty /init actually attached this process to (see /init's
-# own select_console()) - switch_console() below needs to know this to
-# compute "the other one(s)". Empty/wrong over SSH - dropbear's own
+# own select_console()) - the diagnostics banner and this file's own
+# controlling-terminal setup need to know this. Empty/wrong over SSH - dropbear's own
 # clearenv() (see rescue-ssh.sh's own comment) wipes this exact
 # variable along with the rest of /init's exported environment, so this
 # always falls back to "tty0" over SSH regardless of what's actually
@@ -271,28 +272,13 @@ TICK_SECONDS = 3
 
 BACKTITLE = "alpine-zfsboot"
 
-# A raw serial line carries NO terminal-geometry negotiation of its
-# own, at ANY layer of a real connection - confirmed a real, reported
-# rendering bug (box-drawing running together, lines starting at the
-# wrong column, content overlapping itself) that persisted identically
-# across THREE completely different local terminal emulators
-# (Terminal.app, Ghostty, tmux-wrapped-Ghostty), over the SAME real
-# chain: local terminal -> ssh -> `qm terminal` -> QEMU's emulated
-# serial port -> this guest's /dev/ttyS0 - ruling out every one of
-# those as the cause, since none of them changed the outcome at all.
-# /init's own case-statement (see its comment there) forces this exact
-# tty's own real winsize to a fixed 24x80 via `stty` before this
-# process even starts - but that alone still leaves dialog itself free
-# to independently compute its OWN idea of a widget's box size from
-# whatever it reads back via TIOCGWINSZ (every dialog_*() helper below
-# used to pass "0 0" - "figure out a size yourself" - for exactly this
-# reason). This project no longer trusts that computation AT ALL for a
-# serial console, forced tty winsize or not: every dialog widget below
-# gets REAL, fixed numbers instead, so there is no longer anything for
-# dialog itself to get wrong. tty0 (a real Linux vt) keeps "0 0" -
-# there is no equivalent doubt there: the kernel's own vt/fbcon layer
-# genuinely knows that console's real geometry, and TIOCGWINSZ against
-# it has never been the reported problem.
+# A raw serial line has no terminal-geometry negotiation at all -
+# confirmed via a real rendering bug (box-drawing corruption) that
+# TIOCGWINSZ-based auto-sizing can't be trusted there, forced tty
+# winsize or not. Every dialog widget below gets fixed 24x80 numbers
+# for a serial console instead of "0 0" ("figure it out yourself").
+# tty0 (a real Linux vt) keeps "0 0" - the kernel's own vt/fbcon layer
+# genuinely knows that console's real geometry.
 IS_SERIAL_CONSOLE = ACTIVE_TTY != "tty0"
 # Comfortably inside the 24x80 /init itself forces (1 row held back
 # for dialog's own --backtitle line, drawn above the box rather than
@@ -332,145 +318,6 @@ DIALOG_COMMON = ["dialog", "--ascii-lines", "--backtitle", BACKTITLE]
 # colors now (see its own header for the full story). This project
 # just has no reason to also set DIALOGRC to the same path GLOBALRC
 # already resolves to on its own.
-
-# True on real UEFI firmware - the same test /init itself uses
-# elsewhere (its own efi_pstore probe). Decides which of the two
-# backing stores write_console_pref() below actually writes to - see
-# its own docstring for why these are two genuinely different
-# concepts, not two implementations of the same one.
-IS_UEFI = os.path.isdir("/sys/firmware/efi")
-
-# Same GUID/name /init's own read_efivar_console_pref() reads (see
-# that function's own comment for the full reasoning - operator's
-# persisted runtime choice, UEFI only, same mechanism systemd-boot's
-# LoaderEntryDefault / GRUB's grubenv use).
-EFIVAR_GUID = "ce0e7d88-f5ad-45e9-a195-680f5140efa5"
-EFIVAR_NAME = "AlpineZfsBootConsole"
-EFIVAR_PATH = f"/sys/firmware/efi/efivars/{EFIVAR_NAME}-{EFIVAR_GUID}"
-
-# Which device /init already confirmed is the canonical alpine-zfsboot
-# FAT/ESP partition (its own disambiguated LABEL=EFI scan, done once -
-# see /init's own ESP-discovery comment for the full "exactly one
-# candidate" reasoning) - empty if /init never found one (or found more
-# than one and refused to guess). Only consulted on BIOS - see
-# write_console_pref()'s own docstring.
-ZFSBOOT_ESP_DEV = os.environ.get("ALPINE_ZFSBOOT_ESP_DEV", "")
-ESP_CONFIG_MOUNT = "/tmp/esp-console-pref"
-
-
-def _write_efivar_console_pref(tty):
-    """Attributes + value in ONE write() - efivarfs's own write handler
-    needs the whole thing at once (see /init's read_efivar_console_pref()
-    for the exact attribute bits and why). Python's raw binary file I/O
-    sidesteps the one real risk a shell printf would have here (embedding
-    a NUL byte, then possibly not writing the rest of the format string in
-    the same call) entirely - f.write(bytes) is one write() syscall of
-    exactly those bytes, no NUL-terminated-string interpretation anywhere
-    in the path. Best-effort: a write failure here is silently swallowed,
-    same posture as the FAT-config path below.
-    """
-    try:
-        with open(EFIVAR_PATH, "wb") as f:
-            f.write(b"\x07\x00\x00\x00" + tty.encode("ascii"))
-    except OSError:
-        pass
-
-
-def _write_fat_console_pref(tty):
-    """Read-modify-write against EFI/ALPINE/config on the
-    canonical FAT/ESP partition, preserving every other line untouched -
-    this is the one persisted setting menu.py itself ever writes into
-    that file (everything else in it is written once, at install time,
-    by alpine-install-zfs.sh), so blowing away unrelated settings here
-    would be a real regression, not a hypothetical one. Best-effort: if
-    the ESP is missing, unwritable, or anything else goes wrong, this
-    boot's LIVE console switch (the sys.exit(42) relaunch right after
-    this call - see switch_console()) still happens regardless; only
-    the "remember this for next reboot" part is lost.
-
-    The actual write is transactional - temp file in the SAME
-    directory, fsync the file, os.rename() over the real target, then
-    fsync the directory too - not a plain truncate-in-place (an
-    earlier version of this function did exactly that: open config_path
-    directly in "w" mode, write, fsync the file descriptor only). A
-    crash between truncate and the new content landing could leave
-    config truncated or half-written, and even a clean file-fsync alone
-    doesn't guarantee the rename's own directory-entry metadata is
-    durable on every filesystem - real hardening for a file that also
-    carries rescue-SSH/network settings, not just the console
-    preference. Same semantics internal/espconfig.WriteFile implements
-    in Go for the new alpine-zfsboot CLI's own writers - not shared
-    code (different runtime), but the same contract.
-    """
-    if not ZFSBOOT_ESP_DEV:
-        return
-    subprocess.run(["mkdir", "-p", ESP_CONFIG_MOUNT], capture_output=True)
-    subprocess.run(["umount", ESP_CONFIG_MOUNT], capture_output=True)
-    mounted = subprocess.run(["mount", "-t", "vfat", ZFSBOOT_ESP_DEV, ESP_CONFIG_MOUNT],
-                              capture_output=True)
-    if mounted.returncode != 0:
-        return
-    try:
-        config_dir = os.path.join(ESP_CONFIG_MOUNT, "EFI", "ALPINE")
-        config_path = os.path.join(config_dir, "config")
-        os.makedirs(config_dir, exist_ok=True)
-        lines = []
-        if os.path.exists(config_path):
-            with open(config_path, "r", errors="replace") as f:
-                lines = [ln.rstrip("\r\n") for ln in f]
-        lines = [ln for ln in lines if not ln.startswith("alpine-zfsboot.console=")]
-        lines.append(f"alpine-zfsboot.console={tty}")
-
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".alpine-zfsboot-write-", dir=config_dir)
-        try:
-            with os.fdopen(tmp_fd, "w") as f:
-                f.write("\n".join(lines) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.rename(tmp_path, config_path)
-        except OSError:
-            os.unlink(tmp_path)
-            raise
-        dir_fd = os.open(config_dir, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass  # best-effort - see this function's own docstring
-    finally:
-        subprocess.run(["umount", ESP_CONFIG_MOUNT], capture_output=True)
-
-
-def write_console_pref(tty):
-    """Persists the operator's chosen console as their own runtime
-    preference - UEFI NVRAM on UEFI hosts (the mechanism this project
-    used originally), EFI/ALPINE/config on the canonical FAT/ESP
-    partition on BIOS hosts (which have no NVRAM to persist anything
-    into at all).
-
-    Deliberately NOT the same storage either way. The FAT config file
-    is the canonical, firmware-neutral MACHINE CONFIG/DEFAULT (set once
-    at install time, by alpine-install-zfs.sh, same file rescue-SSH/
-    network settings live in) - an operator's own "I prefer tty0 on
-    THIS box" choice, made live from this menu, is a different concept,
-    and on UEFI hosts it has a real, existing, firmware-native place to
-    live that does that job well. An earlier version of this function
-    routed BOTH cases through the FAT config file uniformly, on the
-    reasoning that one storage mechanism everywhere is simpler - true,
-    but it silently discarded a real UEFI capability (a persisted
-    choice independent of whatever the installed machine config
-    says) for no actual gain, since the FAT-config path was only ever
-    NEEDED for BIOS (UEFI already had a working mechanism). Restored on
-    review: see /init's own select_console() for the full four-layer
-    precedence (cmdline > UEFI NVRAM > FAT config > kernel default) this
-    split is designed around.
-    """
-    if IS_UEFI:
-        _write_efivar_console_pref(tty)
-    else:
-        _write_fat_console_pref(tty)
-
 
 def zfs_list(dataset_root):
     """Boot environments: datasets directly under <pool>/ROOT."""
@@ -854,45 +701,6 @@ def select_kernel():
         boot(BOOTFS, kernel_suffix=kernels[choice])
 
 
-def switch_console():
-    """Shows every real console candidate this boot has, current one
-    marked and pre-highlighted, and lets the user pick explicitly -
-    not just a blind cycle-to-next-one (an earlier version of this did
-    that, with no indication anywhere of what the current default even
-    was). Persists the choice via write_console_pref() (UEFI NVRAM or
-    the canonical FAT/ESP partition's own config file, depending on
-    firmware - see that function's own docstring), then asks /init to
-    relaunch this whole menu attached to it - a real, live switch
-    within THIS boot (FreeBSD-loader-style: flip between video/serial
-    on demand), not just "takes effect next reboot". Exit code 42 is a
-    deliberate, specific signal /init's own main loop treats as
-    "restart me on the new console", not a crash (see /init's own
-    comment on that same exit code) - sys.exit(), not os._exit(), so
-    any real cleanup Python itself wants to do on the way out still
-    happens.
-    """
-    # ttyS1/ttyS2 alongside ttyS0/ttyAMA0 - confirmed a real need on
-    # physical OVH hardware, whose remote-console redirection doesn't
-    # always land on ttyS0 (see /init's own select_console() comment).
-    candidates = [c for c in ("tty0", "ttyS0", "ttyS1", "ttyS2", "ttyAMA0") if os.path.exists(f"/dev/{c}")]
-    if len(candidates) < 2:
-        dialog_msgbox("Switch console", "Only one console is available on this boot - nothing to switch to.")
-        return
-    current = ACTIVE_TTY if ACTIVE_TTY in candidates else candidates[0]
-    labels = [f"/dev/{c}" + (" (current)" if c == current else "") for c in candidates]
-    idx = dialog_menu(
-        "Switch console", labels,
-        text=f"Console: /dev/{current} (default)\n\nSelect a console to switch to:",
-        default_item=str(candidates.index(current)),
-    )
-    if idx is None or candidates[idx] == current:
-        return
-    next_tty = candidates[idx]
-    write_console_pref(next_tty)
-    dialog_msgbox("Switch console", f"Switching to /dev/{next_tty}...")
-    sys.exit(42)
-
-
 def _network_status():
     """Real, current RESCUE_IFACE address, or None - re-checked every time this
     is called (menu item labels, network_menu() itself), never cached,
@@ -1262,11 +1070,11 @@ def _offer_to_end_session(text):
     own SSH client by hand (~.), leaving the success dialog on screen
     with "Connection to ... closed" overlaid on top of it.
 
-    Yes -> sys.exit() (a plain exit - NOT the special exit(42)
-    select_console() uses for its own live-console relaunch, which
-    means something specific to /init and does not apply here), which
-    ends this process and, with it, dropbear's session for this
-    connection. No (the default - default_no=True, same convention as
+    Yes -> sys.exit() (a plain exit - NOT recovery_shell()'s own special
+    exit(43), which means something specific to /init's own pool-import
+    re-collection and does not apply here), which ends this process and,
+    with it, dropbear's session for this connection. No (the default -
+    default_no=True, same convention as
     every other real "are you sure" prompt in this file, e.g. the
     delete-snapshot confirmation) falls through and returns, exactly
     like the plain dialog_msgbox this replaced did.
@@ -1276,7 +1084,7 @@ def _offer_to_end_session(text):
     exiting really does end just that connection - but on the local
     console this process is /init's own child (init/init's own
     "python3 /menu.py" loop), and /init treats ANY exit other than the
-    special 42 as "menu.py missing or crashed", falling straight
+    special 43 as "menu.py missing or crashed", falling straight
     through to automatic boot (exec /boot-dataset.sh on the default
     BOOTFS, or die() under ALPINE_ZFSBOOT_FORCED_RESCUE) - see
     init/init's own comment on that loop. A console operator answering
@@ -2431,7 +2239,7 @@ def _banner():
         "   the Rolls Royce of ZFS boot for Alpine, by UniDoc\n"
         f"   version: {_project_version()} (built {_build_stamp()})\n"
         "============================================================\n"
-        f"   Console: /dev/{ACTIVE_TTY} (see 'Switch console' to change)"
+        f"   Console: /dev/{ACTIVE_TTY} (press TAB at the pre-boot prompt to change)"
     )
     if POOL_IMPORT_ERROR:
         # ONE short, fixed-length line - NOT the actual error text (an
@@ -2467,11 +2275,9 @@ def _banner():
 
 
 def _items():
-    """A function, not a constant - "Switch console" and "Network" both
-    show their own live current state right in the label (a real,
-    requested change for Switch console: it used to say only "Switch
-    console" with no indication anywhere in the menu of what pressing
-    it would actually do; Network follows the identical reasoning).
+    """A function, not a constant - "Network" shows its own live
+    current state right in the label, not just a bare action name with
+    no indication of what pressing it would actually do.
     """
     # _network_addresses(), not _network_status() - a full source audit
     # found this menu label used the IPv4-only helper, which meant a
@@ -2489,8 +2295,8 @@ def _items():
     # Diagnostics cockpit's own existing use of this same helper.
     addrs = _network_addresses()
     ip = addrs[0] if addrs else None
-    # Same live-state-in-the-label convention as Switch console/Network
-    # below - encryption state used to only ever become visible as a
+    # Same live-state-in-the-label convention as Network below -
+    # encryption state used to only ever become visible as a
     # side effect of picking a kernel or chrooting in; showing it here
     # unconditionally is what makes "Unlock encrypted root" a first-
     # class rescue concept rather than a hidden precondition.
@@ -2531,7 +2337,6 @@ def _items():
         "Diagnostics (pool status / disks / dmesg)",
         "Edit cmdline & boot",
         "Deploy new machine (zfs recv)",
-        f"Switch console (current: /dev/{ACTIVE_TTY})",
         f"Network: {ip if ip else 'not connected'}",
         "Recovery shell",
         # Always present, not just when POOL_IMPORT_ERROR is set - real,
@@ -2551,7 +2356,41 @@ def _items():
 _TICK_TIMEOUT_CODE = 66
 
 
-def _run_dialog_with_activity(cmd, env, real_tty_fd):
+def _apply_nav_keys(scan, position, item_count):
+    """Replays every bare Up/Down arrow-key escape sequence found in
+    SCAN, IN ORDER, against POSITION - clamped at each individual
+    keypress exactly the way dialog's own menubox.c
+    DLGK_ITEM_PREV/DLGK_ITEM_NEXT handling does (confirmed against
+    dialog's real upstream source: at either boundary, an extra Up/Down
+    is a complete no-op there - no state change, no redraw - NOT a
+    clamp-and-stop, and certainly not a wrap to the other end). A real,
+    reported bug this replaced: an earlier version only tracked a NET
+    Down(+1)/Up(-1) byte COUNT, applied after the fact as
+    `(default_item + nav_delta) % len(items)` - correct only as long as
+    navigation never touched a boundary mid-tick. The moment it did
+    (the single most natural thing to do from the bottom item, which
+    POOL_IMPORT_ERROR/FORCED_RESCUE's own default_item already opens
+    on - see main()'s own comment), the modulo wraparound produced a
+    value with no relationship to where dialog's own cursor actually
+    was, silently diverging further on every subsequent tick.
+
+    A pure function, deliberately pulled out of
+    _run_dialog_with_activity()'s own read loop so it's testable
+    without a real dialog/pty at all - same idiom this project already
+    uses elsewhere (e.g. /init's own split-for-testability functions)
+    for logic that would otherwise only ever be a static source check.
+    """
+    for m in re.finditer(rb"\x1b\[([AB])", scan):
+        if m.group(1) == b"B":
+            if position < item_count - 1:
+                position += 1
+        else:
+            if position > 0:
+                position -= 1
+    return position
+
+
+def _run_dialog_with_activity(cmd, env, real_tty_fd, default_item, item_count):
     """Runs `cmd` (a dialog invocation) attached to a pty THIS function
     manages, relaying real keystrokes to it and its rendering back to
     the real terminal - the only way to detect that the operator
@@ -2569,20 +2408,16 @@ def _run_dialog_with_activity(cmd, env, real_tty_fd):
     byte. This relay is what makes _countdown_menu() able to tell
     those two cases apart, which dialog alone provably cannot.
 
-    Returns (exit_code, stderr_text, activity, nav_delta) - activity is
+    Returns (exit_code, stderr_text, activity, position) - activity is
     True if even a single byte was ever read from the real terminal
     while dialog was running, whether or not dialog itself ever
-    recognized it as a real selection. nav_delta is a best-effort net
-    Down(+1)/Up(-1) arrow-key count seen in that same input - confirmed
-    a real, reported UX bug otherwise: a tick that times out AFTER the
-    operator navigated (but never confirmed) falls into a brand new,
-    unrelated dialog invocation next (see _countdown_menu()'s own
-    default_item handling), which has no memory of where they'd
-    navigated to and defaults back to item 0 - a visible "flicker back
-    to the top" the moment anyone hesitates for even one tick. Only
-    plain arrow keys are tracked (not Home/End/PageUp/Down or mouse) -
-    good enough for the common case without parsing dialog's own
-    screen output to determine the exact highlighted item.
+    recognized it as a real selection. position is the operator's real
+    current highlighted item - see _apply_nav_keys()'s own comment for
+    how it's tracked and the real, reported bug that function's
+    clamped-replay approach replaced. Only plain arrow keys are tracked
+    (not Home/End/PageUp/Down or mouse) - good enough for the common
+    case without parsing dialog's own screen output to determine the
+    exact highlighted item.
     """
     master_fd, slave_fd = pty.openpty()
     # See IS_SERIAL_CONSOLE's own module-level comment - a serial
@@ -2707,7 +2542,7 @@ def _run_dialog_with_activity(cmd, env, real_tty_fd):
     old_attrs = termios.tcgetattr(real_tty_fd)
     tty.setraw(real_tty_fd)
     activity = False
-    nav_delta = 0
+    position = default_item
     pending_esc = b""
     stderr_chunks = []
 
@@ -2728,11 +2563,11 @@ def _run_dialog_with_activity(cmd, env, real_tty_fd):
             try:
                 rlist, _, _ = select.select([master_fd, err_r, real_tty_fd], [], [])
             except OSError:
-                # A real serial line (ttyS0 - not a pty) can raise here
-                # in ways a pty never does. Nothing about "select
-                # itself failed" tells us whether dialog is even still
-                # running - waitpid below (WNOHANG) is what actually
-                # decides that, not this loop guessing.
+                # A real serial line can raise here in ways a pty
+                # never does. Nothing about "select itself failed"
+                # tells us whether dialog is even still running -
+                # waitpid below (WNOHANG) decides that, not this loop
+                # guessing.
                 try:
                     if os.waitpid(pid, os.WNOHANG) != (0, 0):
                         break
@@ -2767,7 +2602,7 @@ def _run_dialog_with_activity(cmd, env, real_tty_fd):
                     # scanned again as the start of THIS chunk rather
                     # than lost.
                     scan = pending_esc + chunk
-                    nav_delta += scan.count(b"\x1b[B") - scan.count(b"\x1b[A")
+                    position = _apply_nav_keys(scan, position, item_count)
                     pending_esc = scan[-2:]
                     _write_all(master_fd, chunk)
     finally:
@@ -2797,7 +2632,7 @@ def _run_dialog_with_activity(cmd, env, real_tty_fd):
         exit_code = (status >> 8) & 0xFF
     except OSError:
         exit_code = _TICK_TIMEOUT_CODE
-    return exit_code, b"".join(stderr_chunks).decode("utf-8", "replace").strip(), activity, nav_delta
+    return exit_code, b"".join(stderr_chunks).decode("utf-8", "replace").strip(), activity, position
 
 
 def _countdown_menu(title, items, text, seconds, default_item=0):
@@ -2819,15 +2654,18 @@ def _countdown_menu(title, items, text, seconds, default_item=0):
         real activity, even unconfirmed, silences the countdown for
         good rather than letting it keep ticking down underneath
         someone who is visibly still there.
-      - next_default_item is this tick's own default_item plus
-        whatever net arrow-key navigation the relay observed, wrapped
-        into range - see _run_dialog_with_activity()'s own nav_delta
-        comment for the real, reported "flicker back to item 0" bug
-        this closes: whoever calls this again next (another tick, or
-        the unhurried dialog_menu() once the countdown stops) should
-        pass THIS back in as their own default_item, so a tick that
-        times out mid-navigation hands off to a fresh widget that
-        opens exactly where the operator left it, not item 0.
+      - next_default_item is the operator's REAL current highlighted
+        item, replayed keypress-by-keypress from this tick's own
+        navigation (clamped at each boundary exactly like dialog's own
+        menubox.c - see _run_dialog_with_activity()'s own comment for
+        both the original "flicker back to item 0" bug this closes,
+        and the follow-up bug a naive net-delta-plus-modulo version of
+        this fix itself had: whoever calls this again next (another
+        tick, or the unhurried dialog_menu() once the countdown stops)
+        should pass THIS back in as their own default_item, so a tick
+        that times out mid-navigation hands off to a fresh widget that
+        opens exactly where the operator left it, not item 0 (or
+        anywhere else that doesn't match dialog's own real cursor).
     See this file's own header comment for why the full countdown is
     built from many of these short calls rather than one long one.
     """
@@ -2894,7 +2732,8 @@ def _countdown_menu(title, items, text, seconds, default_item=0):
                   "falling back to stdin - rendering will likely be invisible")
             real_tty_fd = sys.stdin.fileno()
     try:
-        exit_code, answer, activity, nav_delta = _run_dialog_with_activity(cmd, env, real_tty_fd)
+        exit_code, answer, activity, next_default_item = _run_dialog_with_activity(
+            cmd, env, real_tty_fd, default_item, len(items))
     except Exception as e:
         # The pty relay is real, novel, low-level code - confirmed
         # twice on real hardware to fail in ways no local testing (all
@@ -2913,8 +2752,8 @@ def _countdown_menu(title, items, text, seconds, default_item=0):
         print(f"alpine-zfsboot: pty relay failed ({e!r}), falling back to plain dialog")
         proc = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, env=env)
         answer = (proc.stderr or "").strip()
-        # No nav_delta available from this fallback path (no relay ran
-        # at all) - passes default_item straight through unchanged
+        # No real position tracking from this fallback path (no relay
+        # ran at all) - passes default_item straight through unchanged
         # rather than losing it.
         return (int(answer), 0, False, default_item) if proc.returncode == 0 and answer.lstrip("-").isdigit() \
             else (None, proc.returncode, False, default_item)
@@ -2924,7 +2763,6 @@ def _countdown_menu(title, items, text, seconds, default_item=0):
                 os.close(real_tty_fd)
             except OSError:
                 pass
-    next_default_item = (default_item + nav_delta) % len(items)
     if exit_code == 0 and answer.lstrip("-").isdigit():
         return int(answer), 0, activity, next_default_item
     if exit_code == 0:
@@ -3026,14 +2864,12 @@ def _dispatch(choice):
     elif choice == 9:
         deploy()
     elif choice == 10:
-        switch_console()
-    elif choice == 11:
         network_menu()
-    elif choice == 12:
+    elif choice == 11:
         recovery_shell()
-    elif choice == 13:
+    elif choice == 12:
         show_boot_log()
-    elif choice == 14:
+    elif choice == 13:
         show_previous_boot_diagnostics()
 
 
@@ -3181,14 +3017,13 @@ def main():
         # just-reattached remote console is live - without this, that
         # keystroke sits buffered and gets delivered to the very first
         # countdown dialog as an instant "confirm the highlighted item"
-        # (Boot default), reproducing the exact symptom this whole
-        # feature exists to fix, just delayed by MENU_GRACE seconds
-        # instead of eliminated.
+        # (Boot default), which would otherwise look exactly like a
+        # silently-skipped menu.
         #
         # PR #16 review (F6): unconditional means this also ran over
         # rescue SSH (the session is by definition already attached -
         # there is no remote-console reattach to wait for), and on every
-        # 42/43 relaunch (the operator just pressed a key, seconds ago -
+        # 43 relaunch (the operator just pressed a key, seconds ago -
         # not a fresh reboot). Gating on IS_SSH_SESSION closes the SSH
         # case, which also happens to be the common one: every normal
         # boot was 5s slower by default otherwise. The relaunch case is
@@ -3200,7 +3035,10 @@ def main():
         # nobody's remotely reattaching to) to leave as-is too.
         if MENU_GRACE > 0 and not IS_SSH_SESSION:
             print(f"alpine-zfsboot: waiting {MENU_GRACE}s for this console to be ready before showing the menu...")
-            _cancellable(time.sleep, MENU_GRACE)
+            try:
+                time.sleep(MENU_GRACE)
+            except KeyboardInterrupt:
+                print("alpine-zfsboot: cancelled (Ctrl-C) - returning to menu", file=sys.stderr)
             try:
                 termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
             except (OSError, termios.error):
@@ -3249,20 +3087,20 @@ def main():
             _cancellable(boot, BOOTFS)
 
     # A human is confirmed present (or explicitly cancelled the
-    # countdown) - no more time pressure from here on. A loop, not
-    # recursion - every submenu action (manage/chroot/deploy/edit-
-    # cmdline) returns back here, and a rescue session can sit at this
-    # menu for a long time; recursing on every return would grow the
-    # Python call stack for no reason.
-    # Only the FIRST call here needs default_item - it's what carries
-    # over whatever the operator had navigated to in the countdown's
-    # last tick (see above); returning to this same menu after a
-    # submenu action is unrelated existing behavior, not something
-    # anyone has reported an issue with, so it's left resetting to 0
-    # like it always has.
+    # countdown), OR there was never any auto-boot pressure to begin
+    # with (POOL_IMPORT_ERROR/FORCED_RESCUE) - no more time pressure
+    # from here on. A plain blocking menu, not a ticking one: a ticking
+    # menu restarts the widget on every idle tick and loses any cursor
+    # move that is not an arrow key (digit hotkeys, Home/End, PgUp/PgDn),
+    # so Enter could run a different item than the one selected.
+    # A loop, not recursion - every submenu action (manage/chroot/
+    # deploy/edit-cmdline) returns back here, and a rescue session can
+    # sit at this menu for a long time.
+    # Only the FIRST call needs default_item - it carries over whatever
+    # the operator had navigated to in the countdown's last tick.
     def _menu_round(**kwargs):
         choice = dialog_menu("alpine-zfsboot", _items(), text=_banner(),
-                              cancel_label="Boot default", **kwargs)
+                             cancel_label="Boot default", **kwargs)
         _dispatch(choice)
 
     _cancellable(_menu_round, default_item=default_item)

@@ -3,14 +3,15 @@
 # alpine-zfsboot-shell, run directly on the dev host (no Alpine container, no
 # real hardware needed).
 #
-# Uses #!/usr/bin/env bash - init/init used to have a real reason this
-# harness specifically needed bash (a `read -t N -n 1` keypress race,
-# unsupported by dash's `read`), which is gone now that select_console()
-# no longer races a keypress at all (menu.py's own dialog --timeout is
-# the countdown now - see /init's own header comment for why). Left as
-# bash anyway rather than re-verified against dash - no longer a hard
-# requirement as far as this file's own contents go, but not worth
-# re-litigating without a real reason to.
+# Uses #!/usr/bin/env bash - not because THIS file's own bash-level code
+# needs it (init/init's real `read -t N -n 1` keypress race, in
+# _boot_args_wait_for_tab() - the pre-boot "press TAB to interrupt" gate,
+# see that function's own comment - always runs inside a `busybox ash -c`
+# subprocess this file spawns, never as bash syntax here directly, so
+# this file's own interpreter choice is unrelated to whether dash's
+# `read` supports -t/-n). Left as bash for no remaining hard reason as
+# far as this file's own contents go - not worth re-litigating without
+# one.
 #
 # init/init and boot-dataset.sh both set PATH=/sbin:/bin:/usr/sbin:/usr/bin
 # themselves - deliberately, for a deterministic PATH at real boot,
@@ -375,20 +376,29 @@ fi
 rm -rf "$d"
 
 # The above proves _cancellable() itself is safe when called this way -
-# it does NOT prove main() actually calls it that way rather than a
-# bare time.sleep(MENU_GRACE) (main() has real dialog/tty side effects,
-# not practical to invoke directly in this harness - see this file's
-# own NOTE further down on what that class of test can and cannot
-# prove). This closes that gap with a plain source check instead.
-if grep -q '_cancellable(time\.sleep, MENU_GRACE)' "$REPO_ROOT/init/menu.py"; then
-    ok "main() actually routes the MENU_GRACE sleep through _cancellable(), not a bare time.sleep()"
+# it does NOT prove main() actually calls it that way (main() has real
+# dialog/tty side effects, not practical to invoke directly in this
+# harness - see this file's own NOTE further down on what that class of
+# test can and cannot prove). This closes that gap with a plain source
+# check instead.
+#
+# Third audit: MENU_GRACE's own pause is not a plain _cancellable(
+# time.sleep, MENU_GRACE) call either - it's wrapped in its OWN
+# try/except KeyboardInterrupt, printing the exact same "cancelled"
+# message _cancellable() itself would have. Same safety property,
+# different mechanism - the check below matches that shape instead of
+# the _cancellable() call tested above.
+grace_block="$(awk '/if MENU_GRACE > 0/{f=1} f{print} f && /while remaining > 0:/{exit}' "$REPO_ROOT/init/menu.py")"
+if echo "$grace_block" | grep -q 'except KeyboardInterrupt:' \
+   && echo "$grace_block" | grep -q 'cancelled (Ctrl-C) - returning to menu'; then
+    ok "main() catches Ctrl-C during the MENU_GRACE loop itself, with the same 'cancelled' message _cancellable() uses elsewhere"
 else
-    bad "main() does not call _cancellable(time.sleep, MENU_GRACE) - Ctrl-C during the grace pause would crash uncaught regardless of _cancellable's own correctness"
+    echo "$grace_block"; bad "the MENU_GRACE loop does not catch KeyboardInterrupt - Ctrl-C during grace would crash uncaught"
 fi
 
 # PR #16 review (F6): the pause used to be unconditional - it also ran
 # over rescue SSH (the session is by definition already attached, no
-# remote-console reattach to wait for) and on every 42/43 relaunch.
+# remote-console reattach to wait for) and on every 43 relaunch.
 # Gating on IS_SSH_SESSION closes the SSH case (the common one - every
 # normal boot was 5s slower by default otherwise). Same "static source
 # check, main() itself isn't practical to invoke directly" reasoning as
@@ -435,10 +445,10 @@ echo "== menu.py: stdin is re-flushed after the MENU_GRACE pause, not just befor
 # driving a real pty race (this harness's own dot-sourced subshells
 # have no controlling terminal at all - see this file's own NOTE further
 # down on what that class of test can and cannot prove).
-if awk '/_cancellable\(time\.sleep, MENU_GRACE\)/{f=1} f && /termios\.tcflush/{print; found=1} /remaining = MENU_TIMEOUT/{exit} END{exit !found}' "$REPO_ROOT/init/menu.py"; then
-    ok "a tcflush call exists after the MENU_GRACE sleep, before the countdown loop starts"
+if awk '/if MENU_GRACE > 0/{f=1} f && /termios\.tcflush/{print; found=1} /remaining = MENU_TIMEOUT/{exit} END{exit !found}' "$REPO_ROOT/init/menu.py"; then
+    ok "a tcflush call exists after the MENU_GRACE loop, before the countdown loop starts"
 else
-    bad "no tcflush found between the MENU_GRACE sleep and the countdown loop - a keystroke buffered during the grace pause would reach the first dialog unflushed"
+    bad "no tcflush found between the MENU_GRACE loop and the countdown loop - a keystroke buffered during the grace pause would reach the first dialog unflushed"
 fi
 
 # =============================================================================
@@ -3361,7 +3371,7 @@ rm -rf "$d"
 echo "== init: an operator-chosen serial console gets its line settings (baud/parity/bits) set explicitly =="
 # Real hardware found (OVH/Kimsufi bare metal, IPMI Serial-Over-LAN): a
 # console picked ONLY via alpine-zfsboot's own runtime preference layers
-# (FAT config/NVRAM/cmdline - see select_console()'s own comment) rather
+# (FAT config/claim/cmdline - see select_console()'s own comment) rather
 # than the one embedded in CONSOLE_CMDLINE at build time was never
 # touched by the kernel's own console= parsing, so it kept whatever line
 # settings the UART/kernel driver defaulted to - observed as complete
@@ -3512,7 +3522,7 @@ rm -rf "$d"
 
 # The tests above prove _parse_console_spec/_apply_console_line_settings
 # are correct IN ISOLATION - they do NOT prove select_console() itself
-# actually calls _parse_console_spec before each of its own layer 2/3/4
+# actually calls _parse_console_spec before each of its own layer 2/3
 # comparisons, rather than comparing the whole raw preference string
 # against a bare candidate name directly (the exact old, silently-
 # broken-for-any-spec-with-options shape this whole feature replaces).
@@ -3521,19 +3531,1738 @@ rm -rf "$d"
 # compare) left every test above still passing, since none of them
 # exercises select_console() itself - a real coverage gap, not
 # hypothetical. Static source checks close it (select_console() has
-# real mount/efivar side effects, not practical to invoke directly in
-# this harness - see this file's own NOTE elsewhere on that class of
+# real mount side effects, not practical to invoke directly in this
+# harness - see this file's own NOTE elsewhere on that class of
 # limitation).
-if grep -c '_parse_console_spec "\$pref"' "$REPO_ROOT/init/init" | grep -qx 2 \
+if grep -c '_parse_console_spec "\$pref"' "$REPO_ROOT/init/init" | grep -qx 1 \
    && grep -q '_parse_console_spec "\$ZFSBOOT_CONSOLE_CMDLINE"' "$REPO_ROOT/init/init"; then
-    ok "select_console() calls _parse_console_spec for all three preference layers (FAT config, NVRAM, cmdline)"
+    ok "select_console() calls _parse_console_spec for both spec-bearing preference layers (FAT config, cmdline)"
 else
     bad "select_console() does not call _parse_console_spec for one or more layers - a console=ttySn,<opts> value would silently never match any candidate in that layer"
 fi
 
 # =============================================================================
-echo "== init: an operator-chosen console that can't actually be opened falls back instead of killing /init =="
-# Fable-model adversarial review (same review that led to the stty fix
+echo "== init: notify_inactive_consoles() banners every OTHER registered console, never the active one (Netcup incident fix) =="
+# design review, after a real Netcup VM incident: /init (and
+# everything menu.py later prints) only ever writes to ACTIVE_TTY - every
+# OTHER console CONSOLE_CMDLINE registered went completely silent the
+# moment userspace took over, indistinguishable from a hang. Extracts the
+# REAL function verbatim and runs it under busybox ash against fake
+# console/active + regular-file /dev nodes.
+extract_notify() {
+    sed -n '/^_parse_console_spec()/,/^}/p; /^_apply_console_line_settings()/,/^}/p; /^_known_console_names()/,/^}/p; /^_is_known_console_name()/,/^}/p; /^_extra_relevant_consoles()/,/^}/p; /^notify_inactive_consoles()/,/^}/p' "$REPO_ROOT/init/init"
+}
+d="$(fresh_env)"
+mkdir -p "$d/sys/class/tty/console" "$d/dev"
+echo "tty0 ttyS0" > "$d/sys/class/tty/console/active"
+: > "$d/dev/tty0"
+: > "$d/dev/ttyS0"
+busybox ash -c "
+$(extract_notify)
+ROOTFS='$d'
+ACTIVE_TTY=ttyS0
+LAST_NOTIFIED_TTY=''
+notify_inactive_consoles
+echo done
+" >"$d/rc.out" 2>&1
+if grep -q "the interactive boot menu is running on /dev/ttyS0" "$d/dev/tty0" \
+   && grep -qx "done" "$d/rc.out"; then
+    ok "notify_inactive_consoles() writes a banner naming the active console to the OTHER (inactive) console"
+else
+    cat "$d/dev/tty0" "$d/rc.out"; bad "no banner landed on the inactive console, or the function didn't survive"
+fi
+if [ -s "$d/dev/ttyS0" ]; then
+    cat "$d/dev/ttyS0"; bad "the ACTIVE console got a banner written to it too - it should stay untouched, that's what the menu itself is already using"
+else
+    ok "the active console itself is never written to by notify_inactive_consoles() - only genuinely inactive ones"
+fi
+if grep -q "reboot and press" "$d/dev/tty0" && grep -q "TAB at the 'alpine-zfsboot starting' prompt" "$d/dev/tty0"; then
+    ok "the tty0-specific banner points at the pre-boot TAB-interrupt screen, not a live claim"
+else
+    cat "$d/dev/tty0"; bad "tty0's own extra banner line is missing or still references a live claim"
+fi
+rm -rf "$d"
+
+# Third review finding: a kernel-registered but UNRECOGNIZED
+# console (hvc0, say - in console/active, so this loop's own existence
+# check passes, but outside _known_console_names) used to get the SAME
+# "reboot and press TAB, or set alpine-zfsboot.console=$tty" advice as
+# a genuinely supported one - a guaranteed dead end, since
+# select_console() itself will reject that name every single boot,
+# forever. Must say the console is unsupported instead, not propose a
+# persistence step that can never work.
+d="$(fresh_env)"
+mkdir -p "$d/sys/class/tty/console" "$d/dev"
+echo "tty0 hvc0" > "$d/sys/class/tty/console/active"
+: > "$d/dev/tty0"
+: > "$d/dev/hvc0"
+busybox ash -c "
+$(extract_notify)
+ROOTFS='$d'
+ACTIVE_TTY=tty0
+LAST_NOTIFIED_TTY=''
+notify_inactive_consoles
+echo done
+" >"$d/rc.out" 2>&1
+if grep -q "isn't a console name this build can select" "$d/dev/hvc0" \
+   && ! grep -q "alpine-zfsboot.console=hvc0" "$d/dev/hvc0" \
+   && grep -qx "done" "$d/rc.out"; then
+    ok "an unrecognized-name console (hvc0) gets an honest 'unsupported' banner, not advice that can never actually work"
+else
+    cat "$d/dev/hvc0" "$d/rc.out"; bad "an unrecognized-name console still got the doomed-to-reject persistence advice - the exact dead-end bug the fix was for"
+fi
+rm -rf "$d"
+
+echo "== menu.py: the post-countdown top-level menu is a plain blocking dialog_menu(), not a ticking one =="
+# A ticking menu restarts dialog every idle tick and loses any cursor move
+# that is not an arrow key (digit hotkeys, Home/End, PgUp/PgDn), so Enter
+# could run a different item than the one the operator selected (PR #18
+# review, F3). Real side effects make main() impractical to invoke here,
+# so this is a static check of its shape. Also: no leftover claim-poll call.
+main_src="$(awk '/^def main\(\)/{f=1} f{print} f && /^def [a-z]/ && !/^def main\(\)/{exit}' "$REPO_ROOT/init/menu.py")"
+if echo "$main_src" | grep -q 'def _menu_round(' \
+   && echo "$main_src" | grep -q 'dialog_menu("alpine-zfsboot", _items(), text=_banner(),' \
+   && echo "$main_src" | grep -q 'cancel_label="Boot default"' \
+   && ! echo "$main_src" | grep -q '_unhurried_round' \
+   && ! echo "$main_src" | grep -q '_poll_console_claim\|_poll_tty0_claim\|_poll_serial_console_claim'; then
+    ok "the post-countdown top-level menu is a plain blocking dialog_menu() (ESC = Boot default), and no claim-polling call remains"
+else
+    echo "$main_src" | grep -n "_unhurried_round\|_menu_round\|_poll_console_claim\|_poll_tty0_claim\|_poll_serial_console_claim"; bad "the top-level menu is not the plain blocking dialog_menu() shape"
+fi
+
+echo "== init: notify_inactive_consoles() only banners once per ACTIVE_TTY, not every relaunch =="
+d="$(fresh_env)"
+mkdir -p "$d/sys/class/tty/console" "$d/dev"
+echo "tty0 ttyS0" > "$d/sys/class/tty/console/active"
+: > "$d/dev/tty0"
+: > "$d/dev/ttyS0"
+# review (F2), a real gap: the fake tty0 here is a REGULAR FILE,
+# and the banner write uses `>` (truncate) - a second, unguarded call
+# with the SAME ACTIVE_TTY would produce byte-identical content anyway
+# (same inputs), so a plain before/after string compare can't tell
+# "didn't write" from "wrote the exact same thing again" - this test
+# would have passed even with the LAST_NOTIFIED_TTY dedupe deleted
+# (confirmed: negative control run, dedupe removed, this assertion
+# still read SAME). Fixed: plant a sentinel line AFTER the first call -
+# a real second write (via `>`) truncates it away; a real skip leaves
+# it untouched. Only a working dedupe can leave the sentinel in place.
+busybox ash -c "
+$(extract_notify)
+ROOTFS='$d'
+ACTIVE_TTY=ttyS0
+LAST_NOTIFIED_TTY=''
+notify_inactive_consoles
+echo SENTINEL-UNTOUCHED >> \"\$ROOTFS/dev/tty0\"
+notify_inactive_consoles
+cat \"\$ROOTFS/dev/tty0\"
+" >"$d/rc.out" 2>&1
+if grep -qx "SENTINEL-UNTOUCHED" "$d/rc.out"; then
+    ok "calling notify_inactive_consoles() twice with the same ACTIVE_TTY does not re-write (or duplicate) the banner"
+else
+    cat "$d/rc.out"; bad "a second call with the same ACTIVE_TTY changed the banner content - LAST_NOTIFIED_TTY dedupe isn't working"
+fi
+rm -rf "$d"
+
+echo "== init: notify_inactive_consoles() survives a console it can't actually write to (PID 1 must never die here) =="
+# Real negative-shaped case: console/active names a tty whose /dev node
+# exists but writing to it fails (EISDIR here - a directory standing in
+# for "exists but not writable", the same class of failure a real
+# PORT_UNKNOWN node's own write(2) EIO would produce).
+d="$(fresh_env)"
+mkdir -p "$d/sys/class/tty/console" "$d/dev"
+echo "tty0 ttyS0" > "$d/sys/class/tty/console/active"
+mkdir -p "$d/dev/tty0"  # directory, not a file - any write to it fails
+: > "$d/dev/ttyS0"
+busybox ash -c "
+$(extract_notify)
+ROOTFS='$d'
+ACTIVE_TTY=ttyS0
+LAST_NOTIFIED_TTY=''
+notify_inactive_consoles
+echo SURVIVED
+" >"$d/rc.out" 2>&1
+if grep -qx "SURVIVED" "$d/rc.out"; then
+    ok "notify_inactive_consoles() survives an inactive console it can't actually write to"
+else
+    cat "$d/rc.out"; bad "notify_inactive_consoles() did not survive a write failure on an inactive console"
+fi
+rm -rf "$d"
+
+# The tests above prove notify_inactive_consoles() is correct IN
+# ISOLATION - not that the main loop actually CALLS it (same class of
+# gap this file has already hit twice for select_console()/_cancellable
+# integration). A static check closes it: both the real-boot branch
+# (right before the exec redirect) and the $ROOTFS-set/test branch
+# call it - exactly 2 bare calls, indentation-matched so this doesn't
+# also match the function's own definition line or its doc comments.
+if [ "$(grep -c '^        notify_inactive_consoles$' "$REPO_ROOT/init/init")" -eq 2 ]; then
+    ok "the main loop actually calls notify_inactive_consoles() (both the real-boot and \$ROOTFS-set branches)"
+else
+    bad "the main loop does not call notify_inactive_consoles() in both branches - the banner function exists but may never run"
+fi
+
+# =============================================================================
+echo "== init: _notify_recovery_shell_elsewhere() - the real console gets nothing, every OTHER one gets an honest 'elsewhere' notice, never the same promise twice =="
+# Operator's own explicit point, this session: die()'s FATAL+recovery-
+# shell message used to reach only whichever console this process's
+# stdio happened to be attached to - every OTHER registered console saw
+# nothing. The naive fix (broadcast the SAME "dropping to a recovery
+# shell" text everywhere) would have been its own lie - PID 1 only ever
+# has ONE stdin, so only ONE console can possibly have a real, working
+# shell; saying so on every console implies they're all equally usable
+# when they categorically aren't. Real pty test, not a static read:
+# pty.fork() makes the child's own controlling terminal the "real"
+# console (readlink -f /proc/self/fd/0 inside the child resolves to
+# THIS exact pty, proving the self-exclusion is genuine kernel state,
+# not a hardcoded assumption) - a second, separate pty stands in for an
+# "other" registered console nothing ever attaches to.
+extract_notify_elsewhere() {
+    sed -n '/^_parse_console_spec()/,/^}/p; /^_apply_console_line_settings()/,/^}/p; /^_known_console_names()/,/^}/p; /^_is_known_console_name()/,/^}/p; /^_extra_relevant_consoles()/,/^}/p; /^_notify_recovery_shell_elsewhere()/,/^}/p' "$REPO_ROOT/init/init"
+}
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+cat > "$d/elsewhere.py" <<PYEOF
+import os, pty, time, signal
+other_master, other_slave = pty.openpty()
+os.symlink(os.ttyname(other_slave), "$d/root/dev/ttyS1")
+pid, fd = pty.fork()
+if pid == 0:
+    os.symlink(os.ttyname(0), "$d/root/dev/tty0")
+    with open("$d/root/sys/class/tty/console/active", "w") as f:
+        f.write("tty0 ttyS1\n")
+    script = '''
+$(extract_notify_elsewhere)
+ROOTFS="$d/root"
+read_fat_console_pref() { echo ""; }
+ACTIVE_TTY=tty0
+ACTIVE_CONSOLE_OPTS=""
+_notify_recovery_shell_elsewhere
+echo DONE
+'''
+    os.execvp("busybox", ["busybox", "ash", "-c", script])
+else:
+    time.sleep(1)
+    def peek(m):
+        try:
+            os.set_blocking(m, False)
+            return os.read(m, 65536)
+        except OSError:
+            return b""
+    out_self = peek(fd)
+    out_other = peek(other_master)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    print("SELF_GOT_ELSEWHERE_BANNER:", b"DIFFERENT" in out_self)
+    print("OTHER_GOT_ELSEWHERE_BANNER:", b"DIFFERENT" in out_other)
+PYEOF
+out="$(timeout 10 python3 "$d/elsewhere.py" 2>&1)"
+rm -rf "$d"
+if echo "$out" | grep -qx "SELF_GOT_ELSEWHERE_BANNER: False" && echo "$out" | grep -qx "OTHER_GOT_ELSEWHERE_BANNER: True"; then
+    ok "the console this process is actually attached to gets nothing; every OTHER console gets the honest 'elsewhere' notice, not the same promise"
+else
+    echo "$out"; bad "_notify_recovery_shell_elsewhere() did not correctly distinguish the real console from the others"
+fi
+
+# Static check, same idiom as notify_inactive_consoles()'s own one just
+# above: die() actually calls this, not just defines it correctly in
+# isolation.
+if [ "$(grep -c '^    _notify_recovery_shell_elsewhere$' "$REPO_ROOT/init/init")" -eq 1 ]; then
+    ok "die() actually calls _notify_recovery_shell_elsewhere()"
+else
+    bad "die() does not call _notify_recovery_shell_elsewhere() - the function exists but may never run"
+fi
+
+# =============================================================================
+echo "== init: select_console()'s three layers - FAT config beats the bare kernel default, cmdline beats everything =="
+# Three layers now, not four - the live console-claim mechanism (a tty0
+# keypress or serial "menu"+Enter, Layer 3 in an earlier version of this
+# project) was removed by deliberate choice: _boot_args_interrupt()'s
+# own pre-boot TAB-interrupt screen is the ONE way to change console now
+# (see select_console()'s own header comment). NVRAM is also gone
+# entirely (BURT - see that same comment) - FAT config is the only
+# persisted layer. Real execution under busybox ash, stubbing
+# read_fat_console_pref (real mount side effects - not what this test is
+# about) rather than reimplementing select_console() itself.
+extract_select_console() {
+    sed -n '/^_parse_console_spec()/,/^}/p; /^_known_console_names()/,/^}/p; /^_is_known_console_name()/,/^}/p; /^select_console()/,/^}/p' "$REPO_ROOT/init/init"
+}
+run_select_console() {
+    # $1=fat pref  $2=cmdline pref  $3=console/active (kernel default)
+    d="$(fresh_env)"
+    mkdir -p "$d/sys/class/tty/console" "$d/dev"
+    for t in tty0 ttyS0; do : > "$d/dev/$t"; done
+    echo "$3" > "$d/sys/class/tty/console/active"
+    busybox ash -c "
+$(extract_select_console)
+msg() { echo \"MSG: \$*\"; }
+read_fat_console_pref() { echo '$1'; }
+ROOTFS='$d'
+ZFSBOOT_CONSOLE_CMDLINE='$2'
+select_console
+echo \"ACTIVE_TTY=\$ACTIVE_TTY\"
+"
+    rm -rf "$d"
+}
+out="$(run_select_console "tty0" "" "ttyS0")"
+if echo "$out" | grep -qx "ACTIVE_TTY=tty0"; then
+    ok "a persisted FAT-config preference wins over the bare kernel default"
+else
+    echo "$out"; bad "a FAT-config preference did not win over the bare kernel default"
+fi
+out="$(run_select_console "tty0" "ttyS0" "ttyS0")"
+if echo "$out" | grep -qx "ACTIVE_TTY=ttyS0"; then
+    ok "an explicit cmdline alpine-zfsboot.console= wins over a persisted FAT-config preference, unconditionally"
+else
+    echo "$out"; bad "a FAT-config preference incorrectly overrode an explicit cmdline console= preference"
+fi
+out="$(run_select_console "" "" "ttyS0")"
+if echo "$out" | grep -qx "ACTIVE_TTY=ttyS0"; then
+    ok "no FAT config and no cmdline preference at all - the bare kernel default applies"
+else
+    echo "$out"; bad "behavior changed with no preference present at all"
+fi
+out="$(run_select_console "ttyS9" "" "ttyS0")"
+if echo "$out" | grep -qx "ACTIVE_TTY=ttyS0"; then
+    ok "a FAT-config preference naming a tty that isn't a real candidate this boot is ignored - the bare kernel default applies"
+else
+    echo "$out"; bad "a stale/invalid FAT-config preference incorrectly changed the active console"
+fi
+
+echo "== init: select_console() WARNS when an operator-requested console doesn't exist, instead of silently ignoring it - real reported bug =="
+# Real, reported bug on real hardware: an operator edited
+# alpine-zfsboot.console= via the pre-boot TAB-interrupt screen to a
+# tty with no actual /dev node this boot (e.g. no serial0 device
+# attached in Proxmox) - the menu came up on tty0 anyway with nothing
+# on screen explaining why. Covers BOTH operator-facing layers (FAT
+# config AND cmdline/the TAB-interrupt screen's own passthrough) - a
+# mismatch MUST warn on each, and a genuine match must NOT warn at all
+# (no false positives on the ordinary, working path).
+out="$(run_select_console "ttyS9" "" "ttyS0")"
+if echo "$out" | grep -q "WARNING.*alpine-zfsboot.console=ttyS9.*EFI/ALPINE/config.*doesn't support as /dev/ttyS9"; then
+    ok "a FAT-config preference naming a nonexistent console now warns loudly, not silently"
+else
+    echo "$out"; bad "a nonexistent FAT-config console preference did not warn - the exact silent-failure bug this closes"
+fi
+out="$(run_select_console "" "ttyS9" "ttyS0")"
+if echo "$out" | grep -q "WARNING.*alpine-zfsboot.console=ttyS9.*kernel cmdline, or the pre-boot TAB-interrupt.*doesn't support as /dev/ttyS9"; then
+    ok "a cmdline/TAB-interrupt console naming a nonexistent console now warns loudly, not silently"
+else
+    echo "$out"; bad "a nonexistent cmdline console preference did not warn - the exact bug a real operator hit via the TAB-interrupt screen"
+fi
+out="$(run_select_console "" "ttyS0" "tty0")"
+if echo "$out" | grep -qx "ACTIVE_TTY=ttyS0" && ! echo "$out" | grep -q "WARNING"; then
+    ok "a console preference that DOES exist applies cleanly, with no false-positive warning"
+else
+    echo "$out"; bad "a valid console preference either didn't apply or triggered a spurious warning"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_wait_for_tab() - a real TAB keypress on a real pty is detected, a different key or silence is not =="
+# The user's own explicit, repeated design ask: a GRUB-style "press TAB
+# to interrupt" gate before anything else happens (see
+# _boot_args_interrupt()'s own comment). Real pty, not a pipe or a fake
+# /dev node (this project's own established testing discipline - a pipe
+# does not behave like a tty for a non-blocking/timed read the way a
+# real character device does) - extracts the REAL function verbatim and
+# runs it under busybox ash with its stdin/stdout attached to a real
+# pty slave, exactly the class of coverage this function was split out
+# on its own to make possible.
+extract_boot_args_wait_for_tab() {
+    sed -n '/^_tty_safe_name()/,/^}/p; /^_boot_args_wait_for_tab()/,/^}/p' "$REPO_ROOT/init/init"
+}
+run_wait_for_tab() {
+    # $1=what to write into the pty, if anything  $2=delay in seconds
+    # before writing it (0 = write immediately)  $3=timeout to pass the
+    # function itself
+    d="$(fresh_env)"
+    cat > "$d/wait_test.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+# The REAL pty path, not "/dev/stdin" - confirmed the hard way:
+# _boot_args_wait_for_tab() now reads via a BACKGROUNDED subshell (see
+# its own comment on real concurrency), and "/dev/stdin" resolves
+# differently once inside a background job under busybox ash (a direct
+# test proved it: a backgrounded "read < /dev/stdin" never saw a byte
+# genuinely written to the pty, while the exact same read against the
+# pty's own real /dev/pts/N path did) - production code never calls
+# this function with "/dev/stdin" either, only real \$ROOTFS/dev/\$tty
+# paths, so this is a test-fixture-only fix, not a behavior change.
+slave_path = os.ttyname(slave)
+script = '''
+$(extract_boot_args_wait_for_tab)
+_boot_args_wait_for_tab "\$1" "\$2"
+echo "RC=\$?"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", slave_path, "$3"],
+    stdin=slave, stdout=slave, stderr=slave,
+    preexec_fn=os.setsid, close_fds=True)
+os.close(slave)
+delay = $2
+if delay:
+    time.sleep(delay)
+data = $1
+if data:
+    os.write(master, data)
+proc.wait(timeout=15)
+time.sleep(0.3)
+out = b""
+try:
+    while True:
+        chunk = os.read(master, 65536)
+        if not chunk:
+            break
+        out += chunk
+except OSError:
+    pass
+sys.stdout.buffer.write(out)
+PYEOF
+    # Raw pty output, not a plain file - the line discipline turns the
+    # embedded shell's own "\n" into "\r\n" on the way out (confirmed
+    # directly, not assumed: `od -c` on a captured run shows a trailing
+    # "RC=0\r\n", not "RC=0\n"), so a plain `grep -x` against the raw
+    # capture never matches - strip CRs first, same as this project's
+    # own sanitize_diagnostic_text() already does for this exact class
+    # of noise elsewhere.
+    python3 "$d/wait_test.py" 2>&1 | tr -d '\r'
+    rm -rf "$d"
+}
+out="$(run_wait_for_tab 'b"\t"' 0.3 3)"
+if echo "$out" | grep -q "RC=0$"; then
+    ok "a real TAB keypress on a real pty is detected and returns 0 - the interactive edit screen would open"
+else
+    echo "$out"; bad "a real TAB keypress was not detected"
+fi
+out="$(run_wait_for_tab 'b"x"' 0.3 2)"
+if echo "$out" | grep -q "RC=1$"; then
+    ok "a different real keypress (not TAB) is correctly ignored - the timeout still elapses, unattended boot continues"
+else
+    echo "$out"; bad "a non-TAB keypress incorrectly interrupted the boot"
+fi
+out="$(run_wait_for_tab 'None' 0 2)"
+if echo "$out" | grep -q "RC=1$"; then
+    ok "genuine silence times out (returns 1) - the ordinary, unattended boot path"
+else
+    echo "$out"; bad "silence did not correctly time out"
+fi
+out="$(run_wait_for_tab 'b"x"' 0.3 2)"
+if echo "$out" | grep -q "press TAB to interrupt"; then
+    ok "the countdown banner is actually printed to the tty, not just computed silently"
+else
+    echo "$out"; bad "no countdown banner text found on the tty"
+fi
+out="$(run_wait_for_tab 'b"\r"' 0.3 3)"
+if echo "$out" | grep -q "RC=2$"; then
+    ok "a bare ENTER is not treated as a TAB winner (RC=2, distinct from both TAB=0 and a genuine timeout=1) - it fast-forwards the unattended boot, it doesn't open the edit screen, and reports which console it came from"
+else
+    echo "$out"; bad "ENTER was incorrectly treated as a TAB win - the edit screen would wrongly open"
+fi
+if echo "$out" | grep -q "press TAB to interrupt (.*) or ENTER to continue now"; then
+    ok "the countdown banner mentions ENTER, not just TAB - operator's own explicit ask, so the option is actually discoverable"
+else
+    echo "$out"; bad "the countdown banner doesn't mention ENTER at all"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_wait_for_tab() - ENTER genuinely fast-forwards past the rest of the countdown, not just a cosmetic no-op =="
+# sitting out the WHOLE countdown just to
+# continue, even when nothing needs changing, is needless waiting.
+# Real timing assertion, same idiom as the concurrency test below: a
+# LONG timeout (8s) with ENTER written after ~0.3s must return almost
+# immediately, not anywhere near 8s - proves this is a genuine
+# short-circuit, not merely "ENTER doesn't count as TAB" (the test
+# above already proves that part) while still silently waiting out the
+# clock underneath.
+d="$(fresh_env)"
+cat > "$d/enter_timing.py" <<PYEOF
+import os, pty, time, subprocess
+master, slave = pty.openpty()
+slave_path = os.ttyname(slave)
+script = '''
+$(extract_boot_args_wait_for_tab)
+_boot_args_wait_for_tab "\$1" "\$2"
+echo "RC=\$?"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", slave_path, "8"],
+    stdin=slave, stdout=slave, stderr=slave,
+    preexec_fn=os.setsid, close_fds=True)
+os.close(slave)
+t0 = time.time()
+time.sleep(0.3)
+os.write(master, b"\\r")
+proc.wait(timeout=15)
+elapsed = time.time() - t0
+print("ELAPSED:%.2f" % elapsed)
+PYEOF
+out="$(timeout 20 python3 "$d/enter_timing.py" 2>&1)"
+rm -rf "$d"
+elapsed_val="$(echo "$out" | sed -n 's/^ELAPSED:\([0-9.]*\)$/\1/p')"
+if [ -n "$elapsed_val" ] && awk -v e="$elapsed_val" 'BEGIN{exit !(e < 2.5)}'; then
+    ok "ENTER returned in ~${elapsed_val}s against an 8s timeout - a real short-circuit, not a silent full wait"
+else
+    echo "$out"; bad "ENTER did not fast-forward - took almost the full timeout anyway (elapsed=${elapsed_val:-unknown}s)"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_wait_for_tab() still catches TAB after an earlier, different keypress - real reported bug =="
+# Real, reported bug (user's own words): "ég geri líka óvart escape fyrst
+# og svo TAB en ekkert gerist" (I also accidentally press escape first and
+# then TAB, but nothing happens). Root cause: the per-console reader used
+# to be a single one-shot `read -n 1` - it consumes exactly one byte and
+# the backgrounded reader exits for good, so ANY earlier keypress (ESC, a
+# stray key while a remote console window regains focus) permanently
+# silenced that console's listener for the rest of the whole countdown;
+# a TAB pressed afterward lands on nobody. Fixed: the reader now loops,
+# re-reading against the real wall-clock deadline (`date +%s`, not a
+# decrementing counter - a read that returns early because a non-TAB
+# byte arrived must not grant extra total listening time), so it keeps
+# listening for TAB specifically until either TAB arrives or the real
+# timeout passes. Real pty, two separate writes (ESC then "q", then TAB
+# a full second later) - the OLD code would read the ESC, not match, and
+# exit immediately, missing the TAB entirely (RC=1); this exercises the
+# REAL function (not a mock), so it only passes if the fix is actually
+# in effect.
+d="$(mktemp -d)"
+cat > "$d/esc_then_tab.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+slave_path = os.ttyname(slave)
+script = '''
+$(extract_boot_args_wait_for_tab)
+_boot_args_wait_for_tab "\$1" "\$2"
+echo "RC=\$?"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", slave_path, "5"],
+    stdin=slave, stdout=slave, stderr=slave,
+    preexec_fn=os.setsid, close_fds=True)
+os.close(slave)
+time.sleep(0.3)
+os.write(master, b"\x1b")
+os.write(master, b"q")
+time.sleep(1.0)
+os.write(master, b"\t")
+proc.wait(timeout=15)
+time.sleep(0.3)
+out = b""
+try:
+    while True:
+        chunk = os.read(master, 65536)
+        if not chunk:
+            break
+        out += chunk
+except OSError:
+    pass
+sys.stdout.buffer.write(out)
+PYEOF
+out="$(python3 "$d/esc_then_tab.py" 2>&1 | tr -d '\r')"
+rm -rf "$d"
+if echo "$out" | grep -q "RC=0$"; then
+    ok "a TAB pressed after an earlier ESC+other key is still detected - the reader keeps listening, doesn't die after the first wrong key"
+else
+    echo "$out"; bad "a TAB pressed after an earlier wrong key was missed - the exact bug the user reported"
+fi
+
+echo "== init: _boot_args_wait_for_tab() polls EVERY listed console, not just the first - the actual Proxmox VGA-lockout incident this exists for =="
+# Real incident, confirmed by the user on real hardware: back when
+# CONSOLE_CMDLINE still baked BOTH tty0 and ttyS0 onto every cmdline
+# (see build.sh's own CONSOLE_CMDLINE comment - no longer true, tty0
+# only now), the kernel's own "last console= wins" rule made ttyS0 the
+# resolved default on a VGA-only Proxmox console, and a single-console
+# prompt there was completely invisible to an operator who only ever
+# had tty0. Still real coverage today even with a tty0-only default
+# cmdline: a persisted FAT-config serial preference (see
+# _boot_args_interrupt()'s own comment) creates the exact same "more
+# than one console to poll" situation. This proves a TAB keypress on
+# the SECOND (non-primary) console of two is still detected - the
+# scenario the single-device version of this function could not cover
+# at all.
+d="$(fresh_env)"
+cat > "$d/multi_test.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master0, slave0 = pty.openpty()
+master1, slave1 = pty.openpty()
+pts0 = os.ttyname(slave0)
+pts1 = os.ttyname(slave1)
+script = '''
+$(extract_boot_args_wait_for_tab)
+_boot_args_wait_for_tab "\$1 \$2" "\$3"
+echo "RC=\$?"
+'''
+# The function's own stdout (its "echo \$tty_dev" winner-report and the
+# final "echo RC=\$?") is captured via a real PIPE, SEPARATELY from the
+# two ptys it's writing the countdown banner TO by filename - those are
+# two genuinely different channels (confirmed the hard way: an earlier
+# version of this test tried to find the winning device's path inside
+# the pty-drained banner text, which never contains it at all, since
+# the banner printfs never write the device's own path - only "echo
+# \$tty_dev" does, straight to this process's own inherited stdout).
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", pts0, pts1, "5"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(2.2)
+os.write(master1, b"\t")  # the "VGA operator" is on the SECOND console
+own_out, _ = proc.communicate(timeout=15)
+sys.stdout.buffer.write(own_out)
+print()
+print("WINNER_WAS_PTS1:", pts1.encode() in own_out)
+PYEOF
+out="$(timeout 20 python3 "$d/multi_test.py" 2>&1 | tr -d '\r')"
+rm -rf "$d"
+if echo "$out" | grep -q "RC=0$" && echo "$out" | grep -q "WINNER_WAS_PTS1: True"; then
+    ok "a TAB keypress on the SECOND (non-primary) of two polled consoles is still detected, and the correct device is reported back"
+else
+    echo "$out"; bad "a TAB keypress on a non-primary console was missed, or the wrong device was reported - this is the exact Proxmox lockout bug"
+fi
+
+echo "== init: _boot_args_wait_for_tab() listens CONCURRENTLY, not sequentially - TIMEOUT seconds total, never TIMEOUT * consoles =="
+# User's own real, reported regression: an earlier version of this
+# function polled each console with its own full TIMEOUT-second
+# BLOCKING read, one after another - correct in terms of what it
+# detected, but it silently multiplied a requested 15s window into 30s+
+# of real boot delay on any dual-console build (every build - see
+# build.sh's own CONSOLE_CMDLINE comment), on EVERY boot, unattended or
+# not. Real timing assertion, not just a correctness check: with two
+# consoles and a 5s timeout, nobody touching either one, this must take
+# ~5 real seconds - not ~10. A generous upper bound (8s) absorbs real
+# scheduling/python overhead without being loose enough to pass a
+# genuinely-doubled regression.
+d="$(fresh_env)"
+cat > "$d/timing_test.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master0, slave0 = pty.openpty()
+master1, slave1 = pty.openpty()
+pts0 = os.ttyname(slave0)
+pts1 = os.ttyname(slave1)
+script = '''
+$(extract_boot_args_wait_for_tab)
+_boot_args_wait_for_tab "\$1 \$2" "\$3"
+echo "RC=\$?"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", pts0, pts1, "5"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+t0 = time.time()
+own_out, _ = proc.communicate(timeout=20)
+elapsed = time.time() - t0
+print("ELAPSED:%.2f" % elapsed)
+print(own_out.decode(errors="replace"))
+PYEOF
+out="$(timeout 25 python3 "$d/timing_test.py" 2>&1)"
+rm -rf "$d"
+elapsed_val="$(echo "$out" | sed -n 's/^ELAPSED:\([0-9.]*\)$/\1/p')"
+if echo "$out" | grep -q "RC=1$" \
+   && [ -n "$elapsed_val" ] \
+   && awk -v e="$elapsed_val" 'BEGIN{exit !(e >= 4.5 && e <= 8)}'; then
+    ok "two consoles, 5s timeout, nobody touching either: took ~${elapsed_val}s total - concurrent, not 10s (sequential/doubled)"
+else
+    echo "$out"; bad "timing indicates sequential (TIMEOUT * consoles) polling, not real concurrency - the exact regression this test guards against"
+fi
+
+echo "== init: _boot_args_wait_for_tab() fails CLOSED (skips the gate, never writes outside its own tmpdir) when mktemp -d fails =="
+# review finding: an unguarded mktemp failure used to leave
+# $tmpdir empty, turning every "$tmpdir/$safe" sentinel path into a
+# bare "/$safe" at the filesystem ROOT - PID 1 runs as root, so that
+# write could actually succeed there on a real boot, and a
+# pre-existing file at that exact path would have reported a false
+# "winner" with no real keypress ever happening. Real execution, a
+# stubbed mktemp that always fails.
+d="$(fresh_env)"
+cat > "$d/mktemp_fail.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+pts_path = os.ttyname(slave)
+script = '''
+$(extract_boot_args_wait_for_tab)
+msg() { echo "MSG: \$*"; }
+mktemp() { return 1; }
+_boot_args_wait_for_tab "\$1" "\$2"
+echo "RC=\$?"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", pts_path, "5"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+own_out, _ = proc.communicate(timeout=10)
+sys.stdout.buffer.write(own_out)
+PYEOF
+out="$(timeout 15 python3 "$d/mktemp_fail.py" 2>&1)"
+rm -rf "$d"
+if echo "$out" | grep -q "RC=1$" && echo "$out" | grep -qi "mktemp -d failed"; then
+    ok "a failed mktemp -d is caught, logged, and fails the gate closed (RC=1) instead of writing sentinel files at the filesystem root"
+else
+    echo "$out"; bad "a failed mktemp -d was not caught - sentinel paths could fall back to the filesystem root"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_default_line() - the pre-filled edit-screen default is exactly the real cmdline's alpine-zfsboot.* tokens, console= added only if missing =="
+extract_boot_args_default_line() {
+    sed -n '/^_known_console_names()/,/^}/p; /^_is_known_console_name()/,/^}/p; /^_boot_args_default_line()/,/^}/p' "$REPO_ROOT/init/init"
+}
+run_default_line() {
+    # $1=fake /proc/cmdline content  $2=tty arg  $3=opts arg
+    d="$(fresh_env)"
+    mkdir -p "$d/proc"
+    printf '%s' "$1" > "$d/proc/cmdline"
+    busybox ash -c "
+$(extract_boot_args_default_line)
+ROOTFS='$d'
+_boot_args_default_line '$2' '$3'
+"
+    rm -rf "$d"
+}
+out="$(run_default_line "root=/dev/sda1 quiet alpine-zfsboot.timeout=5" "ttyS0" "")"
+if [ "$out" = "alpine-zfsboot.timeout=5 alpine-zfsboot.console=ttyS0" ]; then
+    ok "non-alpine-zfsboot cmdline tokens are dropped; the real ones are kept verbatim, with an explicit console= appended (none was on cmdline)"
+else
+    echo "GOT: [$out]"; bad "the default line did not come out as expected when cmdline had no console= of its own"
+fi
+out="$(run_default_line "alpine-zfsboot.console=ttyS1,9600n7 quiet" "ttyS0" "")"
+if [ "$out" = "alpine-zfsboot.console=ttyS1,9600n7" ]; then
+    ok "an alpine-zfsboot.console= already on cmdline is kept verbatim, not duplicated/overridden by the resolved ACTIVE_TTY"
+else
+    echo "GOT: [$out]"; bad "an existing cmdline console= was duplicated or lost"
+fi
+out="$(run_default_line "quiet" "ttyS0" "9600n7")"
+if [ "$out" = "alpine-zfsboot.console=ttyS0,9600n7" ]; then
+    ok "the synthesized console= includes ACTIVE_CONSOLE_OPTS (the resolved line settings), not just the bare tty name"
+else
+    echo "GOT: [$out]"; bad "ACTIVE_CONSOLE_OPTS was dropped from the synthesized console= value"
+fi
+out="$(run_default_line "" "tty0" "")"
+if [ "$out" = "alpine-zfsboot.console=tty0" ]; then
+    ok "an empty/missing cmdline still produces a sensible default (the kernel-resolved console), never a blank line"
+else
+    echo "GOT: [$out]"; bad "an empty cmdline did not fall back to a sensible default"
+fi
+# Third review finding: synthesizing console=$tty for a tty name
+# select_console() will NEVER recognize (hvc0, say - kernel-registered,
+# but outside _known_console_names) used to hand back a default line
+# that, confirmed completely unchanged, immediately triggered the
+# reject/force yesno about the very console the operator is reading it
+# on - a guaranteed, confusing dead end. No console= should be
+# synthesized for an unrecognized name at all.
+out="$(run_default_line "quiet" "hvc0" "")"
+if [ "$out" = "" ]; then
+    ok "no console= is synthesized for a tty name select_console() will never recognize (hvc0) - no guaranteed-to-reject default offered"
+else
+    echo "GOT: [$out]"; bad "a doomed-to-reject console= was still synthesized for an unrecognized tty name"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_interrupt() - real dialog/exec side effects make it a static check, but order/wiring is verified =="
+# Real dialog + real tty attach make the full function impractical to
+# invoke end-to-end in this harness (same class of limitation this
+# file already accepts for select_console() itself) - but
+# _boot_args_wait_for_tab/_boot_args_default_line above are each
+# covered by real execution, and this confirms the orchestration
+# actually calls them in the right order, guards correctly, and feeds
+# a real edit through apply_zfsboot_kv() with the cmdline source tag
+# (not the config one - a typed console= here must behave exactly like
+# a real kernel cmdline token, see this function's own header comment).
+func_src="$(awk '/^_boot_args_interrupt\(\)/{f=1} f{print} f && /^}/{exit}' "$REPO_ROOT/init/init")"
+if echo "$func_src" | grep -q '\[ -n "\$ttys" \] || return 0' \
+   && echo "$func_src" | grep -q 'tty_dev="\$(_boot_args_wait_for_tab "\$ttys" "\$BOOT_ARGS_TIMEOUT" "\$trusted")"' \
+   && echo "$func_src" | grep -q 'default_line="\$(_boot_args_default_line "\$tty" "\$opts")"' \
+   && echo "$func_src" | grep -q '\[ "\$status" -eq 0 \] || return 0' \
+   && echo "$func_src" | grep -q 'ZFSBOOT_KV_SOURCE=cmdline'; then
+    ok "_boot_args_interrupt() builds the registered-console list, waits for TAB on all of them before doing anything else, and replays a confirmed edit through apply_zfsboot_kv() with the cmdline source tag"
+else
+    echo "$func_src"; bad "_boot_args_interrupt()'s own guard/order/source-tag wiring is not as expected"
+fi
+
+# =============================================================================
+extract_boot_args_interrupt_all() {
+    sed -n '/^_tty_safe_name()/,/^}/p; /^_parse_console_spec()/,/^}/p; /^_apply_console_line_settings()/,/^}/p; /^_known_console_names()/,/^}/p; /^_is_known_console_name()/,/^}/p; /^_extra_relevant_consoles()/,/^}/p; /^_boot_args_wait_for_tab()/,/^}/p; /^_boot_args_default_line()/,/^}/p; /^_boot_args_interrupt()/,/^}/p' "$REPO_ROOT/init/init"
+}
+echo "== init: _boot_args_interrupt() polls a persisted FAT-config console too, even when the kernel never registered it - the real Kimsufi/OVH scenario =="
+# Real, reported scenario (user's own cikarang machine): CONSOLE_CMDLINE
+# bakes in tty0 ONLY now (see build.sh's own comment) - no serial
+# console= anywhere unless an operator configured one themselves. A
+# machine with alpine-zfsboot.console=ttyS1,115200n8 already persisted
+# in EFI/ALPINE/config (written at install time) has ttyS1 NOT in
+# /sys/class/tty/console/active at all (the kernel never registered
+# it) - without this, the pre-boot TAB-interrupt prompt would only ever
+# show on tty0, invisible to an operator who configured serial
+# specifically because tty0 isn't reachable for them at all. Real
+# execution: two real ptys, one standing in for the kernel-registered
+# tty0, one for the FAT-config-only ttyS1 - confirms the countdown
+# banner reaches BOTH.
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "faketty0" > "$d/root/sys/class/tty/console/active"
+cat > "$d/fat_console.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master0, slave0 = pty.openpty()
+master1, slave1 = pty.openpty()
+os.symlink(os.ttyname(slave0), "$d/root/dev/faketty0")
+# A real known name (ttyS1), not the older "fakettyS1" fixture - the
+# a later review's own _is_known_console_name() check (see
+# init/init's own comment) now also gates the FAT-pref poll-list
+# addition, not just the typed-value validation. An unrecognized
+# fixture name would be correctly (and silently) excluded from the
+# poll list by that same fix, so NOTHING would ever write to this
+# pty's slave end - and since this script never closes slave1, the
+# master-side os.read() below would then block forever waiting for
+# bytes that can never arrive (caught the hard way: this exact test
+# hung the whole suite past its 300s ceiling before this fixture was
+# corrected).
+os.symlink(os.ttyname(slave1), "$d/root/dev/ttyS1")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { echo "MSG: \$*"; }
+apply_zfsboot_kv() { :; }
+read_fat_console_pref() { echo "ttyS1,115200n8"; }
+ROOTFS="$d/root"
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+echo "SURVIVED rc=\$?"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script],
+    preexec_fn=os.setsid, close_fds=True)
+proc.wait(timeout=15)
+def peek(m):
+    try:
+        return os.read(m, 65536)
+    except OSError:
+        return b""
+out0 = peek(master0)
+out1 = peek(master1)
+print("TTY0_GOT_BANNER:", b"press TAB to interrupt" in out0)
+print("FATCONSOLE_GOT_BANNER:", b"press TAB to interrupt" in out1)
+PYEOF
+out="$(timeout 20 python3 "$d/fat_console.py" 2>&1)"
+rm -rf "$d"
+if echo "$out" | grep -qx "TTY0_GOT_BANNER: True" && echo "$out" | grep -qx "FATCONSOLE_GOT_BANNER: True"; then
+    ok "the pre-boot TAB-interrupt prompt reaches a persisted FAT-config console even when the kernel never registered it - not just kernel-registered ones"
+else
+    echo "$out"; bad "a persisted FAT-config console that isn't kernel-registered never got the pre-boot prompt - exactly the Kimsufi/OVH gap this closes"
+fi
+
+# =============================================================================
+echo "== init: ENTER on a SECOND console makes THAT console the active one - real reported bug (ENTER on serial booted the menu on tty0) =="
+# Operator pressed ENTER on ttyS0 to skip the countdown; the menu came up
+# on tty0 (the kernel default) where nobody was looking. Two real ptys,
+# tty0 stand-in ("faketty0", registered) and a serial stand-in (ttyS1);
+# ENTER goes to the serial one only. _boot_args_interrupt() must apply
+# alpine-zfsboot.console=ttyS1 (cmdline layer) and NOT open the edit screen.
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "faketty0" > "$d/root/sys/class/tty/console/active"
+cat > "$d/enter_serial.py" <<PYEOF
+import os, pty, time, subprocess
+m0, s0 = pty.openpty()
+m1, s1 = pty.openpty()
+os.symlink(os.ttyname(s0), "$d/root/dev/faketty0")
+os.symlink(os.ttyname(s1), "$d/root/dev/ttyS1")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+dialog() { echo "DIALOG_OPENED"; return 1; }
+apply_zfsboot_kv() { echo "APPLIED:\$1"; }
+read_fat_console_pref() { echo ""; }
+ROOTFS="$d/root"
+ZFSBOOT_CONSOLE_CMDLINE=""
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="8"
+_boot_args_interrupt
+echo "DONE"
+'''
+p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(1)
+os.write(m1, b"\\r")
+out, _ = p.communicate(timeout=15)
+print(out.decode(errors="replace"))
+PYEOF
+out="$(timeout 20 python3 "$d/enter_serial.py" 2>&1)"
+rm -rf "$d"
+if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1" && ! echo "$out" | grep -q "DIALOG_OPENED" && echo "$out" | grep -q "^DONE"; then
+    ok "ENTER on the serial console applies console=ttyS1 for this boot without opening the edit screen"
+else
+    echo "$out"; bad "ENTER on a non-active console did not make that console active (or wrongly opened the edit screen)"
+fi
+
+# =============================================================================
+echo "== init: ENTER keeps the console's configured line options; line noise on an unwatched port is not ENTER (PR #18 review F4, F5) =="
+run_enter_case() {
+    # $1=FAT pref  $2=bytes written to the serial stand-in (python bytes literal)
+    d="$(fresh_env)"
+    mkdir -p "$d/root/sys/class/tty/console"
+    echo "faketty0" > "$d/root/sys/class/tty/console/active"
+    cat > "$d/enter_case.py" <<PYEOF
+import os, pty, time, subprocess
+m0, s0 = pty.openpty()
+m1, s1 = pty.openpty()
+os.symlink(os.ttyname(s0), "$d/root/dev/faketty0")
+os.symlink(os.ttyname(s1), "$d/root/dev/ttyS1")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+dialog() { echo "DIALOG_OPENED"; return 1; }
+apply_zfsboot_kv() { echo "APPLIED:\$1"; }
+read_fat_console_pref() { echo "$1"; }
+ROOTFS="$d/root"
+ZFSBOOT_CONSOLE_CMDLINE="faketty0"
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="3"
+_boot_args_interrupt
+echo "DONE"
+'''
+p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(1)
+os.write(m1, $2)
+out, _ = p.communicate(timeout=15)
+print(out.decode(errors="replace"))
+PYEOF
+    timeout 20 python3 "$d/enter_case.py" 2>&1
+    rm -rf "$d"
+}
+# F4: the persisted ttyS1,9600n8 is outvoted by a tty0 cmdline override; ENTER on
+# ttyS1 must carry its 9600n8 along, not apply a bare ttyS1 (which the main loop
+# would reset to 115200).
+out="$(run_enter_case 'ttyS1,9600n8' 'b"\r"')"
+if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1,9600n8$"; then
+    ok "ENTER on an outvoted EFI/ALPINE/config console keeps that console's configured line options"
+else
+    echo "$out"; bad "ENTER dropped the persisted console's line options"
+fi
+# F5: a device streaming a status line (any byte before the CR/LF) on a port nobody
+# configured must not become the menu console.
+out="$(run_enter_case '' 'b"STATUS OL 230V\r\n"')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
+    ok "line noise (bytes then CR/LF) on an unwatched port does not move the menu there"
+else
+    echo "$out"; bad "a chatty serial device moved the menu console"
+fi
+# ...but a bare ENTER on that same unwatched port still does (serial-only machine, no config).
+out="$(run_enter_case '' 'b"\r"')"
+if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1$"; then
+    ok "a bare ENTER on an unwatched port still selects it - the serial-only first-boot case"
+else
+    echo "$out"; bad "bare ENTER on a serial-only machine no longer selects the console"
+fi
+
+# =============================================================================
+echo "== init: select_console() flags EVERY unusable operator-chosen console, not just a dead node (PR #18 review F2) =="
+run_unusable_case() {
+    # $1=FAT pref  $2=cmdline  (tty0 and ttyS0 exist, as regular files)
+    d="$(fresh_env)"
+    mkdir -p "$d/sys/class/tty/console" "$d/dev"
+    for t in tty0 ttyS0; do : > "$d/dev/$t"; done
+    echo "tty0" > "$d/sys/class/tty/console/active"
+    busybox ash -c "
+$(extract_select_console)
+msg() { :; }
+read_fat_console_pref() { echo '$1'; }
+ROOTFS='$d'
+ZFSBOOT_CONSOLE_CMDLINE='$2'
+select_console
+[ -n \"\$CONSOLE_UNUSABLE\" ] && echo UNUSABLE || echo USABLE
+"
+    rm -rf "$d"
+}
+for case_ in "ttyS1:|UNUSABLE|missing node in config" "ttyS9:|UNUSABLE|unsupported name in config" ":ttyS1|UNUSABLE|missing node on cmdline" "ttyS0:|USABLE|valid config" "ttyS9:ttyS0|USABLE|valid cmdline outvotes a bad config" ":|USABLE|nothing chosen"; do
+    inputs="${case_%%|*}"; rest="${case_#*|}"; want="${rest%%|*}"; label="${rest#*|}"
+    got="$(run_unusable_case "${inputs%%:*}" "${inputs#*:}")"
+    if [ "$got" = "$want" ]; then ok "$label -> $want"; else bad "$label: expected $want, got $got"; fi
+done
+if grep -q '^        if \[ -n "\$CONSOLE_UNUSABLE" \]; then$' "$REPO_ROOT/init/init" \
+   && sed -n '/CONSOLE_UNUSABLE" \]; then$/,/^        fi$/p' "$REPO_ROOT/init/init" | grep -q 'die "'; then
+    ok "the main loop sends an unusable console to die(), same as a dead node"
+else
+    bad "the main loop does not die() on CONSOLE_UNUSABLE"
+fi
+
+# =============================================================================
+echo "== init: _notify_recovery_shell_elsewhere() before the main loop's exec - fd 0 is /dev/console, not a /dev/<tty> name (PR #18 review F1) =="
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "tty0 ttyS1" > "$d/root/sys/class/tty/console/active"
+cat > "$d/elsewhere_console.py" <<PYEOF
+import os, pty, time, subprocess
+m0, s0 = pty.openpty()
+m1, s1 = pty.openpty()
+os.symlink(os.ttyname(s0), "$d/root/dev/tty0")
+os.symlink(os.ttyname(s1), "$d/root/dev/ttyS1")
+script = '''
+$(extract_notify_elsewhere)
+ROOTFS="$d/root"
+read_fat_console_pref() { echo ""; }
+ACTIVE_TTY=tty0
+ACTIVE_CONSOLE_OPTS=""
+# PID 1's stdio before the exec: the literal path /dev/console.
+readlink() { if [ "\$1 \$2" = "-f /proc/self/fd/0" ]; then echo /dev/console; else command readlink "\$@"; fi; }
+_notify_recovery_shell_elsewhere
+echo DONE
+'''
+p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+p.communicate(timeout=15)
+time.sleep(0.2)
+def peek(m):
+    os.set_blocking(m, False)
+    try: return os.read(m, 65536)
+    except OSError: return b""
+print("LAST_REGISTERED_GOT_NOTICE:", b"DIFFERENT" in peek(m1))
+print("FIRST_REGISTERED_GOT_NOTICE:", b"DIFFERENT" in peek(m0))
+PYEOF
+out="$(timeout 20 python3 "$d/elsewhere_console.py" 2>&1)"
+rm -rf "$d"
+# /dev/console = the kernel's preferred console = LAST entry of console/active (ttyS1):
+# that one will host the shell and must stay quiet; tty0 is genuinely elsewhere.
+if echo "$out" | grep -qx "LAST_REGISTERED_GOT_NOTICE: False" && echo "$out" | grep -qx "FIRST_REGISTERED_GOT_NOTICE: True"; then
+    ok "with fd 0 = /dev/console the kernel's preferred (last registered) console is treated as the shell's own and gets no 'elsewhere' notice"
+else
+    echo "$out"; bad "the console about to host the recovery shell was told the shell is elsewhere"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_interrupt() tells the operator which console is ALREADY active and WHERE that came from, before the countdown starts =="
+# don't make someone guess why a console
+# ended up where it did - say it outright (kernel default / persisted
+# EFI/ALPINE/config / this boot's own cmdline-TAB override), once, as a
+# plain line BEFORE the repeating \r-redrawn countdown, on every
+# listened console. Real execution, three real scenarios (one per
+# source), `_boot_args_wait_for_tab` stubbed to return instantly (RC=1,
+# no winner) since this test is about what's printed BEFORE that call,
+# not about the countdown/TAB-detection itself (already covered
+# elsewhere, real execution, no stub).
+run_console_source_test() {
+    # $1=ZFSBOOT_CONSOLE_CMDLINE  $2=FAT pref  $3=ACTIVE_TTY
+    d="$(fresh_env)"
+    mkdir -p "$d/root/sys/class/tty/console"
+    echo "faketty0" > "$d/root/sys/class/tty/console/active"
+    cat > "$d/src_test.py" <<PYEOF
+import os, pty, time, subprocess
+master, slave = pty.openpty()
+os.symlink(os.ttyname(slave), "$d/root/dev/faketty0")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+apply_zfsboot_kv() { :; }
+read_fat_console_pref() { echo "$2"; }
+_boot_args_wait_for_tab() { return 1; }
+ROOTFS="$d/root"
+ZFSBOOT_CONSOLE_CMDLINE="$1"
+ACTIVE_TTY="$3"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script],
+    preexec_fn=os.setsid, close_fds=True)
+proc.wait(timeout=10)
+time.sleep(0.2)
+os.set_blocking(master, False)
+try:
+    out = os.read(master, 65536)
+except OSError:
+    out = b""
+print(out.decode(errors="replace"))
+PYEOF
+    timeout 15 python3 "$d/src_test.py" 2>&1
+    rm -rf "$d"
+}
+out="$(run_console_source_test 'faketty0' '' 'faketty0')"
+if echo "$out" | grep -q "current console is /dev/faketty0 (cmdline/TAB-interrupt, this boot only)"; then
+    ok "a console chosen via cmdline/this boot's own TAB override is correctly labeled as such"
+else
+    echo "$out"; bad "the cmdline-sourced console was not correctly labeled"
+fi
+out="$(run_console_source_test '' 'faketty0' 'faketty0')"
+if echo "$out" | grep -q "current console is /dev/faketty0 (EFI/ALPINE/config, persisted)"; then
+    ok "a console chosen via a persisted FAT-config preference is correctly labeled as such"
+else
+    echo "$out"; bad "the FAT-config-sourced console was not correctly labeled"
+fi
+out="$(run_console_source_test '' '' 'faketty0')"
+if echo "$out" | grep -q "current console is /dev/faketty0 (kernel default)"; then
+    ok "a console that's just the bare kernel default (no FAT pref, no cmdline override) is correctly labeled as such"
+else
+    echo "$out"; bad "the kernel-default console was not correctly labeled"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_interrupt() REJECTS a console= with no real device, offers edit-again or force-anyway - real reported bug, round 2 =="
+# Real, reported bug (round 1): an operator pressed TAB, edited
+# console= to a tty with no actual /dev node this boot, confirmed it,
+# and the menu came up on tty0 anyway with NOTHING explaining why.
+# Round 2 (the user's own words, verbatim reaction to round 1's first
+# fix): applying the bad value anyway and just noting "falling back to
+# the kernel default" is NOT what was wanted - but neither is a hard
+# block with no way out: "att sjalfsogdu vil eg reject... en lattu mig
+# force-a thad... ef eg virkilega vil". So: a bad console= gets a real
+# --yesno choice, not a --msgbox dead end - "edit again" loops back to
+# the SAME inputbox with the bad edit preserved; "use it anyway" (e.g.
+# the device shows up after a hotplug) applies it despite the missing
+# device, same as any other value. out_file is now $ROOTFS-prefixed
+# (see this function's own comment on why - the old hardcoded bare
+# /tmp/alpine-zfsboot path is what forced the prior round of this test
+# down to a static source check instead of real execution; this exact
+# sandbox had an unrelated file sitting at that bare path, unrelated to
+# this project entirely), so this now runs for real: a real pty, a
+# stubbed dialog distinguishing --inputbox/--yesno by call count and
+# recording every apply_zfsboot_kv call.
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "faketty0" > "$d/root/sys/class/tty/console/active"
+cat > "$d/force_anyway.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+os.symlink(os.ttyname(slave), "$d/root/dev/faketty0")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+applied_log="$d/applied.txt"
+: > "\$applied_log"
+apply_zfsboot_kv() { echo "\$1" >> "\$applied_log"; }
+read_fat_console_pref() { :; }
+calls_log="$d/calls.txt"
+: > "\$calls_log"
+dialog() {
+    case "\$*" in
+        *--inputbox*)
+            echo "INPUTBOX" >> "\$calls_log"
+            echo "alpine-zfsboot.console=nosuchtty9" >&2
+            return 0
+            ;;
+        *--yesno*)
+            echo "YESNO" >> "\$calls_log"
+            return 0
+            ;;
+    esac
+}
+ROOTFS="$d/root"
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+echo "DONE rc=\$?"
+cat "\$applied_log"
+echo "CALLS:"
+cat "\$calls_log"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", os.ttyname(slave)],
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(0.3)
+os.write(master, b"\t")
+proc.wait(timeout=15)
+PYEOF
+out="$(timeout 20 python3 "$d/force_anyway.py" 2>&1)"
+calls="$(cat "$d/calls.txt" 2>/dev/null)"
+rm -rf "$d"
+if echo "$out" | grep -qx "alpine-zfsboot.console=nosuchtty9" \
+   && [ "$(echo "$calls" | grep -c INPUTBOX)" = "1" ] \
+   && [ "$(echo "$calls" | grep -c YESNO)" = "1" ]; then
+    ok "pressing 'Yes' on the no-such-device confirmation applies the typed console= anyway, with exactly one inputbox round and one yesno prompt - the operator's forced choice is honored, not silently dropped"
+else
+    echo "$out"; echo "CALLS: $calls"; bad "'Yes' (use it anyway) did not apply the forced console= as expected"
+fi
+
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "tty0" > "$d/root/sys/class/tty/console/active"
+cat > "$d/edit_again.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+os.symlink(os.ttyname(slave), "$d/root/dev/tty0")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+applied_log="$d/applied.txt"
+: > "\$applied_log"
+apply_zfsboot_kv() { echo "\$1" >> "\$applied_log"; }
+read_fat_console_pref() { :; }
+calls_log="$d/calls.txt"
+: > "\$calls_log"
+dialog() {
+    case "\$*" in
+        *--inputbox*)
+            echo "INPUTBOX" >> "\$calls_log"
+            n="\$(grep -c INPUTBOX "\$calls_log")"
+            if [ "\$n" = "1" ]; then
+                echo "alpine-zfsboot.console=nosuchtty9" >&2
+            else
+                # A real, known console name (tty0), not a fake test-only
+                # name like the older "faketty0" fixture used - this
+                # round's own _is_known_console_name() check (see
+                # init/init's own comment) would otherwise flag an
+                # unrecognized fixture name the exact same way it flags a
+                # genuinely unsupported one, turning this "valid, fixed"
+                # second answer into an infinite edit-again loop (caught
+                # the hard way: this exact test hung and timed out the
+                # whole suite before this fixture was corrected).
+                echo "alpine-zfsboot.console=tty0" >&2
+            fi
+            return 0
+            ;;
+        *--yesno*)
+            echo "YESNO" >> "\$calls_log"
+            return 1
+            ;;
+    esac
+}
+ROOTFS="$d/root"
+ACTIVE_TTY="tty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+echo "DONE rc=\$?"
+cat "\$applied_log"
+echo "CALLS:"
+cat "\$calls_log"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", os.ttyname(slave)],
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(0.3)
+os.write(master, b"\t")
+proc.wait(timeout=15)
+PYEOF
+out="$(timeout 20 python3 "$d/edit_again.py" 2>&1)"
+calls="$(cat "$d/calls.txt" 2>/dev/null)"
+rm -rf "$d"
+if echo "$out" | grep -qx "alpine-zfsboot.console=tty0" \
+   && ! echo "$out" | grep -q "nosuchtty9" \
+   && [ "$(echo "$calls" | grep -c INPUTBOX)" = "2" ] \
+   && [ "$(echo "$calls" | grep -c YESNO)" = "1" ]; then
+    ok "pressing 'No' (edit again) on the no-such-device confirmation re-shows the SAME inputbox instead of applying the bad value - fixed on the second round, never silently falls back"
+else
+    echo "$out"; echo "CALLS: $calls"; bad "'No' (edit again) did not loop back to the inputbox as expected"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_interrupt() catches a console= that EXISTS but ISN'T OPENABLE, not just a missing node - real reported bug, round 3 =="
+# Real, reported bug (round 3, on real Proxmox hardware): typed
+# console=ttyS0, got NO error/confirmation at all (unlike round 2's
+# ttyS12, which correctly triggered the yes/no), the screen "just went
+# ahead" - and the menu came up showing "Console: /dev/tty0" anyway,
+# with nothing explaining why. Root cause: round 2's check was `[ ! -c
+# "$ROOTFS/dev/$_CONSOLE_SPEC_TTY" ]` - node EXISTS only. Proxmox's
+# /dev/ttyS0 node DOES exist (it passes -c) even with no serial device
+# actually attached - exactly the PORT_UNKNOWN class of node this
+# project's own main boot loop already has a SEPARATE, stricter
+# open-test for (`stty -g`, see its own comment) - so round 2's TAB
+# screen said nothing (looked fine), while the main loop's later,
+# stricter test silently fell back to tty0 with only a kmsg line to
+# explain it. Fixed: the TAB screen now uses the exact same `stty -g`
+# test, so a node that exists-but-can't-open gets the SAME yes/no
+# choice a missing node already got - no more gap between what this
+# screen accepts and what the main loop will actually honor. Real
+# fixture: /dev/null stands in for "exists as a char device, but
+# `stty -g` genuinely fails on it" (confirmed directly: `stty -g </dev/null`
+# errors with ENOTTY) - the exact shape of bug a plain `-c` check cannot
+# catch but a real open-test does.
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "faketty0" > "$d/root/sys/class/tty/console/active"
+# A real known name (ttyS1), not the older "deadtty" fixture - the
+# first review's own combined known-name+openability check (see
+# init/init's own comment) means an UNRECOGNIZED name now triggers the
+# yesno via that disjunct alone, never even evaluating `stty -g` - a
+# descriptive-but-unknown name would make this test pass for the wrong
+# reason, no longer actually proving the openability half of the check
+# works at all (caught via the third audit explicitly re-checking for
+# this exact class of regression after it bit two earlier tests the
+# same way today).
+ln -s /dev/null "$d/root/dev/ttyS1"
+cat > "$d/exists_not_openable.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+os.symlink(os.ttyname(slave), "$d/root/dev/faketty0")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+applied_log="$d/applied.txt"
+: > "\$applied_log"
+apply_zfsboot_kv() { echo "\$1" >> "\$applied_log"; }
+read_fat_console_pref() { :; }
+calls_log="$d/calls.txt"
+: > "\$calls_log"
+dialog() {
+    case "\$*" in
+        *--inputbox*)
+            echo "INPUTBOX" >> "\$calls_log"
+            echo "alpine-zfsboot.console=ttyS1" >&2
+            return 0
+            ;;
+        *--yesno*)
+            echo "YESNO" >> "\$calls_log"
+            return 0
+            ;;
+    esac
+}
+ROOTFS="$d/root"
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+echo "DONE rc=\$?"
+cat "\$applied_log"
+echo "CALLS:"
+cat "\$calls_log"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", os.ttyname(slave)],
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(0.3)
+os.write(master, b"\t")
+proc.wait(timeout=15)
+PYEOF
+out="$(timeout 20 python3 "$d/exists_not_openable.py" 2>&1)"
+calls="$(cat "$d/calls.txt" 2>/dev/null)"
+rm -rf "$d"
+if [ "$(echo "$calls" | grep -c YESNO)" = "1" ]; then
+    ok "a console= node that EXISTS but fails the real open test still triggers the reject/force choice - not just a missing node"
+else
+    echo "$out"; echo "CALLS: $calls"; bad "an existing-but-unopenable console= node sailed through with no warning - the exact round-3 bug"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_interrupt()'s FAT-pref poll-list construction - a dead node is excluded, a live one gets correct line settings - full adversarial audit findings =="
+# Full adversarial review, requested by the user after round 3
+# ("taktu eitt audit í viðbót á þetta... búið að míga mjög mikið og
+# vera mjög böggað"), found TWO more real bugs in the ONE path round 3
+# never touched: the FAT-pref console's own addition into the poll
+# list (as opposed to the TAB-typed value, which round 3 already fixed
+# both of these for).
+#
+# Bug 1 (same shape as round 3, recurring in the sibling path): the
+# FAT-pref addition still used `[ -c ]` only - a PORT_UNKNOWN-shaped
+# node (exists, opens fine, every real read fails EIO - this user's own
+# unattached Proxmox serial0, persisted via alpine-zfsboot.console=)
+# got added to the poll list, and _boot_args_wait_for_tab's own
+# looping reader (see its comment) then spins at full speed for the
+# ENTIRE countdown - confirmed by the audit via direct measurement:
+# thousands of iterations per second, for the whole timeout, in PID
+# 1's own child, on every boot of that exact config. Fixed with the
+# same `stty -g` open-test round 3 already uses for the typed value.
+#
+# Bug 2 (a correctness gap, not just a CPU-burn one): even a GENUINELY
+# LIVE FAT-pref console that the kernel never registered sits at the
+# kernel's own 9600n8 default for any UART it didn't configure via
+# console= (confirmed against serial_core.c itself - see the main
+# loop's own _apply_console_line_settings comment for the full
+# citation) - so the countdown banner and the operator's own TAB
+# keystroke went out/in at the WRONG RATE and simply never arrived,
+# silently defeating the entire reason this console was added to the
+# poll list in the first place (the real Kimsufi/OVH scenario this
+# project built the FAT-pref addition for). Fixed by applying the same
+# line settings here that the main loop already applies once a console
+# is actually selected - just done earlier, since polling has to work
+# BEFORE selection can happen.
+#
+# Real execution: a real pty standing in for the kernel-registered
+# tty0, a /dev/null symlink standing in for a dead PORT_UNKNOWN node
+# (confirmed directly, same as round 3's own fixture, that `stty -g
+# </dev/null` genuinely fails), and a second real pty standing in for
+# a genuinely live FAT-pref console - `_boot_args_wait_for_tab` itself
+# is stubbed (to stderr, NOT stdout - the real call site captures
+# stdout via `tty_dev="$(...)"`, so a naive stdout-based probe would
+# silently vanish into that capture instead of ever being observed)
+# purely to report what poll list and line settings it was actually
+# handed, without needing a real timed TAB keypress at all.
+run_fat_pref_ttys_test() {
+    # $1 = the alpine-zfsboot.console= value read_fat_console_pref()
+    # should report (tty,opts form) - MUST be a real _known_console_names
+    # name (ttyS1/ttyS2 here, not tty0/ttyS0 - those would collide with
+    # the kernel-registered faketty0 or be ambiguous) - the second
+    # review's own _is_known_console_name() fix now ALSO gates
+    # this addition, not just the typed-value validation, so an
+    # unrecognized fixture name (this test originally used "deadserial"/
+    # "liveserial") gets excluded for THAT reason regardless of
+    # openability, silently invalidating what each sub-test below is
+    # actually trying to prove.
+    d="$(fresh_env)"
+    mkdir -p "$d/root/sys/class/tty/console"
+    echo "faketty0" > "$d/root/sys/class/tty/console/active"
+    ln -s /dev/null "$d/root/dev/ttyS1"
+    cat > "$d/holder.py" <<PYEOF
+import os, pty, time
+master, slave = pty.openpty()
+os.symlink(os.ttyname(slave), "$d/root/dev/faketty0")
+master2, slave2 = pty.openpty()
+os.symlink(os.ttyname(slave2), "$d/root/dev/ttyS2")
+# A SECOND name for the exact same real, live pty - not one of
+# _known_console_names - lets one test invocation prove the gate's
+# known-name half independently of its openability half (a genuinely
+# live device can still be correctly excluded for having an
+# unrecognized name - the B2/B5 bug class, see this function's own
+# header comment).
+os.symlink(os.ttyname(slave2), "$d/root/dev/ttyS9")
+with open("$d/holder_ready", "w") as f:
+    f.write("ok")
+time.sleep(10)
+PYEOF
+    python3 "$d/holder.py" &
+    holder_pid=$!
+    while [ ! -f "$d/holder_ready" ]; do sleep 0.1; done
+    cat > "$d/test.sh" <<PYEOF
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+apply_zfsboot_kv() { :; }
+read_fat_console_pref() { echo "$1"; }
+_boot_args_wait_for_tab() {
+    echo "TTYS_WAS:[\$1]" >&2
+    for p in \$1; do
+        echo "STTY[\${p##*/}]: \$(stty -a < "\$p" 2>&1 | head -1)" >&2
+    done
+    echo "\${1%% *}"
+    return 1
+}
+ROOTFS="$d/root"
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+PYEOF
+    out="$(busybox ash "$d/test.sh" 2>&1)"
+    kill "$holder_pid" 2>/dev/null
+    rm -rf "$d"
+    echo "$out"
+}
+# ttyS2 (this helper's own always-live fixture pty, used directly by
+# the next two sub-tests below) now ALWAYS shows up too, regardless of
+# what FAT-pref value THIS sub-test passes - a later review
+# widened _extra_relevant_consoles() to try every known console name,
+# not just the FAT-pref/ACTIVE_TTY-named one (the real fix for an
+# operator with no persisted config at all and only serial access -
+# see that function's own comment), so a real, live, known-name device
+# sitting in the SAME fixture is correctly picked up independent of
+# this specific sub-test's own fat_pref value. The assertion below is
+# about ttyS1 (THIS sub-test's own dead console) being excluded, not
+# about the poll list being empty otherwise.
+out="$(run_fat_pref_ttys_test 'ttyS1,9600n8')"
+if echo "$out" | grep -q "TTYS_WAS:\[.*faketty0 .*ttyS2\]$" && ! echo "$out" | grep -q "ttyS1"; then
+    ok "a dead (PORT_UNKNOWN-shaped) FAT-pref console is excluded from the poll list entirely - no busy-loop risk, not just a missing warning"
+else
+    echo "$out"; bad "a dead FAT-pref console was added to the poll list anyway - the exact busy-loop bug the audit measured"
+fi
+out="$(run_fat_pref_ttys_test 'ttyS2,9600n7')"
+if echo "$out" | grep -q "TTYS_WAS:\[.*faketty0 .*ttyS2\]$" \
+   && echo "$out" | grep -q "STTY\[ttyS2\]: speed 9600 baud"; then
+    ok "a genuinely live FAT-pref console is added to the poll list AND gets its correct line settings applied before polling starts - not left at the kernel's 9600n8 default"
+else
+    echo "$out"; bad "a live FAT-pref console either wasn't polled, or didn't get its line settings applied before polling - the countdown/TAB keystroke would go at the wrong rate and never arrive"
+fi
+# A BARE FAT-pref (no explicit baud/parity/bits), not just one with
+# explicit opts - a later review finding, confirmed by real
+# execution: with an empty opts string, _apply_console_line_settings()
+# falls into its own "elif" branch, which checks whether the GLOBAL
+# $ACTIVE_TTY (not the device actually being configured) is
+# kernel-registered - true here, since this helper's own $ACTIVE_TTY
+# (faketty0) IS listed in console/active, even though it's a
+# completely DIFFERENT device than the one this call is supposed to be
+# configuring (ttyS2) - the elif's exemption fired for the wrong
+# reason and silently skipped configuring ttyS2 at all, leaving it at
+# the kernel's 9600n8 default, exactly the bug bullet 1 of the FAT-pref
+# fix was supposed to close. Fixed by defaulting a bare opts string to
+# 115200n8 explicitly, bypassing that elif branch entirely (this call
+# site's own device is, by construction, never kernel-registered - see
+# the real comment in init/init - so the elif's exemption could never
+# legitimately apply here regardless of what $ACTIVE_TTY happens to be).
+out="$(run_fat_pref_ttys_test 'ttyS2')"
+if echo "$out" | grep -q "TTYS_WAS:\[.*faketty0 .*ttyS2\]$" \
+   && echo "$out" | grep -q "STTY\[ttyS2\]: speed 115200 baud"; then
+    ok "a BARE (no explicit baud) FAT-pref console still gets the 115200n8 default applied, even when ACTIVE_TTY happens to already be a DIFFERENT kernel-registered console"
+else
+    echo "$out"; bad "a bare FAT-pref console was left at the kernel's 9600/38400 default - the elif-checks-the-wrong-variable bug, resurrected"
+fi
+# A genuinely LIVE (real, openable pty), but UNKNOWN-NAME FAT-pref
+# device (ttyS9 - the second name for the very same pty ttyS2 already
+# proved is live/openable above) must still be excluded from the poll
+# list - the known-name half of the gate, tested independently of the
+# openability half, which the dead/live tests above already cover.
+# ttyS2 itself (same real pty, reached via its OTHER, recognized name)
+# still shows up on its own merits - see the dead-console test above's
+# own comment on why.
+out="$(run_fat_pref_ttys_test 'ttyS9,115200n8')"
+if echo "$out" | grep -q "TTYS_WAS:\[.*faketty0 .*ttyS2\]$" && ! echo "$out" | grep -q "ttyS9"; then
+    ok "a genuinely live (openable) but unrecognized-name FAT-pref console is still excluded from the poll list - the known-name half of the gate, not just openability"
+else
+    echo "$out"; bad "a live-but-unrecognized-name FAT-pref console was polled anyway - the B2/B5 bug class, recurring in the FAT-pref gate itself"
+fi
+# Real, reported bug (2026-10-02, a real Proxmox VM, serial-only access
+# via `qm terminal`, a totally fresh ISO boot): NO FAT pref at all (the
+# scenario above always has one) and a real, live, known-name console
+# (ttyS2 here, standing in for ttyS0 on the real box) that ISN'T
+# $ACTIVE_TTY either - this is exactly the "operator's only real access
+# is serial, nothing has been configured yet" shape, and it used to get
+# ZERO chance at the pre-boot prompt because nothing had told this
+# project about it. Must now be polled anyway.
+out="$(run_fat_pref_ttys_test '')"
+if echo "$out" | grep -q "TTYS_WAS:\[.*faketty0 .*ttyS2\]$" \
+   && echo "$out" | grep -q "STTY\[ttyS2\]: speed 115200 baud"; then
+    ok "a real, open, known-name console with NO FAT pref AND not ACTIVE_TTY is still polled (115200n8 default) - the real Proxmox serial-only-access incident this closes"
+else
+    echo "$out"; bad "a console nobody explicitly configured was not polled at all - an operator with only serial access and no prior config would be completely locked out"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_interrupt()'s own edit dialog gets the right TERM/geometry for a serial winner, not just tty0 - full adversarial audit finding =="
+# Another audit finding: nothing sets \$TERM at all until the MAIN LOOP
+# runs, well after _boot_args_interrupt() returns - and the main loop's
+# own \$TERM/geometry decision (see its own comment, further down) only
+# exists because a raw serial line carries no window-size negotiation
+# of its own; a wrong/stale TIOCGWINSZ there is confirmed to produce
+# real, reported TUI corruption (box-drawing running together, wrong
+# columns). Every real-hardware TAB test so far happened to land on
+# tty0, where \$TERM defaulting to the kernel's own "linux" and
+# geometry needing no fixup are both already correct by luck - an
+# operator pressing TAB on an actual serial winner was never really
+# exercised. Fixed: the SAME tty0-vs-other branch the main loop already
+# uses, just applied here too, before the edit dialog itself ever runs.
+# Real pty, `dialog` stubbed to record \$TERM when called (logged to a
+# file path, not stdout/stderr - those are the real call's own
+# inputbox/yesno answer channels, already exercised by other tests).
+run_dialog_term_test() {
+    # $1 = the fake "kernel active" tty name (must be tty0 or a serial
+    # name - exercises select_console()'s own tty0-vs-other case
+    # exactly, not a fake name that would fall through by accident)
+    d="$(fresh_env)"
+    mkdir -p "$d/root/sys/class/tty/console"
+    echo "$1" > "$d/root/sys/class/tty/console/active"
+    cat > "$d/holder.py" <<PYEOF
+import os, pty, time
+master, slave = pty.openpty()
+os.symlink(os.ttyname(slave), "$d/root/dev/$1")
+with open("$d/holder_ready", "w") as f:
+    f.write("ok")
+time.sleep(10)
+PYEOF
+    python3 "$d/holder.py" &
+    holder_pid=$!
+    while [ ! -f "$d/holder_ready" ]; do sleep 0.1; done
+    cat > "$d/test.sh" <<PYEOF
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+apply_zfsboot_kv() { :; }
+read_fat_console_pref() { :; }
+dialog() {
+    echo "TERM_AT_CALL=\$TERM" >> "$d/term_log.txt"
+    case "\$*" in
+        *--inputbox*) echo "" >&2; return 1 ;;
+        *--yesno*) return 1 ;;
+    esac
+}
+_boot_args_wait_for_tab() { echo "\$1"; return 0; }
+ROOTFS="$d/root"
+ACTIVE_TTY="$1"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+echo "GEOMETRY: \$(stty -a < "$d/root/dev/$1" 2>&1 | grep -o 'rows [0-9]*; columns [0-9]*')"
+PYEOF
+    : > "$d/term_log.txt"
+    out="$(busybox ash "$d/test.sh" 2>&1)"
+    term_log="$(cat "$d/term_log.txt" 2>/dev/null)"
+    kill "$holder_pid" 2>/dev/null
+    rm -rf "$d"
+    echo "$out"
+    echo "TERM_LOG:$term_log"
+}
+out="$(run_dialog_term_test tty0)"
+if echo "$out" | grep -qx "TERM_LOG:TERM_AT_CALL=linux" && ! echo "$out" | grep -q "rows 24; columns 80"; then
+    ok "tty0 gets TERM=linux for the edit dialog, no serial geometry fixup (matches the main loop's own, later decision)"
+else
+    echo "$out"; bad "tty0's TAB-screen TERM/geometry doesn't match the main loop's own decision for it"
+fi
+out="$(run_dialog_term_test ttyS0)"
+if echo "$out" | grep -qx "TERM_LOG:TERM_AT_CALL=ansi" && echo "$out" | grep -q "rows 24; columns 80"; then
+    ok "a serial TAB winner gets TERM=ansi AND real rows/cols geometry applied before the edit dialog runs - not left as whatever the kernel's own TERM/TIOCGWINSZ happened to be"
+else
+    echo "$out"; bad "a serial TAB winner's edit dialog ran with the wrong TERM or no geometry fixup - the exact TUI-corruption bug class, unfixed in this sibling path"
+fi
+
+# =============================================================================
+echo "== init: _boot_args_interrupt()'s typed-console validation also rejects a device select_console() itself doesn't recognize - full adversarial audit finding =="
+# A second instance of round 3's own "accepted here, dropped there"
+# bug shape, caught by the audit: round 3's `stty -g` check accepts
+# ANY openable device, but select_console()'s own candidate list
+# (_known_console_names) only ever recognizes a small, fixed set of
+# names (tty0/ttyS0/ttyS1/ttyS2/ttyAMA0). A genuinely live, openable
+# ttyS3 (just COM4, a real shape on real hardware) would pass THIS
+# screen's force-anyway choice, get applied, and then get dropped by
+# select_console() anyway - with a warning that used to flatly claim
+# "no such device", which is simply false for a real, working ttyS3.
+# Fixed: the same _is_known_console_name() check select_console() uses
+# to build its own candidate list is now ALSO checked here, so a name
+# outside that set gets the SAME honest force-or-edit choice a missing
+# device already got, instead of a confusing, factually wrong warning
+# two screens later. Real pty named "ttyS3" (deliberately NOT one of
+# the known names, but genuinely openable) - confirms the yesno fires
+# for it same as a truly nonexistent device would.
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "faketty0" > "$d/root/sys/class/tty/console/active"
+cat > "$d/unknown_name.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+os.symlink(os.ttyname(slave), "$d/root/dev/faketty0")
+master2, slave2 = pty.openpty()
+os.symlink(os.ttyname(slave2), "$d/root/dev/ttyS3")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+applied_log="$d/applied.txt"
+: > "\$applied_log"
+apply_zfsboot_kv() { echo "\$1" >> "\$applied_log"; }
+read_fat_console_pref() { :; }
+calls_log="$d/calls.txt"
+: > "\$calls_log"
+dialog() {
+    case "\$*" in
+        *--inputbox*)
+            echo "INPUTBOX" >> "\$calls_log"
+            echo "alpine-zfsboot.console=ttyS3" >&2
+            return 0
+            ;;
+        *--yesno*)
+            echo "YESNO" >> "\$calls_log"
+            return 0
+            ;;
+    esac
+}
+ROOTFS="$d/root"
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+echo "DONE rc=\$?"
+cat "\$applied_log"
+echo "CALLS:"
+cat "\$calls_log"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", os.ttyname(slave)],
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(0.3)
+os.write(master, b"\t")
+proc.wait(timeout=15)
+PYEOF
+out="$(timeout 20 python3 "$d/unknown_name.py" 2>&1)"
+calls="$(cat "$d/calls.txt" 2>/dev/null)"
+rm -rf "$d"
+if [ "$(echo "$calls" | grep -c YESNO)" = "1" ]; then
+    ok "a genuinely openable device whose NAME select_console() doesn't recognize (ttyS3) still triggers the reject/force choice - not silently accepted only to be dropped later with a wrong warning"
+else
+    echo "$out"; echo "CALLS: $calls"; bad "an unrecognized-but-openable console name sailed through this screen with no warning"
+fi
+
+# =============================================================================
+echo "== init: alpine-zfsboot.interrupt_timeout= is a recognized cmdline/config key, not caught by the unrecognized-option warning =="
+d="$(fresh_env)"
+printf 'root=ZFS=zroot/ROOT/alpine ro alpine-zfsboot.interrupt_timeout=7\n' > "$d/root/proc/cmdline"
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" STUB_BOOTFS="-" \
+    run_stubbed "$REPO_ROOT/init/init" >"$d/out" 2>&1 || true
+if ! grep -qi "unrecognized option alpine-zfsboot.interrupt_timeout" "$d/out" 2>/dev/null; then
+    ok "alpine-zfsboot.interrupt_timeout= is recognized, not warned about as an unrecognized option"
+else
+    cat "$d/out"; bad "alpine-zfsboot.interrupt_timeout= was warned about as unrecognized"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== init: _boot_args_interrupt() validates BOOT_ARGS_TIMEOUT before ever doing arithmetic with it - a malformed value never crashes PID 1 =="
+# A real hazard, not hypothetical: _boot_args_wait_for_tab() does
+# `[ "$i" -lt "$timeout" ]` and `$((timeout - i))` on this value, inside
+# PID 1, before pool import, on EVERY boot - unlike MENU_TIMEOUT (only
+# ever used deep inside menu.py's own, separately-validated Python), a
+# bad value here (a typo, an empty value, a CRLF-mangled hand-edit of
+# the ESP config - the exact hazard apply_zfsboot_kv()'s own CR-
+# stripping comment documents) would otherwise abort the whole script
+# with a shell arithmetic error. Real pty, via a fake $ROOTFS - since
+# _boot_args_interrupt() now builds its OWN console list from
+# $ROOTFS/sys/class/tty/console/active (not from ACTIVE_TTY directly -
+# see its own comment on why: polling every registered console, not
+# just one, is the actual fix for the real Proxmox lockout this file
+# documents elsewhere), a fake root dir with that file naming one
+# fake tty, and $ROOTFS/dev/<name> SYMLINKED to a real pty's own
+# /dev/pts/N slave path (a symlink to a real char device still passes
+# `[ -c ... ]`, and read/write through it is the real device - no root
+# needed to create one at a fixed path), lets this exercise the real
+# function end to end. Nobody ever presses TAB, so the (corrected,
+# defaulted) timeout genuinely elapses for real - this proves the
+# validation fix survives actual use, not just a grep.
+run_bad_timeout() {
+    d="$(fresh_env)"
+    mkdir -p "$d/root/sys/class/tty/console"
+    echo "faketty0" > "$d/root/sys/class/tty/console/active"
+    cat > "$d/bad_timeout.py" <<PYEOF
+import os, pty, time, subprocess, sys
+master, slave = pty.openpty()
+pts_path = os.ttyname(slave)
+os.symlink(pts_path, "$d/root/dev/faketty0")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { echo "MSG: \$*"; }
+apply_zfsboot_kv() { :; }
+read_fat_console_pref() { :; }
+ROOTFS="$d/root"
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="\$1"
+_boot_args_interrupt
+echo "SURVIVED rc=\$?"
+'''
+proc = subprocess.Popen(["busybox", "ash", "-c", script, "ash", "$1"],
+    preexec_fn=os.setsid, close_fds=True)
+proc.wait(timeout=15)
+print("SURVIVED rc=%d" % proc.returncode)
+PYEOF
+    timeout 10 python3 "$d/bad_timeout.py" 2>&1
+    rm -rf "$d"
+}
+out="$(run_bad_timeout 'abc')"
+if echo "$out" | grep -q "SURVIVED"; then
+    ok "a non-numeric alpine-zfsboot.interrupt_timeout= (abc) does not crash _boot_args_interrupt() - falls back to the default and survives"
+else
+    echo "$out"; bad "a non-numeric interrupt_timeout crashed instead of falling back to the default"
+fi
+out="$(run_bad_timeout '')"
+if echo "$out" | grep -q "SURVIVED"; then
+    ok "an empty interrupt_timeout survives too (same validated-default path)"
+else
+    echo "$out"; bad "an empty interrupt_timeout crashed"
+fi
+out="$(run_bad_timeout '999')"
+if echo "$out" | grep -q "SURVIVED"; then
+    ok "an out-of-range interrupt_timeout (999) is clamped to the default, not used as-is"
+else
+    echo "$out"; bad "an out-of-range interrupt_timeout crashed or hung instead of being clamped"
+fi
+out="$(run_bad_timeout '0')"
+if echo "$out" | grep -q "SURVIVED"; then
+    ok "interrupt_timeout=0 is accepted as a legal 'skip the gate entirely' value, same convention as this project's other 0-is-meaningful timeouts"
+else
+    echo "$out"; bad "interrupt_timeout=0 did not survive cleanly"
+fi
+
+# =============================================================================
+echo "== init: select_console() and _boot_args_interrupt() both run once, before attempt_pool_import - not inside its retry/relaunch loop =="
+# Static source check: the GRUB-style gate must run exactly once, at
+# the very start (matching "both HDD and ISO boot hit this, before
+# anything else" - the user's own explicit requirement), not get
+# re-triggered by the main menu.py relaunch loop further down (which
+# already has its own, separate select_console() call for attaching to
+# whichever console is actually in use).
+if awk '
+    /^select_console$/{s=NR}
+    /^_boot_args_interrupt$/{i=NR}
+    /^attempt_pool_import$/{p=NR}
+    END{exit !(s && i && p && s < i && i < p)}
+' "$REPO_ROOT/init/init"; then
+    ok "select_console then _boot_args_interrupt run once, in that order, before attempt_pool_import"
+else
+    bad "select_console()/_boot_args_interrupt()'s call-site ordering relative to attempt_pool_import is not as expected"
+fi
+
+
+# =============================================================================
+echo "== init: an operator-chosen console that can't actually be opened calls die(), never a silent fallback to a different console =="
+# adversarial review (same review that led to the stty fix
 # right above): the real `exec < "/dev/$ACTIVE_TTY"` this project uses
 # to attach to the operator's chosen console is the `exec` SPECIAL
 # BUILTIN - a redirection failure there exits the WHOLE non-interactive
@@ -3541,11 +5270,19 @@ echo "== init: an operator-chosen console that can't actually be opened falls ba
 # below), not just "that one command". /dev/ttyS1-3 nodes commonly
 # EXIST on real x86 hardware with no real UART behind them
 # (PORT_UNKNOWN) - select_console()'s own candidate filter only checks
-# existence, not that opening the node actually works - so an operator
-# who remotely persists a bad alpine-zfsboot.console= (a typo, or a
-# port that's real on one fleet box but not another) could kill /init
-# outright: a kernel panic loop on unattended physical hardware, worse
-# than the silent-console problem this whole feature exists to fix.
+# existence, not that opening the node actually works.
+#
+# An earlier version of this guard, on open-test failure, silently
+# substituted a different (kernel-default) console and continued a
+# normal boot there instead - operator's own explicit call, this
+# session: that is exactly the same "configured one console, booted
+# silently on a different one" shape this whole feature exists to
+# eliminate everywhere else, and an operator watching the configured
+# console (SOL, IPMI) over exactly this kind of failure would see
+# nothing, while bootcheck recorded an ordinary successful boot. Fixed:
+# die() instead - one single recovery path (rescue-SSH if staged,
+# _recovery_shell either way, PID 1 survives), never a second, quieter
+# one that tries to paper over the problem.
 #
 # PR #16 review (F1): the original `: < "/dev/$tty"` open-test passes
 # on the exact PORT_UNKNOWN case this comment names (confirmed against
@@ -3556,14 +5293,12 @@ echo "== init: an operator-chosen console that can't actually be opened falls ba
 # node (that needs real kernel tty nodes - see the review's own
 # tests/poc_16_tty_open.sh, run under a privileged container, for that
 # specific coverage), but the "path does not exist at all" case below
-# still proves the guard fires and /init survives either way, and now
-# also proves ACTIVE_CONSOLE_OPTS is dropped on fallback (the review's
-# second, smaller finding).
+# still proves the guard fires and /init survives either way.
 #
 # Extracts the REAL guard block verbatim out of init/init (not a
 # reimplementation of it) and actually runs it under busybox ash
-# against a genuinely nonexistent device path, proving the fallback
-# both fires AND survives - not just that the right text is present.
+# against a genuinely nonexistent device path, proving die() both fires
+# AND the script survives - not just that the right text is present.
 guard_block="$(sed -n '/if ! ( stty -g < "\/dev\/\$ACTIVE_TTY" >\/dev\/null 2>&1 )/,/^        fi$/p' "$REPO_ROOT/init/init")"
 if [ -z "$guard_block" ]; then
     bad "could not find the open-test guard block in init/init at all - did it move or get removed?"
@@ -3571,17 +5306,22 @@ else
     d="$(fresh_env)"
     busybox ash -c '
         msg() { echo "MSG: $*"; }
+        died=0
+        die() { died=1; echo "DIE: $*"; }
         ACTIVE_TTY="does-not-exist-$$"
-        KERNEL_ACTIVE_TTY="tty0"
         ACTIVE_CONSOLE_OPTS="9600n7"
         '"$guard_block"'
-        echo "SURVIVED, ACTIVE_TTY=$ACTIVE_TTY, ACTIVE_CONSOLE_OPTS=$ACTIVE_CONSOLE_OPTS"
+        echo "died=$died"
+        echo "REACHED_END"
     ' >"$d/out" 2>&1
-    if grep -q "WARNING:.*could not be opened - falling back to tty0" "$d/out" \
-       && grep -qx "SURVIVED, ACTIVE_TTY=tty0, ACTIVE_CONSOLE_OPTS=" "$d/out"; then
-        ok "a console that can't be opened falls back to KERNEL_ACTIVE_TTY (dropping its own line options), and /init survives to say so"
+    # Note: $$ in the busybox subshell above is ITS OWN pid, not this
+    # outer script's - matched here by prefix only, not the exact PID,
+    # for that reason.
+    if grep -q "DIE: /dev/does-not-exist-.*could not be opened - not falling back to a different console silently" "$d/out" \
+       && grep -qx "died=1" "$d/out" && grep -q "REACHED_END" "$d/out"; then
+        ok "a console that can't be opened calls die() (never a silent fallback), and /init survives to say so"
     else
-        cat "$d/out"; bad "the real guard block did not fall back, drop ACTIVE_CONSOLE_OPTS, and survive as expected"
+        cat "$d/out"; bad "the real guard block did not call die() and survive as expected"
     fi
     rm -rf "$d"
 fi
@@ -3603,6 +5343,158 @@ else
     cat "$d/out"; bad "negative control did not behave as expected - the positive test above may not prove what it claims to"
 fi
 rm -rf "$d"
+
+# False-positive control: a genuinely openable ACTIVE_TTY must NOT
+# trigger die() - a real, held-open pty stands in for a working
+# console here (not a literal "tty0" - this sandbox has no real
+# /dev/tty0 at all, which would make this sub-test falsely "pass" for
+# the wrong reason if it ever regressed). Its real /dev/pts/N path is
+# addressed the same "ACTIVE_TTY=pts/N" way this suite already does
+# elsewhere for bare, unprefixed-/dev code paths like this one.
+d="$(fresh_env)"
+cat > "$d/holder.py" <<'PYEOF'
+import os, pty, time
+master, slave = pty.openpty()
+with open("holder_pts.txt", "w") as f:
+    f.write(os.ttyname(slave))
+time.sleep(10)
+PYEOF
+(cd "$d" && python3 holder.py) &
+holder_pid=$!
+while [ ! -f "$d/holder_pts.txt" ]; do sleep 0.1; done
+pts_path="$(cat "$d/holder_pts.txt")"
+pts_subpath="${pts_path#/dev/}"
+busybox ash -c '
+    msg() { echo "MSG: $*"; }
+    died=0
+    die() { died=1; echo "DIE: $*"; }
+    ACTIVE_TTY="'"$pts_subpath"'"
+    ACTIVE_CONSOLE_OPTS=""
+    '"$guard_block"'
+    echo "died=$died"
+' >"$d/out" 2>&1
+kill "$holder_pid" 2>/dev/null
+if grep -qx "died=0" "$d/out"; then
+    ok "a WORKING console is not treated as unopenable - die() is not a false positive on the ordinary path"
+else
+    cat "$d/out"; bad "die() fired even though the console is genuinely openable - a false positive that would wrongly drop to a recovery shell"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== init: _recovery_shell()'s PID-1 loop actually produces a usable interactive shell, not a silent fork-bomb - a later review finding =="
+# A severe, bug, confirmed by real execution with a
+# real session leader (pty.fork - the same real-ctty shape PID 1 has
+# after the main loop's own `exec < /dev/$ACTIVE_TTY ...`): POSIX
+# mandates that an asynchronous list's (a `&`-backgrounded job's)
+# standard input is forced to /dev/null UNLESS an explicit redirection
+# says otherwise - confirmed directly (`busybox ash -c '( readlink
+# /proc/self/fd/0 ) & wait' < realfile` prints "/dev/null", not the
+# real file). `_recovery_shell()`'s own PID-1 loop used to background
+# `_recovery_shell_child` with NO explicit redirect of its own, so
+# `exec /bin/bash` inside it always inherited stdin=/dev/null - bash,
+# non-interactive, hit immediate EOF and exited at once, every single
+# time - meaning this was never actually a working recovery shell on
+# PID 1 at all: an unthrottled fork-bomb silently re-launching and
+# immediately killing a non-interactive bash, as fast as fork+exec
+# allow, for the rest of the boot, since this is EVERY die() call's
+# one local-recourse mechanism. Fixed: `exec 3<&0` duplicates this
+# shell's own real fd 0 (already connected to the real console, however
+# it got that way) onto fd 3 once, before the loop - the async-list
+# override only ever touches fd 0 itself - then `<&3` on the
+# background job hands it back real input instead of /dev/null.
+# Real pty, real session leadership (the exact shape this bug needed to
+# reproduce - it does NOT show up without a real ctty/session, which is
+# presumably why earlier hands-on verification of this same shell
+# mechanism, done in the foreground, never caught it): extracts the
+# REAL `_recovery_shell_child()` function and the REAL fixed loop body
+# verbatim, writes an actual command to the pty, and confirms the
+# command's OWN output appears - not just the pty's local echo of the
+# typed characters, which a dead/non-reading shell would still show.
+recovery_child_src="$(awk '/^_recovery_shell_child\(\)/{f=1} f{print} f && /^}/{exit}' "$REPO_ROOT/init/init")"
+recovery_loop_src="$(sed -n '/^        exec 3<&0$/,/^        done$/p' "$REPO_ROOT/init/init")"
+if [ -z "$recovery_child_src" ] || [ -z "$recovery_loop_src" ]; then
+    bad "could not find _recovery_shell_child() and/or the fixed PID-1 loop body in init/init at all - did either move or get removed?"
+else
+    d="$(fresh_env)"
+    cat > "$d/recovery_alive.py" <<PYEOF
+import os, pty, time, signal
+pid, fd = pty.fork()
+if pid == 0:
+    script = '''
+$recovery_child_src
+$recovery_loop_src
+'''
+    os.execvp("busybox", ["busybox", "ash", "-c", script])
+else:
+    time.sleep(0.5)
+    os.write(fd, b"echo PROOF_ALIVE\n")
+    time.sleep(1.5)
+    try:
+        out = os.read(fd, 65536).decode(errors="replace")
+    except OSError:
+        out = ""
+    print(out)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+PYEOF
+    out="$(timeout 10 python3 "$d/recovery_alive.py" 2>&1 | tr -d '\r')"
+    rm -rf "$d"
+    # A line containing PROOF_ALIVE that ISN'T the typed "echo
+    # PROOF_ALIVE" input-echo itself - distinguishes the command's own
+    # OUTPUT (proof the shell actually read and ran it) from the pty's
+    # local echo of the keystrokes (which a dead, non-reading shell
+    # would still show, same as the negative control below proves).
+    if echo "$out" | grep "PROOF_ALIVE" | grep -qv "echo PROOF_ALIVE"; then
+        ok "the PID-1 recovery-shell loop produces a genuinely interactive bash that reads real input - not an instant-EOF fork-bomb"
+    else
+        echo "$out"; bad "the recovery-shell loop did not actually run an interactive shell - the command's own output never appeared"
+    fi
+fi
+
+# Real negative control: the OLD shape (no explicit redirect on the
+# backgrounded job at all) really does produce only the pty's own
+# local echo of the typed command, never the command's actual output -
+# proves the test above is exercising the real bug class, not passing
+# regardless of whether the fix does anything.
+if [ -n "$recovery_child_src" ]; then
+    d="$(fresh_env)"
+    cat > "$d/recovery_dead.py" <<PYEOF
+import os, pty, time, signal
+pid, fd = pty.fork()
+if pid == 0:
+    script = '''
+$recovery_child_src
+while true; do
+    ( _recovery_shell_child ) &
+    wait "\$!"
+done
+'''
+    os.execvp("busybox", ["busybox", "ash", "-c", script])
+else:
+    time.sleep(0.5)
+    os.write(fd, b"echo PROOF_ALIVE\n")
+    time.sleep(1.5)
+    try:
+        out = os.read(fd, 65536).decode(errors="replace")
+    except OSError:
+        out = ""
+    print(out)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+PYEOF
+    out="$(timeout 10 python3 "$d/recovery_dead.py" 2>&1 | tr -d '\r')"
+    rm -rf "$d"
+    if ! echo "$out" | grep "PROOF_ALIVE" | grep -qv "echo PROOF_ALIVE"; then
+        ok "negative control: the OLD unguarded background job really does silently fork-bomb a dead, non-reading shell, uncaught"
+    else
+        echo "$out"; bad "negative control did not behave as expected - the positive test above may not prove what it claims to"
+    fi
+fi
 
 # =============================================================================
 echo "== alpine-zfsboot-shell: interactive (no args) -> execs the menu =="
@@ -4161,7 +6053,11 @@ fi
 rm -rf "$d"
 
 # =============================================================================
-echo "== menu.py: _dispatch(14) calls show_previous_boot_diagnostics() =="
+echo "== menu.py: _dispatch(13) calls show_previous_boot_diagnostics() =="
+# Index 13, not 14 - "Boot console"/edit_boot_console() was removed
+# entirely from the menu (see /init's own new _boot_args_interrupt()
+# pre-menu GRUB-style edit screen, which replaces it), shifting every
+# later item down by one.
 d="$(fresh_env)"
 PATH="$STUBS:$PATH" python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
 import sys
@@ -4169,13 +6065,13 @@ sys.path.insert(0, sys.argv[1])
 import menu
 called = {}
 menu.show_previous_boot_diagnostics = lambda: called.setdefault("yes", True)
-menu._dispatch(14)
+menu._dispatch(13)
 print("called:", called.get("yes", False))
 PYEOF
 if grep -qx "called: True" "$d/out"; then
-    ok "_dispatch(14) routes to show_previous_boot_diagnostics()"
+    ok "_dispatch(13) routes to show_previous_boot_diagnostics()"
 else
-    cat "$d/out"; bad "_dispatch(14) did not call show_previous_boot_diagnostics()"
+    cat "$d/out"; bad "_dispatch(13) did not call show_previous_boot_diagnostics()"
 fi
 rm -rf "$d"
 
@@ -4506,7 +6402,7 @@ echo "== menu.py: unlock_encrypted_root() on the LOCAL CONSOLE never offers to e
 # unidoc-alip's PR #11 review, F1 (must-fix): over SSH, menu.py IS the
 # login shell (alpine-zfsboot-shell execs it), so exiting ends just
 # that connection. On the local console menu.py is /init's own child -
-# ANY exit other than the special 42 is /init's "menu.py missing or
+# ANY exit other than the special 43 is /init's "menu.py missing or
 # crashed" fallback, which kexecs straight into the default boot
 # environment with no passphrase re-prompt (the handoff secret is
 # already staged). A console operator must never be asked "end this
@@ -5046,6 +6942,80 @@ if grep -q "TERM='bogus-alpine-test' has no bundled terminfo entry" "$d/out" && 
     ok "_sanitize_term() falls back to 'ansi' (never 'linux' - a Linux-vt-specific control sequence set) for an unresolvable \$TERM over SSH"
 else
     cat "$d/out"; bad "_sanitize_term() did not fall back correctly over SSH"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== menu.py: _apply_nav_keys() clamps at boundaries exactly like dialog's own menubox.c - never wraps =="
+# Real, reported bug on real hardware: a user starting on the LAST item
+# (14 items, index 13 - exactly what POOL_IMPORT_ERROR/FORCED_RESCUE's
+# own default_item already opens on - see main()'s own comment)
+# pressed Up once (->12), then Down four times. dialog's own real
+# upstream source (menubox.c, DLGK_ITEM_NEXT: "if (scrollamt + choice
+# >= item_no - 1) continue;" - confirmed directly against the real
+# code, not assumed) means the 2nd/3rd/4th Down presses are complete
+# no-ops once back at the last item - dialog's own cursor stays at 13,
+# visually, the whole time. The OLD nav_delta/modulo approach this
+# replaced would have computed (13 + (4-1)) % 14 = 2 for the NEXT
+# tick's own default_item - a silent, unexplained jump with no
+# relationship to what the operator actually just saw. This is a real
+# unit test of the pure function (no dialog/pty needed at all - see
+# its own docstring on why it was pulled out specifically to make this
+# possible).
+d="$(fresh_env)"
+python3 - "$REPO_ROOT/init" <<'PYEOF' >"$d/out" 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+
+# The user's own real reported sequence: start at item 13 (of 14, 0-13),
+# Up once, then Down four times.
+seq = b"\x1b[A" + b"\x1b[B" * 4
+result = menu._apply_nav_keys(seq, 13, 14)
+print(f"user_scenario={result}")
+
+# Up at the very top (item 0) must be a no-op too, symmetric case.
+result2 = menu._apply_nav_keys(b"\x1b[A" * 3, 0, 14)
+print(f"top_boundary={result2}")
+
+# Plain, no-boundary-touching navigation still works exactly as before.
+result3 = menu._apply_nav_keys(b"\x1b[B" * 3, 2, 14)
+print(f"plain_down={result3}")
+result4 = menu._apply_nav_keys(b"\x1b[A" * 2, 5, 14)
+print(f"plain_up={result4}")
+
+# A split escape sequence across two separate calls (pending_esc's own
+# real job in _run_dialog_with_activity()) - the caller re-scans the
+# combined bytes, so this function itself just needs to handle the
+# RECOMBINED buffer correctly, which this directly exercises.
+result5 = menu._apply_nav_keys(b"\x1b[B", menu._apply_nav_keys(b"\x1b", 7, 14), 14)
+print(f"recombined={result5}")
+
+# Adversarial case proving PER-KEYPRESS clamping is actually necessary,
+# not just equivalent to a simpler "sum the deltas, clamp the total"
+# approach: at the bottom (13), two Down presses (both real no-ops per
+# dialog's own menubox.c) followed by one real Up. A sum-then-clamp
+# model would compute delta=-1+0+0=-1 -> clamp(13-1)=12 - coincidentally
+# right here, but ONLY because the two no-op Downs contributed exactly
+# 0 to a naive sum instead of being individually ignored at the moment
+# they occurred. The real risk a naive model gets wrong is the
+# REVERSE shape: starting EXACTLY at a boundary with motion that
+# would overshoot if summed first. Both must match dialog's own
+# strictly sequential, state-dependent clamp - this asserts the
+# library function dialog itself would reach: 13 -> (Down, no-op,
+# still 13) -> (Down, no-op, still 13) -> (Up, real, 12).
+result6 = menu._apply_nav_keys(b"\x1b[B" * 2 + b"\x1b[A", 13, 14)
+print(f"mixed_at_boundary={result6}")
+PYEOF
+if grep -qx "user_scenario=13" "$d/out" \
+   && grep -qx "top_boundary=0" "$d/out" \
+   && grep -qx "plain_down=5" "$d/out" \
+   && grep -qx "plain_up=3" "$d/out" \
+   && grep -qx "recombined=8" "$d/out" \
+   && grep -qx "mixed_at_boundary=12" "$d/out"; then
+    ok "_apply_nav_keys() clamps at both boundaries exactly like dialog's own menubox.c, and tracks plain/mixed/boundary navigation correctly"
+else
+    cat "$d/out"; bad "_apply_nav_keys() does not clamp correctly at a boundary - the exact real-hardware bug this closes"
 fi
 rm -rf "$d"
 

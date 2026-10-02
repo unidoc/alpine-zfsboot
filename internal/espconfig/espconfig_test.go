@@ -163,6 +163,7 @@ func TestConfigRender(t *testing.T) {
 				Net: "static", IPv4: "static", IPv4Address: "10.0.0.5/24", IPv4Gateway: "10.0.0.1",
 				IPv6: "static", IPv6Address: "fd00::5/64", IPv6Gateway: "fe80::1",
 				SSHListen: "0.0.0.0", SSHPort: "22", SSHAllow: "10.0.0.0/8",
+				Console: "ttyS0,115200n8",
 			},
 			want: "alpine-zfsboot.net=static\n" +
 				"alpine-zfsboot.ipv4=static\n" +
@@ -173,7 +174,17 @@ func TestConfigRender(t *testing.T) {
 				"alpine-zfsboot.ipv6.gateway=fe80::1\n" +
 				"alpine-zfsboot.ssh.listen=0.0.0.0\n" +
 				"alpine-zfsboot.ssh.port=22\n" +
-				"alpine-zfsboot.ssh.allow=10.0.0.0/8\n",
+				"alpine-zfsboot.ssh.allow=10.0.0.0/8\n" +
+				"alpine-zfsboot.console=ttyS0,115200n8\n",
+		},
+		{
+			// The real motivating case: an install-time persisted default
+			// for the ONE machine being installed, not a global
+			// CONSOLE_CMDLINE rebuild - see Config.Console's own doc
+			// comment for the full reasoning.
+			name: "console alone",
+			cfg:  Config{Console: "tty0"},
+			want: "alpine-zfsboot.console=tty0\n",
 		},
 	}
 	for _, tc := range cases {
@@ -378,5 +389,18 @@ func TestEncodeDropbearEd25519PrivateKey_Deterministic(t *testing.T) {
 	b := encodeDropbearEd25519PrivateKey(priv)
 	if !bytes.Equal(a, b) {
 		t.Error("encodeDropbearEd25519PrivateKey given the SAME key material twice produced different bytes - the encoder itself must be pure, all randomness belongs in key generation only")
+	}
+}
+
+func TestValidateConsole(t *testing.T) {
+	for _, ok := range []string{"", "tty0", "ttyS0", "ttyS2", "ttyAMA0", "ttyS1,115200n8", "ttyS0,9600", "ttyS0,9600n8r"} {
+		if err := ValidateConsole(ok); err != nil {
+			t.Errorf("ValidateConsole(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"ttyS3", "hvc0", "ttyAMA1", "tty1", "ttyS0,", "ttyS0,fast", "ttyS0 ", "serial"} {
+		if err := ValidateConsole(bad); err == nil {
+			t.Errorf("ValidateConsole(%q) = nil, want an error", bad)
+		}
 	}
 }

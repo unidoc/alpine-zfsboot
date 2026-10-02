@@ -24,7 +24,7 @@ import (
 // not just when.
 type Info struct {
 	Arch       string // "x86_64" or "aarch64" - matches build.sh's own ARCH values
-	Console    string // "vga", "serial", or "auto" - matches build.sh's own CONSOLE_NAME values
+	Console    string // every bare console= value baked into the cmdline, space-joined, verbatim (e.g. "tty0" - the default on every build now; see build.sh's own CONSOLE_CMDLINE comment for why no serial console= is baked in by default) - informational only, not a build "variant" label (that concept, and the CONSOLE_NAME build-time choice it came from, no longer exists)
 	Version    string // alpine-zfsboot.version= - the project's own human-facing release number (e.g. "0.1.0", from the repo's own version.txt file) - display only, never compared
 	BuildStamp string // alpine-zfsboot.buildstamp= - a sortable YYYYMMDDTHHMMSSZ build timestamp - what upToDate actually compares
 	Pool       string // alpine-zfsboot.pool=
@@ -182,31 +182,26 @@ func archFromMachine(m uint16) (string, error) {
 	}
 }
 
-// consoleFromCmdline mirrors build.sh's own CONSOLE_CMDLINE
-// construction in reverse: vga is a bare console=tty0, serial is a
-// bare console=ttyS0/ttyAMA0/etc, auto is both together on the same
-// cmdline (see build.sh's own CONSOLE_NAME case statement).
+// consoleFromCmdline returns every bare console= value on the cmdline,
+// space-joined, verbatim (the full "tty0" or "ttyS0,115200n8" token
+// value, not just "tty0"/"ttyS0" - a real build could in principle
+// still bake in line options, even though the default build.sh case
+// statement no longer does). Used to be a 3-way "vga"/"serial"/"auto"
+// classifier matching a build-time CONSOLE_NAME choice that no longer
+// exists (see build.sh's own CONSOLE_CMDLINE comment) - every build
+// bakes in tty0 only now, so that classification would always have
+// said "vga" regardless of what was actually there, a meaningless
+// label for a distinction that no longer exists. Returning the real
+// value(s) instead stays honest and useful even for a hand-edited
+// build.sh that bakes in something unusual.
 func consoleFromCmdline(line string) string {
-	hasVga := false
-	hasSerial := false
+	var consoles []string
 	for _, tok := range strings.Fields(line) {
-		switch {
-		case tok == "console=tty0":
-			hasVga = true
-		case strings.HasPrefix(tok, "console=tty"):
-			hasSerial = true
+		if v, ok := strings.CutPrefix(tok, "console="); ok {
+			consoles = append(consoles, v)
 		}
 	}
-	switch {
-	case hasVga && hasSerial:
-		return "auto"
-	case hasSerial:
-		return "serial"
-	case hasVga:
-		return "vga"
-	default:
-		return ""
-	}
+	return strings.Join(consoles, " ")
 }
 
 // valueOf returns the value of the first "key=value" cmdline token

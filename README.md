@@ -244,7 +244,7 @@ UEFI firmware
      own countdown with the default entry pre-highlighted, auto-boots
      it if left alone, fully interactive if touched (boot environments,
      kernel selection, BE lifecycle management, chroot, guided
-     zfs-recv deployment, recovery shell, live console switching) -
+     zfs-recv deployment, recovery shell) -
      every path through it ends up calling boot-dataset.sh: mount the
      chosen dataset read-only, find its kernel/initramfs pair, kexec
      into it
@@ -363,14 +363,20 @@ alpine-zfsboot-x86_64.EFI
 alpine-zfsboot-aarch64.EFI
 ```
 
-One build per arch, always both consoles active: the kernel sends
-boot messages to every listed console, but only the *last* one
-becomes `/dev/console` - `init/init`'s own `select_console()` picks
-which one `menu.py` actually renders to, whichever was last used (see
-below), or the first one found if there's no persisted preference yet
-- and `menu.py` itself can switch live between them at any time from
-its own "Switch console" menu item, FreeBSD-loader-style, rather than
-only ever racing for one once at the very start of boot.
+One build per arch, `tty0` only by default - the build itself has no
+built-in knowledge of serial consoles at all. A serial console is
+purely a config matter an operator opts into, via
+`alpine-zfsboot.console=` in `EFI/ALPINE/config` on the ESP (set at
+install time) - `init/init`'s own `select_console()` honors it
+regardless of whether it's on the kernel's own cmdline (it matches
+against real `/dev` node existence, not kernel console= registration -
+see that function's own comment), with a GRUB-style "press TAB to
+interrupt" prompt before any of this, on every boot, letting an
+operator pick a different console for that boot right there instead.
+If the selected console cannot be used at all (no device node, an
+unsupported name, or a node with no UART behind it), the boot stops in
+the recovery shell (and rescue SSH, if staged) instead of quietly
+booting on a different console.
 
 Each of the two arches above also ships as:
 
@@ -916,11 +922,10 @@ alpine-zfsboot
 7) Diagnostics (pool status / disks / dmesg)
 8) Edit cmdline & boot
 9) Deploy new machine (zfs recv)
-10) Switch console
-11) Network
-12) Recovery shell (bash)
-13) Boot log
-14) Previous boot diagnostics
+10) Network
+11) Recovery shell (bash)
+12) Boot log
+13) Previous boot diagnostics
 ```
 
 `Unlock encrypted root`/`Lock encrypted root` always show current state
@@ -943,14 +948,28 @@ boots the default; pressing Cancel (labeled `Boot default`) does the
 same immediately; pressing ESC stops the countdown outright and drops
 into a fully unhurried menu with no time pressure at all.
 
-Every build (both `console=tty0` and `console=ttyS0`/`ttyAMA0` on the
-cmdline, always) remembers which console you last used via a
-real UEFI NVRAM variable (the same mechanism systemd-boot's
-`LoaderEntryDefault`/GRUB's `grubenv` use to persist a choice across
-reboots), defaulting on a first boot to whichever console the kernel
-itself already treats as primary. `Switch console` flips between
-vga/serial live, within the same boot, not just "takes effect next
-time".
+Every build bakes in `console=tty0` only - no serial console= at all
+by default, on either arch. Which console actually gets the
+interactive menu is decided via three layers, lowest to highest
+priority: tty0 (the kernel's own baked-in default); a persisted
+`alpine-zfsboot.console=` in `EFI/ALPINE/config` on the ESP (the one
+and only persisted preference - no UEFI NVRAM variable, no
+firmware-dependent second mechanism, and matched against the real
+`/dev` node regardless of whether the kernel itself ever registered it
+as a console); and an explicit `console=` on the real kernel cmdline,
+which always wins. Before any of this runs, `/init` shows a GRUB-style
+"press TAB to interrupt or ENTER to continue now" prompt with a
+countdown (15s by default), on every openable console at once
+(`tty0`, `ttyS0`-`ttyS2`, `ttyAMA0`), on every boot, so a machine whose
+only console is serial or only VGA is reachable from the first boot with
+no config. TAB on any of them opens an editable line pre-filled with the
+resolved default; ENTER skips the rest of the countdown. Either way the
+console the key was pressed on becomes the active console for that boot
+(ENTER on an unrelated port that only ever sent line noise does not
+count). A confirmed edit there is a genuine, full passthrough
+onto the same cmdline layer (`alpine-zfsboot install --console`, or
+hand-editing `EFI/ALPINE/config`, is how a
+choice is made to persist across reboots instead).
 
 ## Building
 
@@ -990,16 +1009,17 @@ that's already installed still gets the CLI via
 ### How this is built
 
 - **`init/init`** - PID 1 inside the initramfs. Mounts
-  `/proc`/`/sys`/`/dev`/`efivarfs`, parses `alpine-zfsboot.*=` cmdline
+  `/proc`/`/sys`/`/dev`, parses `alpine-zfsboot.*=` cmdline
   options and any ESP-persisted config, stages rescue-SSH material from
-  the ESP if present, starts `dropbear` if it's usable (see
+  the ESP if present, runs `_boot_args_interrupt()` - a GRUB-style
+  "press TAB to interrupt" gate, before anything else, on every boot -
+  starts `dropbear` if it's usable (see
   [Rescue SSH](#rescue-ssh)), imports the
   named pool, reads `bootfs`, checks pool health, best-
   effort-imports every other reachable pool, then always runs
-  `menu.py` (as a plain child, in a loop - `menu.py`'s
-  `switch_console()` exits with a specific code asking to be relaunched
-  attached to a different tty, which is what makes a live console
-  switch possible). Any exit other than that falls through to
+  `menu.py` (as a plain child, in a loop - `recovery_shell()`'s own
+  exit(43) convention asks to be relaunched after a fresh pool-import
+  attempt). Any other exit falls through to
   `exec boot-dataset.sh` directly, the same safety net a `menu.py`
   crash also uses. Plain POSIX `sh`.
 - **`init/boot-dataset.sh`** - `boot-dataset.sh DATASET POOL

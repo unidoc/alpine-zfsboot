@@ -8,7 +8,9 @@
 # countdown with the default entry pre-highlighted, auto-boots that
 # entry if left alone, fully interactive if touched (boot-environment/
 # kernel selection, BE lifecycle management, chroot, guided zfs-recv
-# deployment, recovery shell, console switching - see that file).
+# deployment, recovery shell - see that file). Console selection itself
+# happens earlier, before any of this - see _boot_args_interrupt()'s
+# own comment, further down.
 #
 # An earlier version of this project had a separate fast, Python-free
 # automatic path for when no key was held, and only showed the menu on
@@ -94,6 +96,17 @@ MENU_TIMEOUT=2
 # MENU_TIMEOUT is: no single value is right for every BMC/console.
 MENU_GRACE=5
 
+# How long _boot_args_interrupt() (see its own comment, further down)
+# waits for a bare TAB keypress before giving up and continuing the
+# unattended boot untouched - every registered console gets this full
+# window CONCURRENTLY (see _boot_args_wait_for_tab()'s own comment), not
+# one window divided or multiplied across them, so this number is the
+# real, exact wall-clock delay added to every boot regardless of how
+# many consoles are registered. 15s, not a few seconds: a remote console
+# (VNC/BMC/IPMI) needs several seconds to attach - the same class of
+# latency MENU_GRACE above exists to absorb.
+BOOT_ARGS_TIMEOUT=15
+
 msg() {
     echo "alpine-zfsboot: $*" > /dev/kmsg 2>/dev/null
     echo "$*"
@@ -103,6 +116,16 @@ msg() {
 # shell, not panic the kernel or silently reboot-loop.
 die() {
     msg "FATAL: $*"
+    # Tells every OTHER registered/relevant console (not wherever this
+    # process's own stdio actually is) that the recovery shell is
+    # elsewhere, not here - see _notify_recovery_shell_elsewhere()'s own
+    # comment, further down, for why this is a DIFFERENT message there
+    # rather than the same one repeated everywhere. Defined later in
+    # this file but always called long after the whole file (and every
+    # function in it) has already been read - safe regardless of
+    # definition order, same as every other forward-reference in this
+    # script.
+    _notify_recovery_shell_elsewhere
     # One of this project's three rescue-ssh trigger points (see
     # rescue-ssh.sh's own header comment) - a bare recovery shell with
     # no menu.py/UI running is exactly the "no local recourse short of
@@ -173,8 +196,38 @@ _recovery_shell() {
         # the shell (accidentally or on purpose) hands the operator a
         # brand new one instead of leaving PID 1 alive but permanently
         # stuck with no usable shell for the rest of this boot.
+        #
+        # A real, bug in this exact loop, confirmed
+        # by direct reproduction (a real pty, real session leadership):
+        # POSIX mandates that an asynchronous list's (a `&`-backgrounded
+        # job's) standard input is forced to /dev/null UNLESS an
+        # explicit redirection says otherwise - confirmed directly
+        # (`busybox ash -c '( readlink /proc/self/fd/0 ) & wait' <
+        # realfile` prints "/dev/null", not the real file) - meaning
+        # `( _recovery_shell_child ) &` ALWAYS ran with stdin=/dev/null,
+        # regardless of whatever real console this process's own fd 0
+        # was actually connected to. `_recovery_shell_child`'s own
+        # `exec /bin/bash` then inherited that same /dev/null stdin -
+        # non-interactive, immediate EOF, instant exit - so this loop
+        # was never actually a recovery shell on PID 1 at all: it was
+        # an unthrottled fork-bomb silently re-launching and
+        # immediately killing a non-interactive bash, as fast as
+        # fork+exec allow, for the rest of the boot, with nothing ever
+        # appearing on the console to explain why. Reproduced directly:
+        # 10 iterations completed inside a 2-second window. `exec
+        # 3<&0` duplicates THIS shell's own real fd 0 (whatever it's
+        # actually connected to - already-established ctty or not;
+        # unlike hardcoding `/dev/tty`, which can't even be opened
+        # before a ctty exists) onto fd 3 once, here, before the loop
+        # starts - the async-list override only ever touches fd 0
+        # itself, never other inherited fds - so `<&3` on the
+        # background job gives it back its own real input instead of
+        # /dev/null. Confirmed by the same direct reproduction: real
+        # keystrokes written to the pty were correctly read back by
+        # the shell afterward.
+        exec 3<&0
         while true; do
-            ( _recovery_shell_child ) &
+            ( _recovery_shell_child ) <&3 &
             wait "$!"
         done
     fi
@@ -301,13 +354,6 @@ grep -q '^sshd:' /etc/passwd 2>/dev/null || adduser -h / -s /sbin/nologin -S ssh
 # comes up at all without this.
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts 2>/dev/null
-# efivarfs - real UEFI NVRAM, used by select_console()'s own
-# read_efivar_console_pref() (see that function's own comment for the
-# full "operator's persisted runtime choice, UEFI only" reasoning).
-# Harmless to attempt even on firmware/kernel combinations that don't
-# support it - the mount just fails silently, and every reader already
-# tolerates that.
-mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
 
 # Confirmed the hard way on real Proxmox/virtio-scsi hardware: a
 # storage HBA module (virtio_scsi) loading successfully is NOT enough
@@ -449,6 +495,7 @@ apply_zfsboot_kv() {
         alpine-zfsboot.pool=*) POOL="${kv#alpine-zfsboot.pool=}" ;;
         alpine-zfsboot.timeout=*) MENU_TIMEOUT="${kv#alpine-zfsboot.timeout=}" ;;
         alpine-zfsboot.menu_grace=*) MENU_GRACE="${kv#alpine-zfsboot.menu_grace=}" ;;
+        alpine-zfsboot.interrupt_timeout=*) BOOT_ARGS_TIMEOUT="${kv#alpine-zfsboot.interrupt_timeout=}" ;;
         alpine-zfsboot.net=*) ALPINE_ZFSBOOT_NET="${kv#alpine-zfsboot.net=}" ;;
         alpine-zfsboot.ipv4.address=*) ALPINE_ZFSBOOT_IPV4_ADDRESS="${kv#alpine-zfsboot.ipv4.address=}" ;;
         alpine-zfsboot.ipv4.gateway=*) ALPINE_ZFSBOOT_IPV4_GATEWAY="${kv#alpine-zfsboot.ipv4.gateway=}" ;;
@@ -471,13 +518,13 @@ apply_zfsboot_kv() {
         # (ZFSBOOT_KV_SOURCE=cmdline, set by that loop below) -
         # select_console()'s cmdline layer needs a single, stable,
         # boot-time value, unlike its config-file layer (which is read
-        # fresh at use-time instead, straight off the ESP, so a live
-        # switch_console() write during this boot is visible on the
-        # very next call - see that function's own header comment). A
-        # config-file console= line still applies (this whole function
-        # is the config-file's own parser too - see this function's own
-        # header comment), it just does its job later, at read time,
-        # not here.
+        # fresh at use-time instead, straight off the ESP - nothing
+        # inside the running menu writes to it anymore, but it can still
+        # change out from under a long-running rescue session if an
+        # operator hand-edits the ESP over rescue-SSH). A config-file
+        # console= line still applies (this whole function is the
+        # config-file's own parser too - see this function's own header
+        # comment), it just does its job later, at read time, not here.
         alpine-zfsboot.console=*)
             [ "$ZFSBOOT_KV_SOURCE" = cmdline ] && ZFSBOOT_CONSOLE_CMDLINE="${kv#alpine-zfsboot.console=}"
             ;;
@@ -640,13 +687,11 @@ if [ -z "$ROOTFS" ]; then
     done
     if [ "$esp_candidate_count" -eq 1 ]; then
         msg "alpine-zfsboot ESP found on $esp_candidate"
-        # Exported so menu.py's own switch_console() can persist a new
-        # console choice back to this SAME device without independently
-        # re-running this whole disambiguation scan itself (one
-        # discovery pass, one place that decides "this is genuinely the
-        # alpine-zfsboot ESP", reused - not a second, separate
-        # implementation of the same LABEL=EFI/marker-file logic in
-        # Python that could drift from this one).
+        # Exported so read_fat_console_pref() (and any subshell that
+        # calls it) sees this value without independently re-running
+        # this whole disambiguation scan itself - one discovery pass,
+        # one place that decides "this is genuinely the alpine-zfsboot
+        # ESP", reused.
         export ALPINE_ZFSBOOT_ESP_DEV="$esp_candidate"
         if mount -t vfat -o ro "$esp_candidate" /tmp/esp-config 2>/dev/null; then
             if [ -r "/tmp/esp-config/EFI/ALPINE/config" ]; then
@@ -747,16 +792,21 @@ export ALPINE_ZFSBOOT_NET \
 # staging paths this file just populated, or left empty).
 . "$RESCUE_LIB_DIR/rescue-ssh.sh"
 
-# CONSOLE_NAME=auto builds (see build.sh) put BOTH console=tty0 and
-# console=ttyS0/ttyAMA0 on the kernel cmdline - real hardware/VGA and
-# serial both get every kernel message from boot onward (which is
-# also just genuinely useful on its own: this project's entire EFI
-# loader debugging saga depended on switching between vga and serial
-# builds to get a scrollable log at all - a dual-console build never
-# has to make that choice). Only one of them can be /dev/console
-# though (the kernel picks the LAST console= listed), so without this,
-# whichever one someone is actually looking at might not be the one
-# menu.py actually renders to.
+# Every build (see build.sh's own CONSOLE_CMDLINE comment) registers
+# tty0 only by default now - no serial console= baked in anywhere
+# unless an operator put one there themselves, via a real kernel
+# cmdline override, a persisted alpine-zfsboot.console= in
+# EFI/ALPINE/config (set at install time, when they already have full
+# access - not something that needs to be reached by booting first),
+# or the pre-boot "press TAB to interrupt" screen for just this one
+# boot (e.g. a Kimsufi/OVH-style serial-only rescue boot: TAB, set
+# console=ttyS1 for THIS boot, install, write the same value into
+# EFI/ALPINE/config while already in there - nothing more needed after
+# that). select_console()'s own Layer 2 (FAT config) and Layer 4
+# (cmdline) both match against real /dev node existence, not kernel
+# console= registration, so a configured serial console works
+# correctly regardless of what this file's own CONSOLE_CMDLINE bakes
+# in by default.
 #
 # select_console() picks which real tty menu.py renders to this boot,
 # honoring a persisted preference if one exists and this boot actually
@@ -765,66 +815,58 @@ export ALPINE_ZFSBOOT_NET \
 # live-ticking countdown built INTO the real interactive widget itself
 # (see menu.py's _countdown_menu()), FreeBSD-loader-style, rather than
 # a separate pre-menu prompt that would just be a second, redundant
-# screen in front of the real one. Switching consoles happens from
-# WITHIN the menu itself (see menu.py's switch_console()) rather than
-# during a race here - that needs a live re-attach (close and reopen
-# stdin/stdout/stderr against a different tty), which only makes sense
-# once something is actually running to ask for it, not during a
-# fire-and-forget shell loop with nothing to redraw.
+# screen in front of the real one. Changing console is ONE mechanism,
+# deliberately: _boot_args_interrupt() (see its own comment, further
+# down), the GRUB-style "press TAB to interrupt" edit screen that runs
+# BEFORE any of this, on every boot. It writes ZFSBOOT_CONSOLE_CMDLINE
+# directly (Layer 3 below), the same variable a real kernel cmdline
+# alpine-zfsboot.console= populates - a genuine, full passthrough to
+# apply_zfsboot_kv(), with no precedence rule of its own to keep in
+# sync with this file's other layers. An earlier version of this
+# project also had a separate LIVE claim mechanism (a tty0 keypress or
+# a serial "menu"+Enter, rerouting an already-running menu to a
+# different console) - removed by deliberate choice, same reasoning as
+# the NVRAM removal below: a second way to change console bought
+# confusion (which one actually applies right now?), not real
+# capability the pre-boot screen doesn't already cover - reboot and
+# press TAB.
 #
-# Four layers, lowest to highest priority - two different KINDS of
-# "remembered choice", deliberately kept as two separate mechanisms,
-# not collapsed into one:
+# Three layers, lowest to highest priority - one PERSISTED mechanism:
+# an earlier version of this project also had a UEFI NVRAM variable
+# (AlpineZfsBootConsole) as a second, operator-writable persistence
+# layer alongside the FAT config below, kept deliberately separate from
+# it (a fleet-wide installer default vs. one operator's own override on
+# a single box). Removed by deliberate choice: one config format, one
+# place to look, no firmware-dependent second mechanism that only even
+# existed on UEFI hosts to begin with - BIOS never had an equivalent. A
+# one-boot-only console change (an operator who wants THIS boot,
+# specifically, on a different console, nothing persisted) goes through
+# the pre-boot edit screen above instead - not a second persistence
+# store.
 #
 #   1. kernel's own active console (baseline - see below)
-#   2. FAT config (alpine-zfsboot.console= in EFI/ALPINE/config,
-#      see apply_zfsboot_kv()) - the canonical, firmware-neutral MACHINE
-#      DEFAULT, set once at install time (or by switch_console() on a
-#      BIOS host, which has nowhere else to persist a choice - see
-#      menu.py's own comment). Works on every layout, UEFI or BIOS.
-#   3. UEFI NVRAM variable (AlpineZfsBootConsole, GUID
-#      ce0e7d88-f5ad-45e9-a195-680f5140efa5, the same mechanism
-#      systemd-boot's LoaderEntryDefault / GRUB's grubenv use) - the
-#      OPERATOR's own persisted runtime choice, UEFI only.
-#      switch_console() writes here instead of the FAT config on a
-#      UEFI host (see its own comment) precisely so a machine-wide
-#      config default (say, an installer setting
-#      alpine-zfsboot.console=ttyS0 for a whole fleet) and one
-#      operator's own "I prefer tty0 on THIS box" choice stay two
-#      genuinely separate concepts, neither silently overwriting the
-#      other's storage.
-#   4. explicit kernel cmdline alpine-zfsboot.console= - always wins,
-#      unconditionally, every call - the same "cmdline overrides
-#      persisted config" convention every other alpine-zfsboot.* key
-#      already follows, just carried all the way through here instead
-#      of only applying once at boot.
+#   2. FAT config (alpine-zfsboot.console= in EFI/ALPINE/config, see
+#      apply_zfsboot_kv()) - the ONE persisted preference, machine-wide,
+#      works on every layout (UEFI or BIOS), set at install time or by
+#      hand-editing the ESP.
+#   3. explicit kernel cmdline alpine-zfsboot.console= (or the pre-boot
+#      edit screen, which is a passthrough onto this exact same layer) -
+#      always wins, unconditionally, every call - the same "cmdline
+#      overrides persisted config" convention every other
+#      alpine-zfsboot.* key already follows, just carried all the way
+#      through here instead of only applying once at boot.
 #
-# An earlier version of this file removed layer 3 entirely in favor of
-# routing everything through layer 2, on the reasoning that a second,
-# firmware-dependent persistence mechanism was redundant now that the
-# FAT config path works on every layout. That reasoning conflated "one
-# canonical MACHINE CONFIG format" (true, and still the right call -
-# see this whole file's own ESP-discovery design) with "one persisted
-# OPERATOR CHOICE mechanism" (not the same claim at all) - UEFI's own
-# NVRAM already does the operator-choice job well, and removing it
-# bought nothing except silently downgrading UEFI hosts to lose a real
-# capability they used to have. Restored on review.
-#
-# Layers 2 and 3 both need a FRESH read on every single call, not a
-# cached value from a one-time boot-time parse: switch_console() (see
-# menu.py) runs in a SEPARATE process and writes its new choice
-# straight to whichever of the two backing stores it's using - a plain
-# shell variable in THIS process has no way to see that write happen.
-# Without a fresh re-read, select_console() would keep reapplying a
-# STALE value on every loop iteration, silently undoing the live
-# switch the operator just made from the menu - this is exactly why
-# the original efivarfs-only mechanism worked correctly (every read
-# went straight to the kernel's own live NVRAM, never a cached
-# variable) and why layer 2's own file-based version needs the same
-# discipline now that it's real. Layer 4 (cmdline), by contrast, is a
-# single boot-time value by its own nature - captured once into
-# ZFSBOOT_CONSOLE_CMDLINE by apply_zfsboot_kv() (see its own ZFSBOOT_KV_SOURCE
-# handling) and never needs re-reading.
+# Layer 2 needs a FRESH read on every single call, not a cached value
+# from a one-time boot-time parse: a relaunch (43, see recovery_shell()'s
+# own comment) re-enters this function in a NEW process, and a hand-edit
+# of the ESP config over a long-running rescue SSH session must be
+# picked up just as freshly. Layer 3 (cmdline), by contrast, is a single
+# boot-time value by its own nature - captured once into
+# ZFSBOOT_CONSOLE_CMDLINE by apply_zfsboot_kv() (see its own
+# ZFSBOOT_KV_SOURCE handling, and _boot_args_interrupt()'s own comment
+# for the pre-boot edit screen that can also populate it, once, before
+# the main loop below ever starts) and never needs re-reading after
+# that.
 read_fat_console_pref() {
     [ -n "$ALPINE_ZFSBOOT_ESP_DEV" ] || return
     mount -t vfat -o ro "$ALPINE_ZFSBOOT_ESP_DEV" /tmp/esp-config 2>/dev/null || return
@@ -833,26 +875,11 @@ read_fat_console_pref() {
     umount /tmp/esp-config 2>/dev/null
 }
 
-# An efivarfs file's first 4 bytes are the variable's own UEFI
-# attributes (EFI_VARIABLE_* flags), not part of the stored value -
-# `tail -c +5` strips exactly those, the same convention every real
-# efivarfs reader (efibootmgr, systemd's bootctl, ...) follows. Silent
-# empty result if the variable was never set, or this isn't real UEFI
-# hardware/firmware with efivarfs support - callers already treat "no
-# preference" and "unsupported" identically.
-EFIVAR_GUID="ce0e7d88-f5ad-45e9-a195-680f5140efa5"
-EFIVAR_NAME="AlpineZfsBootConsole"
-EFIVAR_PATH="/sys/firmware/efi/efivars/${EFIVAR_NAME}-${EFIVAR_GUID}"
-read_efivar_console_pref() {
-    [ -r "$EFIVAR_PATH" ] || return
-    tail -c +5 "$EFIVAR_PATH" 2>/dev/null | tr -d '\0'
-}
-
 # _parse_console_spec SPEC - splits SPEC into _CONSOLE_SPEC_TTY (bare
 # tty name, e.g. "ttyS1" - what every candidate-matching comparison in
 # select_console() below already needs) and _CONSOLE_SPEC_OPTS
 # (everything after the first comma, or empty) - two globals rather
-# than a return value, same idiom ACTIVE_TTY/KERNEL_ACTIVE_TTY already
+# than a return value, same idiom ACTIVE_TTY/ACTIVE_CONSOLE_OPTS already
 # use throughout this file. Real gap this closes: a value like
 # "ttyS1,115200n1" (the kernel's OWN console=ttySn,<baud><parity><bits>
 # convention, which an operator naturally reaches for since
@@ -937,14 +964,259 @@ _apply_console_line_settings() {
 
 ACTIVE_TTY=tty0
 ACTIVE_CONSOLE_OPTS=""
+LAST_NOTIFIED_TTY=""
+
+# notify_inactive_consoles - real gap found via a design
+# review, after a real Netcup VM incident: /init (and everything
+# menu.py later prints) only ever writes to ACTIVE_TTY - EVERY other
+# console CONSOLE_CMDLINE registered (see build.sh) goes completely
+# silent the moment userspace takes over, with zero indication anything
+# is happening or how to reach the real menu. On that Netcup box
+# (UEFI, VNC console showing only tty0), the operator watched normal
+# kernel boot messages stop dead and saw nothing else ever again -
+# indistinguishable from a hang, even though the interactive menu was
+# alive the whole time on ttyS0 (the kernel's own default per
+# select_console()'s "last console= wins" rule). Fixed: a one-time
+# (per ACTIVE_TTY change, tracked via LAST_NOTIFIED_TTY so a 43
+# relaunch onto the SAME console doesn't spam it again) banner written
+# directly to every OTHER currently-registered kernel console,
+# explaining where the real menu is and how to move it here.
+#
+# Deliberately targets /sys/class/tty/console/active (the kernel's own
+# registered-console list), not select_console()'s full candidate set:
+# those are exactly the consoles that already received real kernel
+# dmesg output and then went dark (the incident shape), and - just as
+# importantly - the ONLY ones whose line settings the kernel's own
+# console= parsing already configured correctly. A candidate the
+# kernel never registered as a console sits at a hardcoded 9600n8 (see
+# _apply_console_line_settings's own comment) - writing a banner there
+# would frame incorrectly or not appear at all on a real fixed-rate
+# remote listener, the exact silent-console problem this project
+# already spent real effort fixing elsewhere. Every write wrapped in a
+# subshell with its own redirect, same idiom and the same reason as the
+# stty -g open-test right below this function's own caller: a
+# PORT_UNKNOWN node opens fine but EIOs on write, and PID 1 must
+# survive that regardless.
+#
+# No live "press a key to claim this console" hint anymore - an earlier
+# version of this project had one (a tty0 keypress, or typing "menu" on
+# a serial line, would reroute the already-running menu here) and it
+# was removed by deliberate choice: a second way to change console,
+# alongside _boot_args_interrupt()'s own pre-boot screen, bought
+# confusion (which one actually applies right now, given a persisted
+# FAT-config preference?) rather than real capability - "reboot and
+# press TAB" covers the same need with one answer, not two. This
+# banner's own job stays the same regardless: tell an operator on an
+# otherwise-silent console where the menu actually is and how to get it
+# there NEXT boot, so the console's own silence is never again
+# mistaken for a hang (the original Netcup incident).
+notify_inactive_consoles() {
+    [ "$LAST_NOTIFIED_TTY" = "$ACTIVE_TTY" ] && return
+    LAST_NOTIFIED_TTY="$ACTIVE_TTY"
+    # Registered consoles PLUS _extra_relevant_consoles() (see its own
+    # comment, further down) - a later review found this loop used
+    # to only ever consider kernel-registered consoles, so an operator
+    # whose FAT-persisted console preference got outvoted by a one-boot
+    # cmdline override (Layer 3 always wins) saw a real, working
+    # pre-boot TAB countdown on their own console, then permanent
+    # silence afterward - never told the menu moved elsewhere, because
+    # this loop never even considered that device. `_seen` dedups
+    # against whatever the registered loop already queued, so a device
+    # that's both registered AND _extra_relevant_consoles()'s own answer
+    # (the common case: they usually agree) never gets banner-ed twice.
+    _seen=""
+    for tty in $(cat "$ROOTFS/sys/class/tty/console/active" 2>/dev/null) $(_extra_relevant_consoles); do
+        case " $_seen " in *" $tty "*) continue ;; esac
+        _seen="$_seen $tty"
+        [ "$tty" = "$ACTIVE_TTY" ] && continue
+        [ -e "$ROOTFS/dev/$tty" ] || continue
+        ( {
+            echo "alpine-zfsboot: the interactive boot menu is running on /dev/$ACTIVE_TTY, NOT here."
+            echo "alpine-zfsboot: this console stays quiet on purpose - the system is not hung."
+            if _is_known_console_name "$tty"; then
+                echo "alpine-zfsboot: to make THIS console (/dev/$tty) the menu console, reboot and press"
+                echo "alpine-zfsboot: TAB at the 'alpine-zfsboot starting' prompt, or set"
+                echo "alpine-zfsboot:   alpine-zfsboot.console=$tty"
+                echo "alpine-zfsboot: in EFI/ALPINE/config on the ESP to persist it."
+            else
+                # A real, gap: this console IS
+                # kernel-registered (it's in console/active, which is
+                # all this loop checks), but its NAME isn't one
+                # select_console() itself will ever recognize (see
+                # _known_console_names's own comment) - the advice
+                # above would be a guaranteed, silently-rejected dead
+                # end here (select_console()'s own Layer 2/3 warning
+                # would fire every single boot, forever, for an
+                # operator who followed this exact instruction).
+                echo "alpine-zfsboot: /dev/$tty isn't a console name this build can select at all"
+                echo "alpine-zfsboot: (not in: tty0, ttyS0, ttyS1, ttyS2, ttyAMA0) - TAB/console="
+                echo "alpine-zfsboot: here would be accepted but never actually take effect."
+            fi
+        } > "$ROOTFS/dev/$tty" ) 2>/dev/null
+    done
+}
+
+# _notify_recovery_shell_elsewhere - die()'s own analogue of
+# notify_inactive_consoles(), for the same reason: a multi-registered-
+# console build (an explicit cmdline naming more than one console=)
+# used to have die()'s own FATAL message and recovery shell reach only
+# whichever console this process's stdio happened to be attached to at
+# that moment - every OTHER registered console saw nothing at all.
+#
+# Deliberately NOT the same fix shape as notify_inactive_consoles()
+# though: this does NOT repeat the SAME "dropping to a recovery shell"
+# text on every console.
+# PID 1 only ever has ONE stdin, so only ONE console can possibly have
+# a REAL, working shell attached; writing the identical "here's your
+# shell" promise to every console would make the others LOOK just as
+# functional as the real one when they categorically cannot be - the
+# exact same "last one wins, so saying this on all of them is a lie"
+# shape the operator flagged. Every OTHER console gets a plainly
+# DIFFERENT, honest message instead: the real thing is happening
+# elsewhere, not here.
+#
+# Finds which device this process's OWN fd 0 is actually attached to
+# RIGHT NOW via /proc/self/fd/0 - real, ground-truth kernel state, not
+# a bookkeeping variable this file would otherwise have to keep
+# perfectly in sync across every die() call site, including ones that
+# fire before any console was ever successfully exec'd onto this boot
+# at all (this file's own main loop may call die() before its own
+# `exec` ever runs - see that guard's own comment - so there is no
+# "last successfully attached console" variable to fall back on there).
+# Deliberately NOT $ROOTFS-prefixed: /proc/self is this ACTUAL running
+# process's own real kernel-provided view, never something a test
+# fixture's fake root could stand in for (unlike /dev or /sys, which
+# tests/run-tests.sh fakes under $ROOTFS on purpose) - under a real
+# boot $ROOTFS is empty anyway, so this is identical there either way.
+# `readlink -f` on both sides of the comparison below (not a bare name
+# compare) so this also works correctly when `$ROOTFS/dev/$tty` is a
+# symlink to a real pty (tests/run-tests.sh's own fixture shape)
+# rather than a real device node (the real-boot shape) - either way,
+# both resolve to the same real underlying path when they're actually
+# the same device.
+_notify_recovery_shell_elsewhere() {
+    _my_tty="$(readlink -f /proc/self/fd/0 2>/dev/null)"
+    # Before the main loop's exec, PID 1's stdio is the fd the kernel
+    # opened from /dev/console, which resolves to the literal path
+    # /dev/console and never equals any /dev/<tty> name below. That is the
+    # kernel's preferred console: the LAST entry of console/active.
+    if [ "$_my_tty" = /dev/console ]; then
+        _c=""
+        for _c in $(cat "$ROOTFS/sys/class/tty/console/active" 2>/dev/null); do :; done
+        [ -n "$_c" ] && _my_tty="$(readlink -f "$ROOTFS/dev/$_c" 2>/dev/null)"
+    fi
+    _seen=""
+    for tty in $(cat "$ROOTFS/sys/class/tty/console/active" 2>/dev/null) $(_extra_relevant_consoles); do
+        case " $_seen " in *" $tty "*) continue ;; esac
+        _seen="$_seen $tty"
+        [ -e "$ROOTFS/dev/$tty" ] || continue
+        [ -n "$_my_tty" ] && [ "$(readlink -f "$ROOTFS/dev/$tty" 2>/dev/null)" = "$_my_tty" ] && continue
+        ( {
+            echo "alpine-zfsboot: a FATAL error occurred - dropping to a recovery shell on a"
+            echo "alpine-zfsboot: DIFFERENT console, NOT here. This console stays quiet on"
+            echo "alpine-zfsboot: purpose - check whichever console showed earlier boot messages."
+        } > "$ROOTFS/dev/$tty" ) 2>/dev/null
+    done
+}
+
+# _known_console_names/_is_known_console_name - the ONE list of device
+# NAMES this project treats as a console candidate at all (ttyS1/ttyS2
+# alongside ttyS0/ttyAMA0 - confirmed a real need on physical OVH
+# hardware, whose remote-console redirection doesn't always land on
+# ttyS0). Factored out, rather than left as a literal inline the way
+# select_console() used to have it, so _boot_args_interrupt()'s own
+# pre-boot validation (see its own comment) can check the EXACT same
+# definition of "a console name this build supports" - a real,
+# gap otherwise: that validation's own `stty -g`
+# open-test accepts ANY openable device, a strictly MORE permissive
+# definition than this list, so a genuinely live ttyS3/ttyAMA1/hvc0
+# could be force-accepted there and then silently dropped by
+# select_console() anyway, with a warning that wrongly claims the
+# device doesn't exist when it's simply not a name this build
+# recognizes as a console at all.
+_known_console_names() {
+    echo "tty0 ttyS0 ttyS1 ttyS2 ttyAMA0"
+}
+_is_known_console_name() {
+    for _known in $(_known_console_names); do
+        [ "$_known" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# _extra_relevant_consoles - the ONE shared answer to "which non-
+# kernel-registered consoles matter this boot" - used by BOTH
+# _boot_args_interrupt() (so the pre-boot TAB prompt is visible there
+# too) and notify_inactive_consoles() (so a "menu is elsewhere" banner
+# reaches there too, not just silence).
+#
+# Real, reported bug (2026-10-02, a real Proxmox VM, serial-only access
+# via `qm terminal`, a totally fresh ISO boot with NO persisted config
+# yet): an earlier version of this function only ever considered a
+# device the operator had ALREADY told this project about (a FAT-config
+# preference, or the already-resolved $ACTIVE_TTY) - on a pristine
+# machine with neither (this build's own CONSOLE_CMDLINE is tty0-only,
+# see build.sh's own comment on why), a genuinely live, open serial port
+# (ttyS0 - the 8250 driver registers it as a real /dev node independent
+# of whether console= ever named it, confirmed present on virtually any
+# x86 VM/bare metal with a UART) never got a SINGLE CHANCE at the
+# pre-boot prompt. An operator whose only real access IS serial (this
+# exact test, and the Kimsufi Serial-over-LAN scenario the operator
+# raised earlier the same day) was completely locked out on the very
+# first boot, with no way to even reach the mechanism meant to fix
+# this - config can only ever be persisted AFTER a successful first
+# interaction, so requiring prior config here was circular.
+#
+# Fixed: tries EVERY _known_console_names() entry, not just ones
+# already named by FAT config or $ACTIVE_TTY - gated the same way an
+# operator-named console already is elsewhere in this file (genuinely
+# openable, `stty -g`, never just "the node exists" - a PORT_UNKNOWN
+# node passes that and nothing else, so this can never busy-loop
+# _boot_args_wait_for_tab()'s own reader on a node proven dead).
+# Skips anything the registered-console loop (in both callers) already
+# has - this function's whole job is the NON-registered remainder.
+# Applies real line settings to each qualifying device before
+# returning it (a non-registered line sits at the kernel's hardcoded
+# 9600n8 otherwise, which would make both the TAB countdown and
+# notify_inactive_consoles()'s own banner arrive as garbage at
+# whatever real baud rate is actually listening) - the FAT preference's
+# own explicit opts, or $ACTIVE_TTY's own resolved opts, win for
+# whichever device they each specifically name; everything else found
+# only by this new blind sweep defaults to 115200n8, this project's own
+# standard rate, since nothing has told us otherwise for it.
+_extra_relevant_consoles() {
+    _extra=""
+    _registered="$(cat "$ROOTFS/sys/class/tty/console/active" 2>/dev/null)"
+    fat_pref="$(read_fat_console_pref)"
+    _parse_console_spec "$fat_pref"
+    _fat_tty="$_CONSOLE_SPEC_TTY"
+    _fat_opts="$_CONSOLE_SPEC_OPTS"
+    for tty in $(_known_console_names); do
+        case " $_registered " in *" $tty "*) continue ;; esac
+        case " $_extra " in *" $tty "*) continue ;; esac
+        [ -e "$ROOTFS/dev/$tty" ] || continue
+        ( stty -g < "$ROOTFS/dev/$tty" ) >/dev/null 2>&1 || continue
+        if [ "$tty" = "$_fat_tty" ]; then
+            _opts="${_fat_opts:-115200n8}"
+        elif [ "$tty" = "$ACTIVE_TTY" ]; then
+            _opts="${ACTIVE_CONSOLE_OPTS:-115200n8}"
+        else
+            _opts="115200n8"
+        fi
+        _apply_console_line_settings "$_opts" \
+            < "$ROOTFS/dev/$tty" > "$ROOTFS/dev/$tty" 2>/dev/null
+        _extra="$_extra $tty"
+    done
+    echo "$_extra"
+}
+
 select_console() {
+    # Set when an operator-chosen console (config or cmdline) cannot be
+    # used at all - missing node or a name outside _known_console_names.
+    # The main loop treats it exactly like a present-but-dead node: die().
+    CONSOLE_UNUSABLE=""
     candidates=""
-    # ttyS1/ttyS2 alongside ttyS0/ttyAMA0 - confirmed a real need on
-    # physical OVH hardware, whose remote-console redirection doesn't
-    # always land on ttyS0. Listed here too (not just left to
-    # EXTRA_CMDLINE) since this loop is what decides which /dev nodes
-    # switch_console() even offers as candidates in the first place.
-    for tty in tty0 ttyS0 ttyS1 ttyS2 ttyAMA0; do
+    for tty in $(_known_console_names); do
         [ -e "$ROOTFS/dev/$tty" ] && candidates="$candidates $tty"
     done
     set -- $candidates
@@ -975,15 +1247,10 @@ select_console() {
         done
     done
 
-    # Saved here, BEFORE any of layers 2-4 below can override it - this
-    # is the one candidate guaranteed to actually work (it's what the
-    # kernel itself is already using), so it's the fallback the main
-    # loop's own open-test (see its own comment) resets to if an
-    # operator's remotely-persisted choice turns out to name a /dev
-    # node that exists but has no real UART behind it. No explicit line
-    # options for this one - the kernel already configured its own
-    # registered console correctly via its own console= parsing.
-    KERNEL_ACTIVE_TTY="$ACTIVE_TTY"
+    # No explicit line options for this one - the kernel already
+    # configured its own registered console correctly via its own
+    # console= parsing. Layers 2-3 below set ACTIVE_CONSOLE_OPTS
+    # explicitly if an operator's own choice needs them.
     ACTIVE_CONSOLE_OPTS=""
 
     # Layer 2: FAT config (canonical machine default) - fresh read
@@ -994,36 +1261,638 @@ select_console() {
     # never matched a bare candidate name before this existed.
     pref="$(read_fat_console_pref)"
     _parse_console_spec "$pref"
+    _matched=0
     for tty in $candidates; do
         if [ "$tty" = "$_CONSOLE_SPEC_TTY" ]; then
             ACTIVE_TTY="$tty"
             ACTIVE_CONSOLE_OPTS="$_CONSOLE_SPEC_OPTS"
+            _matched=1
         fi
     done
+    # A real, reported gap: an operator-specified console (FAT config
+    # or cmdline, below - both a DELIBERATE choice, unlike Layer 1's
+    # automatic kernel default) that doesn't match any real candidate
+    # used to be silently ignored - no warning, no indication anything
+    # was even tried, the menu just quietly stayed on whatever the
+    # previous layer picked. A real incident: an operator edited
+    # alpine-zfsboot.console= to a tty with no actual /dev node in this
+    # guest (e.g. no serial0 device attached in Proxmox) via the
+    # pre-boot TAB-interrupt screen, confirmed it, and the menu came up
+    # on tty0 anyway with nothing on screen explaining why their choice
+    # didn't apply. "no /dev/$X node" is deliberately NOT claimed here -
+    # a non-match against $candidates can equally mean the name IS a
+    # real, existing, openable device that just isn't one of
+    # _known_console_names's own small supported set (ttyS3, ttyAMA1,
+    # hvc0, ...) - saying "no such device" would be factually wrong in
+    # that case (a real, issue with the original
+    # wording).
+    if [ -n "$_CONSOLE_SPEC_TTY" ] && [ "$_matched" -eq 0 ]; then
+        msg "WARNING: alpine-zfsboot.console=$pref (from EFI/ALPINE/config) names a console this build doesn't support as /dev/$_CONSOLE_SPEC_TTY (unsupported name, or no such node this boot)"
+        CONSOLE_UNUSABLE="alpine-zfsboot.console=$pref (from EFI/ALPINE/config) names /dev/$_CONSOLE_SPEC_TTY, which is not a supported console name or has no device node this boot"
+    fi
 
-    # Layer 3: UEFI NVRAM (operator's own persisted runtime choice) -
-    # UEFI only, also a fresh read every call.
-    if [ -d "$ROOTFS/sys/firmware/efi" ]; then
-        pref="$(read_efivar_console_pref)"
-        _parse_console_spec "$pref"
-        for tty in $candidates; do
-            if [ "$tty" = "$_CONSOLE_SPEC_TTY" ]; then
-                ACTIVE_TTY="$tty"
-                ACTIVE_CONSOLE_OPTS="$_CONSOLE_SPEC_OPTS"
+    # Layer 3: explicit kernel cmdline - always wins, unconditionally,
+    # every call (ZFSBOOT_CONSOLE_CMDLINE is a single boot-time value
+    # by its own nature - see apply_zfsboot_kv()'s own comment).
+    _parse_console_spec "$ZFSBOOT_CONSOLE_CMDLINE"
+    _matched=0
+    for tty in $candidates; do
+        if [ "$tty" = "$_CONSOLE_SPEC_TTY" ]; then
+            ACTIVE_TTY="$tty"
+            ACTIVE_CONSOLE_OPTS="$_CONSOLE_SPEC_OPTS"
+            _matched=1
+        fi
+    done
+    if [ -n "$_CONSOLE_SPEC_TTY" ] && [ "$_matched" -eq 0 ]; then
+        msg "WARNING: alpine-zfsboot.console=$ZFSBOOT_CONSOLE_CMDLINE (from the kernel cmdline, or the pre-boot TAB-interrupt edit screen) names a console this build doesn't support as /dev/$_CONSOLE_SPEC_TTY (unsupported name, or no such node this boot)"
+        CONSOLE_UNUSABLE="alpine-zfsboot.console=$ZFSBOOT_CONSOLE_CMDLINE (from the cmdline / pre-boot screen) names /dev/$_CONSOLE_SPEC_TTY, which is not a supported console name or has no device node this boot"
+    elif [ -n "$_CONSOLE_SPEC_TTY" ]; then
+        # A valid cmdline override outvotes a bad persisted config value
+        # for this boot - the operator has already chosen a working console.
+        CONSOLE_UNUSABLE=""
+    fi
+}
+
+# _boot_args_interrupt - the actual GRUB-style "press TAB to interrupt"
+# gate: the EARLIEST point of interactivity in this
+# whole script, before attempt_pool_import (see its own call site
+# below), on EVERY boot - an installed disk's own boot-environment boot
+# and a rescue ISO boot both run this exact same /init, so there is no
+# separate "ISO path" vs. "HDD path" to keep in sync here, by
+# construction.
+#
+# Deliberately NOT a second persistence/override mechanism: a confirmed
+# edit here is re-parsed through apply_zfsboot_kv() - the SAME function
+# that already parses both the FAT config file and the real kernel
+# cmdline (see that function's own header comment) - with
+# ZFSBOOT_KV_SOURCE=cmdline, so alpine-zfsboot.console= lands in
+# ZFSBOOT_CONSOLE_CMDLINE, select_console()'s own Layer 3 above. A
+# console (or anything else alpine-zfsboot.*) typed here behaves
+# EXACTLY as if it had been typed on the real kernel cmdline at boot -
+# a genuine, unconditional, full passthrough, not a new precedence rule
+# anywhere. This is the ONE mechanism for changing console on this
+# project now - an earlier version also had a live claim (a tty0
+# keypress/serial "menu"+Enter rerouting an already-running menu),
+# removed by deliberate choice (see select_console()'s own header
+# comment).
+#
+# select_console() must already have run once before this is called
+# (see its own call site below) so ACTIVE_TTY/ACTIVE_CONSOLE_OPTS
+# reflect Layers 1-2 (kernel default, FAT config) - exactly the
+# "default stuff that comes from the EFI config if set, else just
+# default" the edit screen is supposed to show.
+#
+# Split into three single-purpose pieces, same idiom as
+# _parse_console_spec/_apply_console_line_settings above: each one
+# takes its real inputs as explicit arguments or $ROOTFS-prefixed
+# paths, not bare globals/absolute paths, specifically so
+# tests/run-tests.sh can exercise it for real (a real pty for the
+# keypress-timeout piece, a fake $ROOTFS/proc/cmdline for the default-
+# line piece) instead of this whole feature being only a static source
+# check, the class of limitation most of this file's OTHER tty-shaped
+# code is stuck with.
+
+# _boot_args_wait_for_tab TTY_DEV TIMEOUT - polls TTY_DEV for a bare TAB
+# keypress for up to TIMEOUT seconds, redrawing a countdown on the same
+# device each second it waits. Returns 0 (countdown line cleared) the
+# instant TAB is seen, 1 once the timeout elapses untouched (also
+# cleared - never leaves a stale countdown line behind on the ordinary,
+# unattended path).
+# _tty_safe_name TTY_DEV - a filesystem-safe sentinel-file name for
+# TTY_DEV (just "/" -> "_" - these are always "/dev/something" or
+# "$ROOTFS/dev/something" paths, never anything stranger). Plain
+# parameter-expansion character walk, not `tr` - one fewer external
+# binary this early in boot, and this runs on at most a handful of
+# short paths, never a hot loop.
+_tty_safe_name() {
+    s="$1"
+    r=""
+    while [ -n "$s" ]; do
+        c="${s%"${s#?}"}"
+        s="${s#?}"
+        case "$c" in
+            /) r="${r}_" ;;
+            *) r="${r}${c}" ;;
+        esac
+    done
+    echo "$r"
+}
+
+# _boot_args_wait_for_tab TTY_DEVS TIMEOUT - TTY_DEVS is a SPACE-
+# SEPARATED list of /dev/* paths (not a single device - see this
+# function's own caller for why more than one is the ordinary case
+# here, not an edge case). Polls EVERY one of them for a bare TAB
+# keypress, redrawing the same countdown on all of them every second,
+# and returns the instant any one of them sees it.
+#
+# Real CONCURRENT listening, not sequential - a background `read -t
+# TIMEOUT -n 1` per device (not `-t 1`, repeated and summed), each
+# touching its own sentinel file in a private mktemp dir on a TAB
+# match, while this function's own loop just redraws the countdown and
+# polls for a sentinel file once a second. TIMEOUT is therefore the
+# REAL, exact wall-clock delay added to every boot, regardless of how
+# many consoles are registered - a real, reported problem with an
+# earlier, sequential-per-tick version of this function: TIMEOUT *
+# (number of devices) silently turned a requested 15s window into 30s+
+# whenever more than one console was being polled (every build was
+# dual-console by default at the time this was found - see build.sh's
+# own CONSOLE_CMDLINE comment for why that's no longer true - but any
+# operator with a persisted FAT-config serial preference still polls
+# two consoles today, same risk), on every single boot, unattended or
+# not.
+# Background jobs are killed (and reaped via `wait`) the moment a
+# winner is found OR the timeout genuinely elapses, so this never
+# leaves a stray `read` holding a console open past its own return.
+_boot_args_wait_for_tab() {
+    ttys="$1"
+    timeout="$2"
+    # Optional: ports the operator is known to watch (kernel-registered,
+    # configured, or active). On any OTHER port - found only by the blind
+    # sweep - a CR/LF counts as ENTER only if no other byte arrived first,
+    # so a UPS or noisy device streaming status lines (text ending in CR/LF) cannot move the
+    # menu there.
+    trusted="${3:-$1}"
+    tmpdir="$(mktemp -d)"
+    # Fail CLOSED, not open: an unguarded mktemp failure here (ENOSPC,
+    # a read-only /tmp, resource exhaustion - exactly the kind of thing
+    # more likely to be the REASON this is even running, not a rare
+    # unrelated coincidence) used to leave $tmpdir empty, so every
+    # "$tmpdir/$safe" sentinel path below silently became a bare
+    # "/$safe" at the filesystem ROOT - PID 1 runs as root, so that
+    # write could actually succeed there instead of failing loudly,
+    # and a PRE-EXISTING file at that exact root-level path would have
+    # made this function report a false "winner" with no real keypress
+    # ever happening. Skip the whole interactive gate for this boot
+    # instead - the same fail-safe posture this project already uses
+    # elsewhere (e.g. zfs-unlock.sh's own fail-closed passphrase
+    # prompt) - an unattended boot proceeding untouched is always the
+    # safe outcome; a phantom TAB firing because of a tmpdir mix-up is
+    # not.
+    if [ -z "$tmpdir" ] || [ ! -d "$tmpdir" ]; then
+        msg "WARNING: mktemp -d failed - skipping the press-TAB-to-interrupt prompt this boot"
+        return 1
+    fi
+    pids=""
+    for tty_dev in $ttys; do
+        safe="$(_tty_safe_name "$tty_dev")"
+        # A single one-shot `read -n 1` here was a real, reported bug:
+        # it consumes exactly ONE byte and then the backgrounded reader
+        # exits for good - an operator who pressed anything else first
+        # (ESC, a stray key while the VM console window was regaining
+        # focus) silently killed this console's own listener for the
+        # rest of the whole countdown, so a TAB pressed a moment later
+        # landed on nobody. Looping reads until either TAB arrives or
+        # the real deadline (wall-clock, via `date +%s` - not a
+        # decrementing counter, so a read that returns early because
+        # a non-TAB byte arrived doesn't silently grant extra total
+        # time) passes keeps listening for TAB specifically, the whole
+        # window, regardless of what else was typed first.
+        (
+            # `remaining` seeded to the plain, exact `$timeout` for the
+            # FIRST read, not computed from `date +%s` beforehand - a
+            # real, boundary bug otherwise: `date
+            # +%s` has 1-second resolution, and the gap between
+            # computing `deadline` and this first check is real
+            # wall-clock time (a few ms, two separate fork+execs) - if
+            # the real second ticks over in that gap, the first
+            # `remaining` computes as `timeout - 1`, which is exactly
+            # `0` for `alpine-zfsboot.interrupt_timeout=1` (a legal
+            # value per this function's own 0-60 validation above) -
+            # `break` before ever calling `read` even once, silently
+            # skipping this console's entire listening window while
+            # the countdown banner still claims to be waiting. Every
+            # LATER iteration still measures `remaining` against the
+            # real deadline after its own read returns, same as
+            # before - only the very first read is exempted from that
+            # measurement, since nothing has had a chance to tick yet.
+            deadline=$(($(date +%s) + timeout))
+            remaining="$timeout"
+            noisy=0
+            while :; do
+                IFS= read -t "$remaining" -n 1 -r key < "$tty_dev" 2>/dev/null
+                _read_rc=$?
+                [ -n "$key" ] && [ "$key" != "$(printf '\t')" ] && noisy=1
+                if [ "$key" = "$(printf '\t')" ]; then
+                    : > "$tmpdir/$safe"
+                    break
+                fi
+                # being forced to sit out
+                # the WHOLE countdown just to continue, even when
+                # nothing needs changing, is needless waiting - ENTER
+                # should skip straight to the unattended boot instead.
+                # Distinguishing a real Enter from a genuine timeout
+                # (both leave $key empty) needs the read's own exit
+                # status, not just the value: this tty's termios has
+                # `icrnl` on (confirmed via `stty -a` - the default,
+                # never touched by this file), so the kernel translates
+                # an incoming CR to LF before this ever sees it, and
+                # `read -n 1` hitting that line-delimiter byte returns
+                # SUCCESS (rc 0) with an EMPTY key (the delimiter itself
+                # is consumed, not stored) - confirmed directly against
+                # a real pty. A genuine timeout ALSO leaves key empty,
+                # but returns NONZERO. Any OTHER single keystroke
+                # (confirmed: a bare, un-Enter-terminated character
+                # arrives on its own, non-empty key, rc 0 - the same
+                # real pty behavior this whole reader already relies on
+                # for bare TAB) is neither of these and falls through
+                # unchanged - still correctly ignored without ending
+                # this console's own listening window, exactly
+                # preserving the earlier "ESC then TAB" fix (a stray
+                # keystroke before the real one must never kill the
+                # reader).
+                if [ "$_read_rc" -eq 0 ] && [ -z "$key" ] \
+                    && { [ "$noisy" -eq 0 ] || case " $trusted " in *" $tty_dev "*) true ;; *) false ;; esac; }; then
+                    printf '%s\n' "$tty_dev" > "$tmpdir/ENTER_PRESSED"
+                    break
+                fi
+                remaining=$((deadline - $(date +%s)))
+                [ "$remaining" -le 0 ] && break
+            done
+        ) &
+        pids="$pids $!"
+    done
+
+    i=0
+    winner=""
+    while [ "$i" -lt "$timeout" ] && [ -z "$winner" ]; do
+        for tty_dev in $ttys; do
+            printf '\ralpine-zfsboot starting, press TAB to interrupt (%ds) or ENTER to continue now ' \
+                "$((timeout - i))" > "$tty_dev" 2>/dev/null
+        done
+        for tty_dev in $ttys; do
+            if [ -e "$tmpdir/$(_tty_safe_name "$tty_dev")" ]; then
+                winner="$tty_dev"
+                break
+            fi
+        done
+        [ -n "$winner" ] && break
+        # ENTER on ANY listened console collapses the remaining wait to
+        # zero - same outcome as the timeout elapsing naturally (no
+        # winner, unattended boot proceeds), just without actually
+        # waiting for it. Deliberately checked AFTER the per-console
+        # winner check above, same ordering reasoning as everywhere
+        # else in this function: a real TAB always takes priority over
+        # a merely-impatient ENTER if both somehow land the same tick.
+        [ -e "$tmpdir/ENTER_PRESSED" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    # One last check after the loop - a background reader can win in
+    # the final real second before `timeout` itself elapses, which the
+    # `i`-driven loop above may not get to re-poll for.
+    if [ -z "$winner" ]; then
+        for tty_dev in $ttys; do
+            if [ -e "$tmpdir/$(_tty_safe_name "$tty_dev")" ]; then
+                winner="$tty_dev"
+                break
             fi
         done
     fi
 
-    # Layer 4: explicit kernel cmdline - always wins, unconditionally,
-    # every call (ZFSBOOT_CONSOLE_CMDLINE is a single boot-time value
-    # by its own nature - see apply_zfsboot_kv()'s own comment).
-    _parse_console_spec "$ZFSBOOT_CONSOLE_CMDLINE"
-    for tty in $candidates; do
-        if [ "$tty" = "$_CONSOLE_SPEC_TTY" ]; then
-            ACTIVE_TTY="$tty"
-            ACTIVE_CONSOLE_OPTS="$_CONSOLE_SPEC_OPTS"
-        fi
+    for pid in $pids; do kill "$pid" 2>/dev/null; done
+    wait 2>/dev/null
+    for tty_dev in $ttys; do printf '\r%78s\r' "" > "$tty_dev" 2>/dev/null; done
+    enter_dev=""
+    [ -z "$winner" ] && [ -e "$tmpdir/ENTER_PRESSED" ] && enter_dev="$(cat "$tmpdir/ENTER_PRESSED" 2>/dev/null)"
+    rm -rf "$tmpdir"
+    if [ -n "$winner" ]; then
+        echo "$winner"
+        return 0
+    fi
+    # ENTER: no edit screen, but the console it was pressed on is where the
+    # operator is - reported so the caller can make that console the active
+    # one for this boot (same as a TAB there would), rather than silently
+    # booting on a different console than the one being watched.
+    if [ -n "$enter_dev" ]; then
+        echo "$enter_dev"
+        return 2
+    fi
+    return 1
+}
+
+# _boot_args_default_line TTY OPTS - the line pre-filled into the edit
+# screen: every alpine-zfsboot.* token ALREADY on the real kernel
+# cmdline, verbatim (so the operator edits exactly what's really
+# there, nothing synthesized) - plus an explicit console=TTY[,OPTS],
+# only when cmdline didn't already name one itself, so there is always
+# something concrete and correct to look at, never a blank line
+# pretending nothing is configured. TTY/OPTS are passed in explicitly
+# by the caller (_boot_args_interrupt(), from _boot_args_wait_for_tab()'s
+# own winning device) - NOT read from ACTIVE_TTY/ACTIVE_CONSOLE_OPTS,
+# since the operator may have pressed TAB on a DIFFERENT console than
+# the one select_console() would otherwise have picked as primary (the
+# real incident this whole multi-console poll exists for: kernel
+# default was ttyS0, the operator was watching tty0 over VGA). Echoes
+# the line; reads $ROOTFS/proc/cmdline (same ROOTFS-prefix convention
+# the real cmdline-parsing loop near the top of this file already
+# uses).
+_boot_args_default_line() {
+    tty="$1"
+    opts="$2"
+    default_line=""
+    for arg in $(cat "$ROOTFS/proc/cmdline" 2>/dev/null); do
+        case "$arg" in
+            alpine-zfsboot.*) default_line="$default_line $arg" ;;
+        esac
     done
+    # A real, gap: synthesizing a console= default
+    # for a tty select_console() will NEVER actually recognize (see
+    # _known_console_names's own comment - e.g. an operator editing
+    # from a kernel-registered hvc0) handed back a default line that,
+    # confirmed completely unchanged, immediately triggers the
+    # reject/force yesno about the very console the operator is
+    # reading it on - a guaranteed, confusing dead end for the one
+    # case (editing from an unsupported-but-real console) this synthesis
+    # was supposed to make convenient. Leaving console= out of the
+    # default line entirely here is strictly safer than proposing a
+    # value already known to be rejected - an operator who wants to set
+    # one can still type it by hand, informed by
+    # notify_inactive_consoles()'s own matching fix for this same gap.
+    case " $default_line " in
+        *" alpine-zfsboot.console="*) : ;;
+        *)
+            _is_known_console_name "$tty" && default_line="$default_line alpine-zfsboot.console=$tty${opts:+,$opts}"
+            ;;
+    esac
+    echo "${default_line# }"
+}
+
+_boot_args_interrupt() {
+    # Every REGISTERED console (same source notify_inactive_consoles()
+    # uses, same reasoning - see that function's own comment: these are
+    # the ones the kernel's own console= parsing already gave correct
+    # line settings to), PLUS _extra_relevant_consoles() (see its own
+    # comment - the persisted FAT-config preference AND the
+    # already-resolved $ACTIVE_TTY, even when NOT kernel-registered) -
+    # NOT just whichever one select_console() picked as primary. Real
+    # incident that found the "registered only" gap the hard way: a
+    # VGA-only Proxmox console, kernel default (back when this build
+    # still baked a second, unconfigured console= onto every cmdline -
+    # see build.sh's own CONSOLE_CMDLINE comment on why it no longer
+    # does) resolved to ttyS0, so a single-console prompt here printed
+    # on ttyS0 only - invisible to an operator who only ever had tty0.
+    # The build itself now bakes in ONLY tty0 by default, so that
+    # specific incident shape can't recur from the default build alone -
+    # but an operator who HAS configured a real serial console (FAT
+    # config, or an explicit cmdline/EXTRA_CMDLINE override) still
+    # deserves to see this prompt there too, not just on tty0. No
+    # separate "real boot only" ROOTFS guard needed (unlike this
+    # function's own earlier, single-console version) - under
+    # tests/run-tests.sh, a fake $ROOTFS/dev/$tty that isn't a real
+    # char device (or no $ROOTFS/sys/class/tty/console/active at all,
+    # and no extra console either) naturally makes $ttys empty, and the
+    # very next line already returns 0 for that; a test that DOES want
+    # to exercise this for real symlinks a fake $ROOTFS/dev/<name> at a
+    # real pty instead (see tests/run-tests.sh's own note on that).
+    #
+    # `-c` (node exists) alone, like round 2's own first attempt at the
+    # TAB-typed-value check, was a real, bug here
+    # too: a PORT_UNKNOWN node (exists, opens fine, every actual read
+    # fails EIO) got added to the poll list, and the backgrounded
+    # reader's own retry loop (see _boot_args_wait_for_tab's own
+    # comment) then spins at full speed for the ENTIRE countdown - read
+    # fails instantly, doesn't match TAB, loop immediately re-reads -
+    # measured directly at several THOUSAND iterations/second in PID
+    # 1's own child. A a later review found this exact bug had only
+    # ever been fixed on _extra_relevant_consoles()'s own side (the
+    # `stty -g` gate there) - this registered-console loop, right next
+    # to it, still only checked `-c`. The legacy 8250 UART driver
+    # registers every nr_uarts line as PORT_UNKNOWN whether or not real
+    # hardware is behind it, so a kernel cmdline naming more serial
+    # consoles than physically exist can register a genuinely dead one
+    # here just as easily as the FAT-pref/cmdline path could. Same gate
+    # now applied to both.
+    ttys=""
+    for tty in $(cat "$ROOTFS/sys/class/tty/console/active" 2>/dev/null); do
+        [ -c "$ROOTFS/dev/$tty" ] || continue
+        ( stty -g < "$ROOTFS/dev/$tty" ) >/dev/null 2>&1 || continue
+        ttys="$ttys $ROOTFS/dev/$tty"
+    done
+    trusted="$ttys"
+    _parse_console_spec "$(read_fat_console_pref)"
+    _fat_t="$_CONSOLE_SPEC_TTY"
+    for tty in $(_extra_relevant_consoles); do
+        case " $ttys " in
+            *" $ROOTFS/dev/$tty "*) : ;;
+            *) ttys="$ttys $ROOTFS/dev/$tty" ;;
+        esac
+        { [ "$tty" = "$ACTIVE_TTY" ] || [ "$tty" = "$_fat_t" ]; } && trusted="$trusted $ROOTFS/dev/$tty"
+    done
+    ttys="${ttys# }"
+    [ -n "$ttys" ] || return 0
+
+    # Validated HERE, at use time, not where it's parsed - same
+    # established convention as bootcheck_max's own validation (see
+    # attempt_pool_import()'s own comment on that) - a malformed
+    # alpine-zfsboot.interrupt_timeout= (a typo, a CR-mangled hand-edit
+    # of the ESP config) must never reach the arithmetic/comparison
+    # inside _boot_args_wait_for_tab() unvalidated: that runs in PID 1
+    # itself, before pool import, on every single boot - a crash there
+    # is far worse than a crash almost anywhere else in this file.
+    case "$BOOT_ARGS_TIMEOUT" in
+        ''|*[!0-9]*)
+            [ -n "$BOOT_ARGS_TIMEOUT" ] && msg "WARNING: invalid alpine-zfsboot.interrupt_timeout=$BOOT_ARGS_TIMEOUT, using the default (15)"
+            BOOT_ARGS_TIMEOUT=15
+            ;;
+        *)
+            if [ "$BOOT_ARGS_TIMEOUT" -gt 60 ]; then
+                msg "WARNING: alpine-zfsboot.interrupt_timeout=$BOOT_ARGS_TIMEOUT out of range (0-60), using the default (15)"
+                BOOT_ARGS_TIMEOUT=15
+            fi
+            ;;
+    esac
+    [ "$BOOT_ARGS_TIMEOUT" -eq 0 ] && return 0
+
+    # show which console is ALREADY active
+    # and WHERE that choice came from, printed once (a plain newline-
+    # terminated line, not part of the repeating \r-redrawn countdown
+    # _boot_args_wait_for_tab() prints below it) before the countdown
+    # starts - so an operator watching any listened console immediately
+    # understands "this is what's configured, TAB here to change it"
+    # instead of having to infer it from silence or trial and error.
+    # Re-derived here rather than tracked as new global state from
+    # select_console() - same values that function itself already
+    # computed from, just asked again for display purposes.
+    _parse_console_spec "$ZFSBOOT_CONSOLE_CMDLINE"
+    if [ -n "$_CONSOLE_SPEC_TTY" ] && [ "$_CONSOLE_SPEC_TTY" = "$ACTIVE_TTY" ]; then
+        _console_source="cmdline/TAB-interrupt, this boot only"
+    else
+        _parse_console_spec "$(read_fat_console_pref)"
+        if [ -n "$_CONSOLE_SPEC_TTY" ] && [ "$_CONSOLE_SPEC_TTY" = "$ACTIVE_TTY" ]; then
+            _console_source="EFI/ALPINE/config, persisted"
+        else
+            _console_source="kernel default"
+        fi
+    fi
+    for tty_dev in $ttys; do
+        printf 'alpine-zfsboot: current console is /dev/%s (%s)\n' \
+            "$ACTIVE_TTY" "$_console_source" > "$tty_dev" 2>/dev/null
+    done
+
+    tty_dev="$(_boot_args_wait_for_tab "$ttys" "$BOOT_ARGS_TIMEOUT" "$trusted")"
+    _wait_rc=$?
+    [ "$_wait_rc" -eq 1 ] && return 0
+
+    # The console that ACTUALLY got the keypress, not necessarily
+    # ACTIVE_TTY - if they match, ACTIVE_CONSOLE_OPTS is the real,
+    # already-resolved line settings; otherwise a bare name is correct
+    # (every registered console already has correct line settings from
+    # the kernel's own console= parsing - see _apply_console_line_settings's
+    # own comment on why a bare name for an already-registered console
+    # needs no explicit options at all).
+    tty="${tty_dev##*/}"
+    opts=""
+    if [ "$tty" = "$ACTIVE_TTY" ]; then
+        opts="$ACTIVE_CONSOLE_OPTS"
+    else
+        # A persisted EFI/ALPINE/config console that a cmdline override
+        # outvoted still has its own configured line options; without them
+        # the main loop would reset that unregistered line to 115200.
+        _parse_console_spec "$(read_fat_console_pref)"
+        [ "$_CONSOLE_SPEC_TTY" = "$tty" ] && opts="$_CONSOLE_SPEC_OPTS"
+    fi
+
+    # ENTER (rc 2): continue without the edit screen, but on the console
+    # ENTER was pressed on. Pressing ENTER on a
+    # serial console while the default was tty0 booted the menu on tty0 -
+    # where nobody was looking. Applied exactly like a confirmed edit
+    # (cmdline layer, this boot only) - and only when it actually differs
+    # from what is already active, so a plain ENTER on the right console
+    # changes nothing.
+    if [ "$_wait_rc" -eq 2 ]; then
+        # Only a name select_console() can actually select: ENTER on a
+        # registered-but-unsupported console (hvc0) would otherwise log a
+        # WARNING every loop pass and leave the menu elsewhere.
+        if [ "$tty" != "$ACTIVE_TTY" ] && _is_known_console_name "$tty"; then
+            ZFSBOOT_KV_SOURCE=cmdline
+            apply_zfsboot_kv "alpine-zfsboot.console=$tty${opts:+,$opts}"
+            ZFSBOOT_KV_SOURCE=""
+        fi
+        return 0
+    fi
+
+    # TERM for the dialog calls below specifically - nothing sets $TERM
+    # at all until the main loop runs, well after this function
+    # returns - plus real terminal geometry for a serial winner, since
+    # a raw serial line carries no window-size negotiation of its own
+    # (same "TIOCGWINSZ can report 0x0/stale" problem the main loop's
+    # own comment, further down, documents and fixes for ITS OWN dialog
+    # calls, once a console is actually selected). A gap here
+    # would be easy to miss: tty0, where both of these are already
+    # correct, is the usual place to press TAB, so a serial winner is the
+    # path that needs them. No extra baud/parity call is needed here
+    # though - every possible winner already has correct line settings
+    # by this point, either from the kernel's own console= parsing
+    # (anything from the kernel-registered loop above) or from this
+    # function's own fix, above, for the FAT-pref case specifically.
+    case "$tty" in
+        tty0) dialog_term=linux ;;
+        *)
+            dialog_term=ansi
+            stty rows 24 cols 80 < "$tty_dev" > "$tty_dev" 2>/dev/null
+            ;;
+    esac
+
+    default_line="$(_boot_args_default_line "$tty" "$opts")"
+    # $ROOTFS-prefixed (empty at a real boot, so byte-identical to the
+    # old hardcoded /tmp/alpine-zfsboot/boot-args-edit there) rather
+    # than hardcoded - lets tests exercise this for real against a fake
+    # root instead of only via a static source check, and can never
+    # collide with an unrelated file some OTHER program left sitting at
+    # the real, bare /tmp/alpine-zfsboot path.
+    out_file="$ROOTFS/tmp/alpine-zfsboot/boot-args-edit"
+    mkdir -p "${out_file%/*}" 2>/dev/null
+    # A console= that names no real /dev node is never applied silently
+    # - it's rejected, with the operator given an explicit choice: fix
+    # it (same inputbox, edits preserved - "edit again"), or confirm
+    # they genuinely want it anyway (the device may appear later, e.g.
+    # after a hotplug) via a real, separate confirmation, never a
+    # default. Two things this is DELIBERATELY not: (1) a prior version
+    # of this screen applied the bad value anyway and just noted
+    # "falling back to the kernel default" - a typo got silently
+    # swallowed and dressed up as a warning, exactly what an operator
+    # pressing TAB to take control does NOT want; (2) a hard block with
+    # no way out at all - an operator who knows the device will exist
+    # later needs an explicit way to say so. --yesno (not --yes-label/
+    # --no-label, whose availability in whatever dialog build ships
+    # here isn't confirmed - a silently-unrecognized flag would exit
+    # non-zero and make "force" permanently unreachable) with the
+    # question itself spelling out what each button means, so plain
+    # "Yes"/"No" labels are unambiguous either way. select_console()'s
+    # own boot-log WARNING (see its comment) still fires for a forced
+    # console that never shows up - that's not the silent fallback this
+    # replaces, it's the exact on-screen confirmation the operator asked
+    # for to know their forced choice didn't pan out.
+    while :; do
+        TERM="$dialog_term" dialog --ascii-lines --backtitle "alpine-zfsboot" --inputbox \
+            "Boot arguments (alpine-zfsboot.key=value, space-separated - this boot only; edit EFI/ALPINE/config on the ESP to persist):" \
+            10 70 "$default_line" \
+            < "$tty_dev" > "$tty_dev" 2>"$out_file"
+        status=$?
+        edited="$(cat "$out_file" 2>/dev/null)"
+        rm -f "$out_file"
+        TERM="$dialog_term" clear > "$tty_dev" 2>/dev/null || true
+        [ "$status" -eq 0 ] || return 0
+
+        typed_console=""
+        for arg in $edited; do
+            case "$arg" in
+                alpine-zfsboot.console=*) typed_console="${arg#alpine-zfsboot.console=}" ;;
+            esac
+        done
+        if [ -n "$typed_console" ]; then
+            _parse_console_spec "$typed_console"
+            # A real, reported bug: checking only `-c` (the node
+            # EXISTS) let a device through here that the main loop's
+            # own later open-test (see its comment, further down -
+            # `stty -g`, not just a bare existence check, because
+            # /dev/ttyS1-3-shaped nodes commonly exist with no real
+            # UART behind them - PORT_UNKNOWN, confirmed on real
+            # hardware AND on a real Proxmox guest's unattached
+            # serial0) then silently rejected anyway, with nothing but
+            # a kmsg line to explain it - the exact "accepted here,
+            # silently dropped two screens later" mismatch an operator
+            # has no way to notice in time. Using the SAME `stty -g`
+            # test here that decides it later means this screen's
+            # yes/no choice is the actual, final answer - not a weaker
+            # pre-check that can still be overruled downstream without
+            # telling anyone.
+            #
+            # A SECOND, instance of the exact same
+            # "accepted here, dropped there" shape: `stty -g` alone
+            # accepts ANY openable device, but select_console()'s own
+            # candidate list (_known_console_names, see its own
+            # comment) only ever recognizes a small, fixed set of
+            # names. A genuinely live, openable ttyS3/ttyAMA1/hvc0
+            # would pass THIS check, get applied, and then get dropped
+            # by select_console() anyway - with a warning that
+            # incorrectly claims the device doesn't exist, when it does
+            # and works fine, it's just a name this build doesn't treat
+            # as a console candidate at all. Checking the same name
+            # list here too means this screen's choice is final either
+            # way, and an operator who hits this gets the honest
+            # force-or-edit choice instead of a confusing, factually
+            # wrong warning two screens later.
+            if [ -n "$_CONSOLE_SPEC_TTY" ] && { ! _is_known_console_name "$_CONSOLE_SPEC_TTY" || ! ( stty -g < "$ROOTFS/dev/$_CONSOLE_SPEC_TTY" ) >/dev/null 2>&1; }; then
+                TERM="$dialog_term" dialog --ascii-lines --backtitle "alpine-zfsboot" --yesno \
+                    "/dev/$_CONSOLE_SPEC_TTY isn't usable this boot (not a supported console name, missing, or present but not openable) - alpine-zfsboot.console=$typed_console names it anyway.\n\nYes = use it anyway (if it still cannot be opened after pool import, the boot stops in the recovery shell)\nNo  = go back and edit" \
+                    10 70 < "$tty_dev" > "$tty_dev" 2>/dev/null
+                force=$?
+                TERM="$dialog_term" clear > "$tty_dev" 2>/dev/null || true
+                if [ "$force" -ne 0 ]; then
+                    default_line="$edited"
+                    continue
+                fi
+            fi
+        fi
+        break
+    done
+
+    ZFSBOOT_KV_SOURCE=cmdline
+    for arg in $edited; do
+        apply_zfsboot_kv "$arg"
+    done
+    ZFSBOOT_KV_SOURCE=""
 }
 
 # Remote rescue access is NOT started here unconditionally anymore -
@@ -1231,6 +2100,19 @@ fi
 export ALPINE_ZFSBOOT_FORCED_RESCUE
 }
 
+# select_console() resolves Layers 1-2 (kernel default, FAT config) so
+# ACTIVE_TTY/ACTIVE_CONSOLE_OPTS reflect the real, already-resolved
+# default BEFORE _boot_args_interrupt() runs - it needs that for its
+# own default-line suggestion (see its own comment), even though it
+# polls/prints on every registered console, not just this one. Its own
+# Layer 3 read (cmdline) is a harmless no-op this early (cmdline was
+# already parsed above, nothing has changed since). The main loop below
+# calls select_console() again itself before ever actually attaching
+# to a console - this first call is only for _boot_args_interrupt()'s
+# own benefit.
+select_console
+_boot_args_interrupt
+
 attempt_pool_import
 
 # Worth importing any OTHER pool that's reachable right now too (e.g.
@@ -1249,21 +2131,13 @@ export ALPINE_ZFSBOOT_MENU_TIMEOUT="$MENU_TIMEOUT"
 export ALPINE_ZFSBOOT_MENU_GRACE="$MENU_GRACE"
 
 # menu.py always runs now (see this file's own header comment) - the
-# loop, not a single run, is what makes menu.py's own switch_console()
-# a REAL, live switch rather than "takes effect next reboot": exit
-# code 42 is a deliberate, specific signal from there ("restart me
-# attached to a different console" - the preference itself was already
-# written, by switch_console(), to whichever store this firmware
-# actually uses - UEFI NVRAM or the ESP's own config file, see that
-# function's own docstring), not a crash - select_console()'s own
-# fresh read_fat_console_pref()/read_efivar_console_pref() calls pick
-# up that just-written preference on the next iteration (see
-# select_console()'s own header comment for why these have to be
-# fresh reads, not cached values), and re-running the exec redirect
-# below re-attaches stdin/stdout/stderr to whichever tty that now is.
-# Any OTHER exit (0, or nonzero from a real crash) breaks out and
-# falls through to automatic boot below, exactly as a crash always
-# has.
+# loop, not a single run, is what makes recovery_shell()'s own exit(43)
+# convention (see its own comment there and in the case statement
+# below) actually re-run attempt_pool_import() and come back around to
+# a fresh menu.py, rather than needing a full reboot to see a pool fix
+# made by hand. Any OTHER exit (0, or nonzero from a real crash) breaks
+# out and falls through to automatic boot below, exactly as a crash
+# always has.
 while :; do
     select_console
     # Real boot only (bare /dev, no $ROOTFS prefix) - under
@@ -1272,7 +2146,7 @@ while :; do
     # meaningful, so it's skipped there; the test only needs
     # ACTIVE_TTY itself, not the physical redirect.
     if [ -z "$ROOTFS" ]; then
-        # A Fable-model adversarial review of the operator-remote-
+        # A adversarial review of the operator-remote-
         # console-selection feature (select_console()'s own layers 2-4)
         # found a real, serious hole this closes: `exec <
         # "/dev/$ACTIVE_TTY"` below is the actual `exec` special
@@ -1283,47 +2157,64 @@ while :; do
         # (PORT_UNKNOWN, confirmed against a real system's own
         # /sys/class/tty/ttyS*/type) - select_console()'s own candidate
         # filter only checks the node EXISTS, not that opening it
-        # actually works. An operator who persists
-        # alpine-zfsboot.console= naming such a node (a typo, or a port
-        # that's real on one box in the fleet but not another) would
-        # kill /init outright - a kernel panic loop on unattended
-        # physical hardware, worse than the silent-console problem this
-        # whole feature exists to fix.
+        # actually works. PID 1 exiting for ANY reason is an
+        # unrecoverable "Attempted to kill init!" kernel panic, not a
+        # survivable error - this file never bare-`exec`s onto a device
+        # it hasn't already open-tested in a subshell first (a
+        # redirection failure inside `( ... )` only fails THAT
+        # subshell, not this one - confirmed directly: `busybox ash -c
+        # 'exec < /nonexistent; echo SURVIVED'` never prints and exits
+        # nonzero, but wrapping the same redirection in a subshell
+        # first and checking its exit status does not bring this shell
+        # down).
         #
         # PR #16 review (F1), confirmed against a real kernel: a plain
         # `: < "/dev/$tty"` open only fails for a node with no driver
         # registered at all (ENXIO) - it SUCCEEDS on exactly the
         # PORT_UNKNOWN case this comment describes (8250 registers all
         # nr_uarts lines as PORT_UNKNOWN nodes that open fine; only
-        # writes/ioctls on them return EIO). So the open-test used to
-        # pass on a dead line, /init would `exec` onto it anyway, and
-        # the operator got a silent auto-boot (menu.py's own writes and
-        # its error handler's print both fail on a EIO tty, so it exits
-        # 120, and /init's loop treats that as "fall through to
-        # automatic boot") - not the kernel-panic-loop this comment
-        # originally described, but still the wrong outcome. `stty -g`
-        # actually exercises the line (a termios ioctl), so it fails
-        # with EIO on PORT_UNKNOWN too, while still succeeding on tty0,
-        # ptys, and a real working UART. A subshell for the same reason
-        # as before (redirection failure inside `( ... )` only fails
-        # THAT subshell, not this one - confirmed the difference
-        # directly: `busybox ash -c 'exec < /nonexistent; echo
-        # SURVIVED'` never prints and exits nonzero, but wrapping the
-        # same redirection in a subshell first and checking its exit
-        # status does not bring this shell down) falls back to
-        # KERNEL_ACTIVE_TTY - the one candidate guaranteed to work,
-        # since select_console() derived it from the kernel's own
-        # already-live /dev/console. ACTIVE_CONSOLE_OPTS is reset too
-        # (same review, second finding): otherwise the dead tty's own
-        # line options (e.g. a operator-chosen 9600n7) would get applied
-        # to the fallback kernel console below instead of being dropped
-        # with the tty that carried them.
-        if ! ( stty -g < "/dev/$ACTIVE_TTY" >/dev/null 2>&1 ); then
-            msg "WARNING: /dev/$ACTIVE_TTY (the selected console) could not be opened - falling back to $KERNEL_ACTIVE_TTY"
-            ACTIVE_TTY="$KERNEL_ACTIVE_TTY"
-            ACTIVE_CONSOLE_OPTS=""
+        # writes/ioctls on them return EIO). `stty -g` actually
+        # exercises the line (a termios ioctl), so it fails with EIO on
+        # PORT_UNKNOWN too, while still succeeding on tty0, ptys, and a
+        # real working UART.
+        #
+        # An earlier version of this block, on open-test failure,
+        # silently substituted KERNEL_ACTIVE_TTY (the kernel's own live
+        # /dev/console, guaranteed to work) and continued a normal boot
+        # there instead - 
+        # that is exactly the same "configured one console, booted
+        # silently on a different one" shape this whole console-
+        # selection feature exists to eliminate everywhere else (the
+        # Netcup incident; an earlier ttyS0-accepted-but-tty0-
+        # shown bug). An operator who configured ttyS0 specifically
+        # because THAT's the channel they're actually watching (SOL,
+        # IPMI) would see nothing at all, while bootcheck/rc.log record
+        # an ordinary successful boot on tty0 instead - invisible
+        # failure, not a safe recovery. The design principle: no silent surprises, and exactly ONE
+        # recovery path for a boot that can't do what it was told -
+        # the rescue-SSH/recovery-shell route die() already provides
+        # (start_rescue_ssh if staged, _recovery_shell either way, PID
+        # 1 survives) - not a second, quieter path that tries to paper
+        # over the problem instead of surfacing it. Physical/unattended
+        # hardware is expected to carry its own independent out-of-band
+        # access (Serial-over-LAN, a hosting provider's own rescue
+        # mode) for exactly this case; alpine-zfsboot.console= is
+        # expected to always be kept pointed at a channel that actually
+        # works, not discovered-and-corrected at boot time.
+        # One rule for every way an operator-chosen console can fail
+        # (missing node, unsupported name, present-but-dead node): stop in
+        # die() (rescue SSH + recovery shell), never boot on a different
+        # console than the one that was asked for.
+        if [ -n "$CONSOLE_UNUSABLE" ]; then
+            die "$CONSOLE_UNUSABLE - not falling back to a different console silently; fix alpine-zfsboot.console= (EFI/ALPINE/config on the ESP) via the rescue-SSH/recovery-shell session this just started, or via its own out-of-band access (Serial-over-LAN, rescue mode)"
         fi
+        if ! ( stty -g < "/dev/$ACTIVE_TTY" >/dev/null 2>&1 ); then
+            die "/dev/$ACTIVE_TTY (the selected console) could not be opened - not falling back to a different console silently; fix alpine-zfsboot.console= (EFI/ALPINE/config on the ESP) via the rescue-SSH/recovery-shell session this just started, or via its own out-of-band access (Serial-over-LAN, rescue mode)"
+        fi
+        notify_inactive_consoles
         exec < "/dev/$ACTIVE_TTY" > "/dev/$ACTIVE_TTY" 2>&1
+    else
+        notify_inactive_consoles
     fi
 
     # dialog (menu.py's own rendering - see its header comment) needs
@@ -1375,16 +2266,19 @@ while :; do
             # console"), but bytes written at the wrong baud rate over a
             # real serial line are exactly as invisible to a fixed-rate
             # remote listener as if nothing had been sent at all. Setting
-            # 115200n8 explicitly - the same rate CONSOLE_CMDLINE already
-            # hardcodes for its own baked-in serial console, and the
-            # near-universal default for IPMI/BMC SOL implementations -
-            # makes an operator-chosen console usable WITHOUT a
-            # hardware-specific rebuild: one generic image, any real
-            # ttyS*/ttyAMA* an operator names via the FAT config/NVRAM/
-            # cmdline layers just works, matching the whole point of
-            # those three layers existing at all. A no-op, not a risk, on
-            # a tty that's already at this rate (e.g. ttyS0, already
-            # configured this way by the kernel's own console= handling).
+            # 115200n8 explicitly - the near-universal default for
+            # IPMI/BMC SOL implementations (and what CONSOLE_CMDLINE
+            # itself used to hardcode, back when it baked in a serial
+            # console at all - see build.sh's own CONSOLE_CMDLINE
+            # comment for why it no longer does) - makes an operator-
+            # chosen console usable WITHOUT a hardware-specific rebuild:
+            # one generic image, any real ttyS*/ttyAMA* an operator
+            # names via the FAT config/cmdline layers just works,
+            # matching the whole point of those layers existing at all.
+            # A no-op, not a risk, on a tty that's already at this rate
+            # (e.g. an explicit real kernel console=ttyS0,115200n8, via
+            # EXTRA_CMDLINE or firmware LoadOptions, already configured
+            # this way by the kernel's own console= handling).
             #
             # Not always 115200n8 unconditionally though - an operator
             # whose real hardware genuinely needs a different rate can
@@ -1461,12 +2355,7 @@ while :; do
     # costs a fallback to automatic boot, never a full reboot cycle.
     python3 /menu.py
     menu_rc=$?
-    # 42: switch_console()'s own long-established "relaunch me" signal
-    # (see this loop's own header comment) - console preference was
-    # already persisted, select_console() picks it up fresh next
-    # iteration, nothing else to do here.
-    #
-    # 43: recovery_shell()'s own NEW signal (see its own comment in
+    # 43: recovery_shell()'s own signal (see its own comment in
     # menu.py) - the operator was in there specifically because
     # POOL_IMPORT_ERROR was set, and may have just fixed the real
     # underlying problem by hand (the exact real case this exists for:
@@ -1480,7 +2369,6 @@ while :; do
     # whole fix; menu.py itself needed no change beyond deciding when
     # to ask for this.
     case "$menu_rc" in
-        42) ;;
         43) attempt_pool_import ;;
         *) break ;;
     esac
