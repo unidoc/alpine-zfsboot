@@ -1918,7 +1918,7 @@ func newInstallCmd() *cobra.Command {
 	var efiFile, efiURL string
 	var stage1File, stage1URL, stage2File, stage2URL string
 	var kernelFile, kernelURL, initrdFile, initrdURL, cmdlineFile, cmdlineURL string
-	var sshKey, net, ipv4, ipv4Address, ipv4Gateway, ipv6, ipv6Address, ipv6Gateway, sshListen, sshPort, sshAllow string
+	var sshKey, net, ipv4, ipv4Address, ipv4Gateway, ipv6, ipv6Address, ipv6Gateway, sshListen, sshPort, sshAllow, console string
 
 	cmd := &cobra.Command{
 		Use:   "install <disk>",
@@ -1975,6 +1975,7 @@ should use (its own USE_UEFI) and must pass it explicitly.`,
 				Net: net, IPv4: ipv4, IPv4Address: ipv4Address, IPv4Gateway: ipv4Gateway,
 				IPv6: ipv6, IPv6Address: ipv6Address, IPv6Gateway: ipv6Gateway,
 				SSHListen: sshListen, SSHPort: sshPort, SSHAllow: sshAllow,
+				Console: console,
 			}
 
 			if uefi {
@@ -2015,6 +2016,7 @@ should use (its own USE_UEFI) and must pass it explicitly.`,
 	cmd.Flags().StringVar(&ipv6, "ipv6", "", "alpine-zfsboot.ipv6=")
 	cmd.Flags().StringVar(&ipv6Address, "ipv6-address", "", "alpine-zfsboot.ipv6.address=")
 	cmd.Flags().StringVar(&ipv6Gateway, "ipv6-gateway", "", "alpine-zfsboot.ipv6.gateway=")
+	cmd.Flags().StringVar(&console, "console", "", "alpine-zfsboot.console= persisted default (e.g. tty0, ttyS0,115200n8) - change later by re-running install, or override for a single boot with the pre-boot 'press TAB to interrupt' screen")
 	cmd.Flags().StringVar(&sshListen, "ssh-listen", "", "alpine-zfsboot.ssh.listen=")
 	cmd.Flags().StringVar(&sshPort, "ssh-port", "", "alpine-zfsboot.ssh.port=")
 	cmd.Flags().StringVar(&sshAllow, "ssh-allow", "", "alpine-zfsboot.ssh.allow=")

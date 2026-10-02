@@ -189,6 +189,23 @@ type Config struct {
 	SSHListen   string
 	SSHPort     string
 	SSHAllow    string
+
+	// Console follows this package's usual "we own this file, full
+	// stop" model like every other field here - nothing at runtime
+	// writes to EFI/ALPINE/config at all anymore (an earlier design had
+	// menu.py's own switch_console() do a live read-modify-write of
+	// this one line; removed by deliberate choice - see init/init's own
+	// select_console() comment for the final, settled console-selection
+	// design). A one-boot-only console override instead goes through
+	// the pre-boot "press TAB to interrupt" screen (ephemeral, never
+	// written here) - this field is purely the PERSISTED default,
+	// written once at install time (by this tool) or by hand-editing
+	// the file directly, nothing else ever touches it. CONSOLE_CMDLINE
+	// itself is tty0-only on every build now (see build.sh's own
+	// comment) - no serial console= is ever baked in, so leaving this
+	// field unset simply means tty0, not an ambiguous "whichever
+	// console=build.sh happened to list last" the way it once did.
+	Console string
 }
 
 // render produces EFI/ALPINE/config's own exact key=value line
@@ -207,6 +224,7 @@ func (c Config) render() []byte {
 		{"alpine-zfsboot.ssh.listen", c.SSHListen},
 		{"alpine-zfsboot.ssh.port", c.SSHPort},
 		{"alpine-zfsboot.ssh.allow", c.SSHAllow},
+		{"alpine-zfsboot.console", c.Console},
 	} {
 		if kv.value == "" {
 			continue

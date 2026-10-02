@@ -163,6 +163,7 @@ func TestConfigRender(t *testing.T) {
 				Net: "static", IPv4: "static", IPv4Address: "10.0.0.5/24", IPv4Gateway: "10.0.0.1",
 				IPv6: "static", IPv6Address: "fd00::5/64", IPv6Gateway: "fe80::1",
 				SSHListen: "0.0.0.0", SSHPort: "22", SSHAllow: "10.0.0.0/8",
+				Console: "ttyS0,115200n8",
 			},
 			want: "alpine-zfsboot.net=static\n" +
 				"alpine-zfsboot.ipv4=static\n" +
@@ -173,7 +174,17 @@ func TestConfigRender(t *testing.T) {
 				"alpine-zfsboot.ipv6.gateway=fe80::1\n" +
 				"alpine-zfsboot.ssh.listen=0.0.0.0\n" +
 				"alpine-zfsboot.ssh.port=22\n" +
-				"alpine-zfsboot.ssh.allow=10.0.0.0/8\n",
+				"alpine-zfsboot.ssh.allow=10.0.0.0/8\n" +
+				"alpine-zfsboot.console=ttyS0,115200n8\n",
+		},
+		{
+			// The real motivating case: an install-time persisted default
+			// for the ONE machine being installed, not a global
+			// CONSOLE_CMDLINE rebuild - see Config.Console's own doc
+			// comment for the full reasoning.
+			name: "console alone",
+			cfg:  Config{Console: "tty0"},
+			want: "alpine-zfsboot.console=tty0\n",
 		},
 	}
 	for _, tc := range cases {

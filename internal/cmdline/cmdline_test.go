@@ -2,7 +2,12 @@ package cmdline
 
 import "testing"
 
-func TestParseVga(t *testing.T) {
+// Console used to be a 3-way "vga"/"serial"/"auto" classifier matching
+// a build-time CONSOLE_NAME choice that no longer exists (see
+// consoleFromCmdline()'s own comment in cmdline.go) - these tests now
+// assert the real, verbatim console= value(s) instead.
+
+func TestParseTty0Only(t *testing.T) {
 	raw := []byte("console=tty0 root=ZFS=zroot/ROOT/alpine ro quiet kexec_load_disabled=0 alpine-zfsboot.pool=zroot alpine-zfsboot.timeout=10 alpine-zfsboot.version=0.1.0 alpine-zfsboot.buildstamp=20260910T003200Z\x00\x00\x00")
 	info, err := parse("x86_64", raw, "test.EFI")
 	if err != nil {
@@ -11,8 +16,8 @@ func TestParseVga(t *testing.T) {
 	if info.Arch != "x86_64" {
 		t.Errorf("Arch = %q, want x86_64", info.Arch)
 	}
-	if info.Console != "vga" {
-		t.Errorf("Console = %q, want vga", info.Console)
+	if info.Console != "tty0" {
+		t.Errorf("Console = %q, want tty0", info.Console)
 	}
 	if info.Version != "0.1.0" {
 		t.Errorf("Version = %q, want 0.1.0", info.Version)
@@ -25,25 +30,31 @@ func TestParseVga(t *testing.T) {
 	}
 }
 
-func TestParseSerial(t *testing.T) {
+func TestParseSerialOnly(t *testing.T) {
+	// Not what build.sh's own default case statement produces anymore
+	// (tty0-only, every arch - see its own CONSOLE_CMDLINE comment),
+	// but parse() itself must still handle whatever a real .cmdline
+	// section actually contains, verbatim - a hand-edited build.sh, or
+	// an older .EFI built before today, could still carry this.
 	raw := []byte("console=ttyS0,115200n8 root=ZFS=zroot/ROOT/alpine ro alpine-zfsboot.buildstamp=20260910T003200Z\x00")
 	info, err := parse("aarch64", raw, "test.EFI")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if info.Console != "serial" {
-		t.Errorf("Console = %q, want serial", info.Console)
+	if info.Console != "ttyS0,115200n8" {
+		t.Errorf("Console = %q, want ttyS0,115200n8", info.Console)
 	}
 }
 
-func TestParseAuto(t *testing.T) {
+func TestParseMultipleConsoles(t *testing.T) {
+	// Same "an older/hand-edited build" reasoning as TestParseSerialOnly.
 	raw := []byte("console=tty0 console=ttyS0,115200n8 root=ZFS=zroot/ROOT/alpine ro alpine-zfsboot.buildstamp=20260910T003200Z\x00")
 	info, err := parse("x86_64", raw, "test.EFI")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if info.Console != "auto" {
-		t.Errorf("Console = %q, want auto", info.Console)
+	if info.Console != "tty0 ttyS0,115200n8" {
+		t.Errorf("Console = %q, want %q", info.Console, "tty0 ttyS0,115200n8")
 	}
 }
 
