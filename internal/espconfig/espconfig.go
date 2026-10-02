@@ -17,6 +17,7 @@
 package espconfig
 
 import (
+	"regexp"
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -337,4 +338,19 @@ func GenerateHostKey(mountpoint string) error {
 		return fmt.Errorf("generating an ed25519 key: %w", err)
 	}
 	return WriteFile(mountpoint, layout.SSHHostEd25519KeyFile, encodeDropbearEd25519PrivateKey(priv), 0o600)
+}
+
+// consoleRE is the set init/init's select_console() can actually select:
+// _known_console_names, optionally followed by the kernel console= line
+// options (<baud>[parity n/e/o][bits 5-8][r]).
+var consoleRE = regexp.MustCompile(`^(tty0|ttyS[012]|ttyAMA0)(,[0-9]+[neo]?[5-8]?r?)?$`)
+
+// ValidateConsole reports whether v is a value alpine-zfsboot.console= can
+// honour at boot. Empty is valid (unset). Anything else would be persisted
+// and then ignored on every boot with a WARNING.
+func ValidateConsole(v string) error {
+	if v == "" || consoleRE.MatchString(v) {
+		return nil
+	}
+	return fmt.Errorf("--console %q is not a console alpine-zfsboot can select: use tty0, ttyS0, ttyS1, ttyS2 or ttyAMA0, optionally followed by ,<baud>[n|e|o][5-8][r] (e.g. ttyS0,115200n8)", v)
 }

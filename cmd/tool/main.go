@@ -1966,6 +1966,7 @@ should use (its own USE_UEFI) and must pass it explicitly.`,
 				diskArg = disk
 			}
 			die(bootenv.VerifyESPMounted(mountpoint, diskArg))
+			die(espconfig.ValidateConsole(console))
 
 			workdir, err := os.MkdirTemp("", "alpine-zfsboot-install-*")
 			die(err)

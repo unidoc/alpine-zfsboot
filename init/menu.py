@@ -3088,41 +3088,24 @@ def main():
 
     # A human is confirmed present (or explicitly cancelled the
     # countdown), OR there was never any auto-boot pressure to begin
-    # with (POOL_IMPORT_ERROR/FORCED_RESCUE, from the branch at the top
-    # of this function) - no more TIME pressure either way, but this
-    # top-level screen still TICKS (built from the same _countdown_menu()
-    # the timed countdown above uses - no countdown text, and a tick
-    # timing out just redraws instead of booting, since there's nothing
-    # to fall back to here / a human already said "I'm here"). This
-    # still matters without any auto-boot deadline: _countdown_menu()'s
-    # own pty relay is what detects real operator ACTIVITY (arrow-key
-    # navigation with no Enter yet - see its own comment) independent of
-    # a timeout; a plain blocking dialog_menu() call has no way to
-    # report that at all, only a confirmed choice or ESC.
-    #
-    # Only THIS top-level screen ticks - every submenu action (manage/
-    # chroot/deploy/unlock/edit-cmdline, all reached via _dispatch below)
-    # still runs through its own plain, non-ticking blocking dialogs.
-    #
-    # default_item carries over the same way it does between countdown
-    # ticks (see _countdown_menu()'s own comment) - a tick that times out
-    # mid-navigation still hands the next one off to a fresh widget
-    # opened where the operator left it, not item 0.
-    def _unhurried_round(item):
-        choice, rc, _activity, next_item = _countdown_menu(
-            "alpine-zfsboot", _items(), _banner(), TICK_SECONDS, item)
-        if rc == 0:
-            _cancellable(_dispatch, choice)
-        elif rc == 1:
-            _cancellable(_dispatch, None)  # "Boot default" cancel button
-        # rc == _TICK_TIMEOUT_CODE (nothing happened) or ESC: just loop
-        # again below - no auto-boot to fall back to on a tick timeout
-        # here, unlike the timed countdown above.
-        return next_item
+    # with (POOL_IMPORT_ERROR/FORCED_RESCUE) - no more time pressure
+    # from here on. A plain blocking menu, not a ticking one: a ticking
+    # menu restarts the widget on every idle tick and loses any cursor
+    # move that is not an arrow key (digit hotkeys, Home/End, PgUp/PgDn),
+    # so Enter could run a different item than the one selected.
+    # A loop, not recursion - every submenu action (manage/chroot/
+    # deploy/edit-cmdline) returns back here, and a rescue session can
+    # sit at this menu for a long time.
+    # Only the FIRST call needs default_item - it carries over whatever
+    # the operator had navigated to in the countdown's last tick.
+    def _menu_round(**kwargs):
+        choice = dialog_menu("alpine-zfsboot", _items(), text=_banner(),
+                             cancel_label="Boot default", **kwargs)
+        _dispatch(choice)
 
-    default_item = _unhurried_round(default_item)
+    _cancellable(_menu_round, default_item=default_item)
     while True:
-        default_item = _unhurried_round(default_item)
+        _cancellable(_menu_round)
 
 
 if __name__ == "__main__":

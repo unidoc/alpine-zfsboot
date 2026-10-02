@@ -391,3 +391,16 @@ func TestEncodeDropbearEd25519PrivateKey_Deterministic(t *testing.T) {
 		t.Error("encodeDropbearEd25519PrivateKey given the SAME key material twice produced different bytes - the encoder itself must be pure, all randomness belongs in key generation only")
 	}
 }
+
+func TestValidateConsole(t *testing.T) {
+	for _, ok := range []string{"", "tty0", "ttyS0", "ttyS2", "ttyAMA0", "ttyS1,115200n8", "ttyS0,9600", "ttyS0,9600n8r"} {
+		if err := ValidateConsole(ok); err != nil {
+			t.Errorf("ValidateConsole(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"ttyS3", "hvc0", "ttyAMA1", "tty1", "ttyS0,", "ttyS0,fast", "ttyS0 ", "serial"} {
+		if err := ValidateConsole(bad); err == nil {
+			t.Errorf("ValidateConsole(%q) = nil, want an error", bad)
+		}
+	}
+}

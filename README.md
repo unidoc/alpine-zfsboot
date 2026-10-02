@@ -373,6 +373,10 @@ against real `/dev` node existence, not kernel console= registration -
 see that function's own comment), with a GRUB-style "press TAB to
 interrupt" prompt before any of this, on every boot, letting an
 operator pick a different console for that boot right there instead.
+If the selected console cannot be used at all (no device node, an
+unsupported name, or a node with no UART behind it), the boot stops in
+the recovery shell (and rescue SSH, if staged) instead of quietly
+booting on a different console.
 
 Each of the two arches above also ships as:
 
@@ -954,10 +958,15 @@ firmware-dependent second mechanism, and matched against the real
 `/dev` node regardless of whether the kernel itself ever registered it
 as a console); and an explicit `console=` on the real kernel cmdline,
 which always wins. Before any of this runs, `/init` shows a GRUB-style
-"press TAB to interrupt" prompt with a short countdown, on EVERY
-registered-or-configured console at once, on every boot - pressing TAB
-on any of them opens an editable line pre-filled with the resolved
-default, and a confirmed edit there is a genuine, full passthrough
+"press TAB to interrupt or ENTER to continue now" prompt with a
+countdown (15s by default), on every openable console at once
+(`tty0`, `ttyS0`-`ttyS2`, `ttyAMA0`), on every boot, so a machine whose
+only console is serial or only VGA is reachable from the first boot with
+no config. TAB on any of them opens an editable line pre-filled with the
+resolved default; ENTER skips the rest of the countdown. Either way the
+console the key was pressed on becomes the active console for that boot
+(ENTER on an unrelated port that only ever sent line noise does not
+count). A confirmed edit there is a genuine, full passthrough
 onto the same cmdline layer (`alpine-zfsboot install --console`, or
 hand-editing `EFI/ALPINE/config`, is how a
 choice is made to persist across reboots instead).

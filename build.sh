@@ -1277,16 +1277,12 @@ add_section() {
 # - harmless either way, and there's no evidence against keeping it.
 case "$ARCH" in
     # tty0 ONLY, on both arches - no serial console= baked into the
-    # default build at all. User's own explicit, repeated, final word
-    # on this: the build itself has NO built-in knowledge of serial -
-    # tty0 is the one and only sensible default, and serial is purely a
-    # config matter an operator opts into themselves, via
-    # alpine-zfsboot.console= in EFI/ALPINE/config (written at INSTALL
-    # time, when the operator already has full access by definition -
-    # not something that needs to be reached by booting first, a wrong
-    # assumption an earlier version of this comment made and the user
-    # corrected with a real machine's own already-working ESP config as
-    # proof). select_console()'s own Layer 2 (FAT config) matches
+    # default build at all. The build itself has no built-in knowledge
+    # of serial - tty0 is the one sensible default, and serial is purely
+    # a config matter an operator opts into, via alpine-zfsboot.console=
+    # in EFI/ALPINE/config (written at INSTALL time, when the operator
+    # already has full access - not something that needs to be reached
+    # by booting first). select_console()'s own Layer 2 (FAT config) matches
     # against real /dev node existence, not kernel console=
     # registration, so a configured serial console works correctly
     # here regardless of whether it's ALSO on this baked cmdline - this
