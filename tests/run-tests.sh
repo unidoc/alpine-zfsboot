@@ -3965,6 +3965,33 @@ else
 fi
 
 # =============================================================================
+echo "== init: _boot_args_wait_for_tab() prints no shell error on an untouched boot (set -u + unset key) =="
+# /init runs under `set -u`; a reader whose first read times out with no input
+# leaves `key` unset, and testing it unguarded aborted the reader with
+# "ash: key: parameter not set" on the console of every clean boot (PR #18
+# review F9). Real pty, silence, stderr captured separately.
+d="$(fresh_env)"
+cat > "$d/setu.py" <<PYEOF
+import os, pty, subprocess
+master, slave = pty.openpty()
+script = '''
+set -u
+$(extract_boot_args_wait_for_tab)
+_boot_args_wait_for_tab "\$1" 2 >/dev/null
+'''
+p = subprocess.run(["busybox", "ash", "-c", script, "ash", os.ttyname(slave)],
+    stdin=slave, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+print("STDERR:[%s]" % p.stderr.decode(errors="replace").strip())
+PYEOF
+out="$(timeout 20 python3 "$d/setu.py" 2>&1)"
+rm -rf "$d"
+if echo "$out" | grep -qx "STDERR:\[\]"; then
+    ok "an untouched countdown prints nothing on stderr - no 'key: parameter not set'"
+else
+    echo "$out"; bad "the reader printed a shell error on a clean, untouched boot"
+fi
+
+# =============================================================================
 echo "== init: _boot_args_wait_for_tab() - ENTER genuinely fast-forwards past the rest of the countdown, not just a cosmetic no-op =="
 # sitting out the WHOLE countdown just to
 # continue, even when nothing needs changing, is needless waiting.
@@ -4388,7 +4415,7 @@ fi
 # =============================================================================
 echo "== init: ENTER keeps the console's configured line options; line noise on an unwatched port is not ENTER (PR #18 review F4, F5) =="
 run_enter_case() {
-    # $1=FAT pref  $2=bytes written to the serial stand-in (python bytes literal)
+    # $1=FAT pref  $2=python statements writing to the serial stand-in (m1), e.g. os.write(m1, b"x")
     d="$(fresh_env)"
     mkdir -p "$d/root/sys/class/tty/console"
     echo "faketty0" > "$d/root/sys/class/tty/console/active"
@@ -4415,7 +4442,7 @@ echo "DONE"
 p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     preexec_fn=os.setsid, close_fds=True)
 time.sleep(1)
-os.write(m1, $2)
+$2
 out, _ = p.communicate(timeout=15)
 print(out.decode(errors="replace"))
 PYEOF
@@ -4425,7 +4452,7 @@ PYEOF
 # F4: the persisted ttyS1,9600n8 is outvoted by a tty0 cmdline override; ENTER on
 # ttyS1 must carry its 9600n8 along, not apply a bare ttyS1 (which the main loop
 # would reset to 115200).
-out="$(run_enter_case 'ttyS1,9600n8' 'b"\r"')"
+out="$(run_enter_case 'ttyS1,9600n8' 'os.write(m1, b"\r")')"
 if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1,9600n8$"; then
     ok "ENTER on an outvoted EFI/ALPINE/config console keeps that console's configured line options"
 else
@@ -4433,14 +4460,23 @@ else
 fi
 # F5: a device streaming a status line (any byte before the CR/LF) on a port nobody
 # configured must not become the menu console.
-out="$(run_enter_case '' 'b"STATUS OL 230V\r\n"')"
+out="$(run_enter_case '' 'os.write(m1, b"STATUS OL 230V\r\n")')"
 if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
     ok "line noise (bytes then CR/LF) on an unwatched port does not move the menu there"
 else
     echo "$out"; bad "a chatty serial device moved the menu console"
 fi
+# F8: a PERSON who presses a stray key (arrow, Esc), looks at the screen, then
+# presses ENTER on that unwatched port must still be accepted - only a burst
+# (a device's whole line) is rejected; a quiet second ends the "noise" state.
+out="$(run_enter_case '' 'os.write(m1, b"x"); time.sleep(1.6); os.write(m1, b"\r")')"
+if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1$"; then
+    ok "a stray key, a pause, then ENTER on an unwatched port is accepted (a person, not a device)"
+else
+    echo "$out"; bad "ENTER after a stray key and a pause was rejected on the serial-only first-boot path"
+fi
 # ...but a bare ENTER on that same unwatched port still does (serial-only machine, no config).
-out="$(run_enter_case '' 'b"\r"')"
+out="$(run_enter_case '' 'os.write(m1, b"\r")')"
 if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1$"; then
     ok "a bare ENTER on an unwatched port still selects it - the serial-only first-boot case"
 else

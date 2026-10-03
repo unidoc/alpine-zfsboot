@@ -965,8 +965,8 @@ only console is serial or only VGA is reachable from the first boot with
 no config. TAB on any of them opens an editable line pre-filled with the
 resolved default; ENTER skips the rest of the countdown. Either way the
 console the key was pressed on becomes the active console for that boot
-(ENTER on an unrelated port that only ever sent line noise does not
-count). A confirmed edit there is a genuine, full passthrough
+(a port that sends bytes in a burst, like a UPS status line, is not
+treated as a person pressing ENTER). A confirmed edit there is a genuine, full passthrough
 onto the same cmdline layer (`alpine-zfsboot install --console`, or
 hand-editing `EFI/ALPINE/config`, is how a
 choice is made to persist across reboots instead).

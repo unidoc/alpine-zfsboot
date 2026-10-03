@@ -17,7 +17,6 @@
 package espconfig
 
 import (
-	"regexp"
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -25,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
 )

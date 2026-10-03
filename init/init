@@ -197,7 +197,7 @@ _recovery_shell() {
         # brand new one instead of leaving PID 1 alive but permanently
         # stuck with no usable shell for the rest of this boot.
         #
-        # A real, bug in this exact loop, confirmed
+        # A bug in this exact loop, confirmed
         # by direct reproduction (a real pty, real session leadership):
         # POSIX mandates that an asynchronous list's (a `&`-backgrounded
         # job's) standard input is forced to /dev/null UNLESS an
@@ -1039,7 +1039,7 @@ notify_inactive_consoles() {
                 echo "alpine-zfsboot:   alpine-zfsboot.console=$tty"
                 echo "alpine-zfsboot: in EFI/ALPINE/config on the ESP to persist it."
             else
-                # A real, gap: this console IS
+                # A gap: this console IS
                 # kernel-registered (it's in console/active, which is
                 # all this loop checks), but its NAME isn't one
                 # select_console() itself will ever recognize (see
@@ -1450,7 +1450,7 @@ _boot_args_wait_for_tab() {
         (
             # `remaining` seeded to the plain, exact `$timeout` for the
             # FIRST read, not computed from `date +%s` beforehand - a
-            # real, boundary bug otherwise: `date
+            # boundary bug otherwise: `date
             # +%s` has 1-second resolution, and the gap between
             # computing `deadline` and this first check is real
             # wall-clock time (a few ms, two separate fork+execs) - if
@@ -1469,8 +1469,19 @@ _boot_args_wait_for_tab() {
             remaining="$timeout"
             noisy=0
             while :; do
-                IFS= read -t "$remaining" -n 1 -r key < "$tty_dev" 2>/dev/null
+                # key cleared first: under `set -u`, a first read that times
+                # out leaves it unset, and the test below would abort this
+                # reader with a shell error on the console of every clean boot.
+                key=""
+                # Once a port has sent something other than TAB/ENTER, read
+                # with a 1s timeout: a device writes a whole line in one
+                # burst, a person pauses. A quiet second ends the "noise"
+                # state, so a person's ENTER after a stray key (arrow, Esc)
+                # still counts, while a device's status line does not.
+                _t="$remaining"; [ "$noisy" -eq 1 ] && [ "$_t" -gt 1 ] && _t=1
+                IFS= read -t "$_t" -n 1 -r key < "$tty_dev" 2>/dev/null
                 _read_rc=$?
+                [ "$_read_rc" -ne 0 ] && [ "$noisy" -eq 1 ] && noisy=0
                 [ -n "$key" ] && [ "$key" != "$(printf '\t')" ] && noisy=1
                 if [ "$key" = "$(printf '\t')" ]; then
                     : > "$tmpdir/$safe"
@@ -1595,7 +1606,7 @@ _boot_args_default_line() {
             alpine-zfsboot.*) default_line="$default_line $arg" ;;
         esac
     done
-    # A real, gap: synthesizing a console= default
+    # A gap: synthesizing a console= default
     # for a tty select_console() will NEVER actually recognize (see
     # _known_console_names's own comment - e.g. an operator editing
     # from a kernel-registered hvc0) handed back a default line that,
@@ -1646,14 +1657,14 @@ _boot_args_interrupt() {
     # real pty instead (see tests/run-tests.sh's own note on that).
     #
     # `-c` (node exists) alone, like round 2's own first attempt at the
-    # TAB-typed-value check, was a real, bug here
+    # TAB-typed-value check, was a bug here
     # too: a PORT_UNKNOWN node (exists, opens fine, every actual read
     # fails EIO) got added to the poll list, and the backgrounded
     # reader's own retry loop (see _boot_args_wait_for_tab's own
     # comment) then spins at full speed for the ENTIRE countdown - read
     # fails instantly, doesn't match TAB, loop immediately re-reads -
     # measured directly at several THOUSAND iterations/second in PID
-    # 1's own child. A a later review found this exact bug had only
+    # 1's own child. A later review found this exact bug had only
     # ever been fixed on _extra_relevant_consoles()'s own side (the
     # `stty -g` gate there) - this registered-console loop, right next
     # to it, still only checked `-c`. The legacy 8250 UART driver
@@ -1858,7 +1869,7 @@ _boot_args_interrupt() {
             # pre-check that can still be overruled downstream without
             # telling anyone.
             #
-            # A SECOND, instance of the exact same
+            # A second instance of the exact same
             # "accepted here, dropped there" shape: `stty -g` alone
             # accepts ANY openable device, but select_console()'s own
             # candidate list (_known_console_names, see its own
@@ -2146,7 +2157,7 @@ while :; do
     # meaningful, so it's skipped there; the test only needs
     # ACTIVE_TTY itself, not the physical redirect.
     if [ -z "$ROOTFS" ]; then
-        # A adversarial review of the operator-remote-
+        # An adversarial review of the operator-remote-
         # console-selection feature (select_console()'s own layers 2-4)
         # found a real, serious hole this closes: `exec <
         # "/dev/$ACTIVE_TTY"` below is the actual `exec` special
@@ -2181,8 +2192,7 @@ while :; do
         # An earlier version of this block, on open-test failure,
         # silently substituted KERNEL_ACTIVE_TTY (the kernel's own live
         # /dev/console, guaranteed to work) and continued a normal boot
-        # there instead - 
-        # that is exactly the same "configured one console, booted
+        # there instead - that is exactly the same "configured one console, booted
         # silently on a different one" shape this whole console-
         # selection feature exists to eliminate everywhere else (the
         # Netcup incident; an earlier ttyS0-accepted-but-tty0-
