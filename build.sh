@@ -611,6 +611,13 @@ mkdir -p "$BUILD_DIR/features.d"
     # (package renamed/removed) fails loudly here rather than silently
     # shipping a rescue shell that's quietly missing it.
     command -v sgdisk
+    # fsck.vfat / fsck.fat (Alpine's `dosfstools`, already in the build
+    # container's apk line for iso.sh's mkfs.vfat): the ESP is a FAT
+    # partition, and a corrupt one is exactly when someone needs the
+    # recovery shell to repair it (the pool-less, "fix EFI/ALPINE/config"
+    # path die() points at). Same fail-loudly rule as sgdisk above.
+    command -v fsck.fat
+    command -v fsck.vfat
     # apk itself, in the RESCUE SHELL - not this build container's own
     # copy re-purposed, a real, deliberate design choice: rather than
     # hand-picking one more individual tool into this list every time

@@ -231,6 +231,21 @@ jobs:
       - name: Run bios/tests/run-ata-atapi-host-test.sh
         run: ./bios/tests/run-ata-atapi-host-test.sh
 
+  bootparams-host-test:
+    # bios/tests/bootparams_host_test.c - guards the boot_params.screen_info
+    # bytes the BIOS loader writes (without them vgacon never starts and a
+    # VGA-only BIOS boot shows nothing after "starting kernel").
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run bios/tests/run-bootparams-host-test.sh
+        run: ./bios/tests/run-bootparams-host-test.sh
+
   fat-host-test:
     # bios/tests/fat_host_test.c/build_fat_fixtures.py existed in the tree
     # (added earlier this session as the regression guard for a real

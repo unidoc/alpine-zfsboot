@@ -729,16 +729,21 @@ fi
 # if $extra_cmdline doesn't already name its own console= - an explicit
 # persisted choice there is a deliberate override, not an oversight to
 # paper over.
-case "$extra_cmdline" in
-    *console=*) console_cmdline="" ;;
+# The decided console (and its line options) comes from the environment, or -
+# for a rescue-SSH session, where dropbear wipes the environment - from the
+# file /init wrote when it decided it. Either way it is the CONFIG-decided
+# console, never "whatever this session happens to run on".
+active_tty="${ALPINE_ZFSBOOT_ACTIVE_TTY:-}"
+[ -n "$active_tty" ] || active_tty="$(cat "$ROOTFS/tmp/alpine-zfsboot/active-console" 2>/dev/null)"
+active_opts="${ALPINE_ZFSBOOT_ACTIVE_CONSOLE_OPTS:-}"
+[ -n "$active_opts" ] || active_opts="$(cat "$ROOTFS/tmp/alpine-zfsboot/active-console-opts" 2>/dev/null)"
+case " $extra_cmdline " in
+    *" console="*) console_cmdline="" ;;
     *)
-        case "${ALPINE_ZFSBOOT_ACTIVE_TTY:-tty0}" in
-            tty0)    console_cmdline="console=tty0" ;;
-            ttyS0)   console_cmdline="console=ttyS0,115200n8" ;;
-            ttyS1)   console_cmdline="console=ttyS1,115200n8" ;;
-            ttyS2)   console_cmdline="console=ttyS2,115200n8" ;;
-            ttyAMA0) console_cmdline="console=ttyAMA0,115200n8" ;;
-            *)       console_cmdline="" ;;
+        case "${active_tty:-tty0}" in
+            tty0)                      console_cmdline="console=tty0" ;;
+            ttyS0|ttyS1|ttyS2|ttyAMA0) console_cmdline="console=${active_tty},${active_opts:-115200n8}" ;;
+            *)                         console_cmdline="" ;;
         esac
         ;;
 esac

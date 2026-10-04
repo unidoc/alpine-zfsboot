@@ -2239,7 +2239,7 @@ def _banner():
         "   the Rolls Royce of ZFS boot for Alpine, by UniDoc\n"
         f"   version: {_project_version()} (built {_build_stamp()})\n"
         "============================================================\n"
-        f"   Console: /dev/{ACTIVE_TTY} (press TAB at the pre-boot prompt to change)"
+        f"   Console: /dev/{ACTIVE_TTY} (press TAB at the pre-boot prompt and edit alpine-zfsboot.console=)"
     )
     if POOL_IMPORT_ERROR:
         # ONE short, fixed-length line - NOT the actual error text (an

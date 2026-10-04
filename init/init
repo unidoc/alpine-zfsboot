@@ -694,6 +694,9 @@ if [ -z "$ROOTFS" ]; then
         # ESP", reused.
         export ALPINE_ZFSBOOT_ESP_DEV="$esp_candidate"
         if mount -t vfat -o ro "$esp_candidate" /tmp/esp-config 2>/dev/null; then
+            # Seed the console-pref cache (see read_fat_console_pref).
+            sed -n 's/^alpine-zfsboot\.console=//p' /tmp/esp-config/EFI/ALPINE/config 2>/dev/null |
+                tail -n 1 | tr -d '\r' > /tmp/alpine-zfsboot-console-pref.cache
             if [ -r "/tmp/esp-config/EFI/ALPINE/config" ]; then
                 msg "applying persisted config (cmdline still overrides)"
                 ZFSBOOT_KV_SOURCE=config
@@ -867,12 +870,34 @@ export ALPINE_ZFSBOOT_NET \
 # for the pre-boot edit screen that can also populate it, once, before
 # the main loop below ever starts) and never needs re-reading after
 # that.
+# The config layer must never silently vanish: if the read-only mount fails
+# (e.g. the operator already has the ESP mounted read-write in the recovery
+# shell to fix it - the very fix path die() points at), read it from where
+# it is already mounted, and failing that fall back to the value last read
+# successfully (seeded at boot) WITH a warning - never "no config".
+_CONSOLE_PREF_CACHE=/tmp/alpine-zfsboot-console-pref.cache
+_read_console_pref_from() {
+    sed -n 's/^alpine-zfsboot\.console=//p' "$1/EFI/ALPINE/config" 2>/dev/null |
+        tail -n 1 | tr -d '\r'
+}
 read_fat_console_pref() {
     [ -n "$ALPINE_ZFSBOOT_ESP_DEV" ] || return
-    mount -t vfat -o ro "$ALPINE_ZFSBOOT_ESP_DEV" /tmp/esp-config 2>/dev/null || return
-    sed -n 's/^alpine-zfsboot\.console=//p' /tmp/esp-config/EFI/ALPINE/config 2>/dev/null |
-        tail -n 1 | tr -d '\r'
-    umount /tmp/esp-config 2>/dev/null
+    if mount -t vfat -o ro "$ALPINE_ZFSBOOT_ESP_DEV" /tmp/esp-config 2>/dev/null; then
+        _pref="$(_read_console_pref_from /tmp/esp-config)"
+        umount /tmp/esp-config 2>/dev/null
+        printf '%s\n' "$_pref" > "$_CONSOLE_PREF_CACHE" 2>/dev/null
+        printf '%s\n' "$_pref"
+        return
+    fi
+    _mp="$(awk -v d="$ALPINE_ZFSBOOT_ESP_DEV" '$1==d {print $2; exit}' /proc/mounts 2>/dev/null)"
+    if [ -n "$_mp" ] && [ -r "$_mp/EFI/ALPINE/config" ]; then
+        _pref="$(_read_console_pref_from "$_mp")"
+        printf '%s\n' "$_pref" > "$_CONSOLE_PREF_CACHE" 2>/dev/null
+        printf '%s\n' "$_pref"
+        return
+    fi
+    msg "WARNING: cannot re-read EFI/ALPINE/config from $ALPINE_ZFSBOOT_ESP_DEV - keeping the console value read earlier" >&2
+    cat "$_CONSOLE_PREF_CACHE" 2>/dev/null
 }
 
 # _parse_console_spec SPEC - splits SPEC into _CONSOLE_SPEC_TTY (bare
@@ -1034,10 +1059,10 @@ notify_inactive_consoles() {
             echo "alpine-zfsboot: the interactive boot menu is running on /dev/$ACTIVE_TTY, NOT here."
             echo "alpine-zfsboot: this console stays quiet on purpose - the system is not hung."
             if _is_known_console_name "$tty"; then
-                echo "alpine-zfsboot: to make THIS console (/dev/$tty) the menu console, reboot and press"
-                echo "alpine-zfsboot: TAB at the 'alpine-zfsboot starting' prompt, or set"
+                echo "alpine-zfsboot: to make THIS console (/dev/$tty) the menu console, reboot, press TAB at"
+                echo "alpine-zfsboot: the 'alpine-zfsboot starting' prompt and set"
                 echo "alpine-zfsboot:   alpine-zfsboot.console=$tty"
-                echo "alpine-zfsboot: in EFI/ALPINE/config on the ESP to persist it."
+                echo "alpine-zfsboot: on the edit line, or set it in EFI/ALPINE/config on the ESP to persist it."
             else
                 # A gap: this console IS
                 # kernel-registered (it's in console/active, which is
@@ -1409,8 +1434,8 @@ _boot_args_wait_for_tab() {
     # Optional: ports the operator is known to watch (kernel-registered,
     # configured, or active). On any OTHER port - found only by the blind
     # sweep - a CR/LF counts as ENTER only if no other byte arrived first,
-    # so a UPS or noisy device streaming status lines (text ending in CR/LF) cannot move the
-    # menu there.
+    # so a UPS or noisy device streaming status lines (text ending in CR/LF)
+    # cannot cut the countdown short.
     trusted="${3:-$1}"
     tmpdir="$(mktemp -d)"
     # Fail CLOSED, not open: an unguarded mktemp failure here (ENOSPC,
@@ -1483,7 +1508,12 @@ _boot_args_wait_for_tab() {
                 _read_rc=$?
                 [ "$_read_rc" -ne 0 ] && [ "$noisy" -eq 1 ] && noisy=0
                 [ -n "$key" ] && [ "$key" != "$(printf '\t')" ] && noisy=1
-                if [ "$key" = "$(printf '\t')" ]; then
+                # TAB wins only from a person: on a port nobody is known to
+                # watch (found only by the blind sweep), a TAB inside a
+                # device's burst (a UPS "OL<TAB>230V" line) must not open an
+                # edit screen nobody can see and stall the boot.
+                if [ "$key" = "$(printf '\t')" ] \
+                    && { [ "$noisy" -eq 0 ] || case " $trusted " in *" $tty_dev "*) true ;; *) false ;; esac; }; then
                     : > "$tmpdir/$safe"
                     break
                 fi
@@ -1513,7 +1543,7 @@ _boot_args_wait_for_tab() {
                 # reader).
                 if [ "$_read_rc" -eq 0 ] && [ -z "$key" ] \
                     && { [ "$noisy" -eq 0 ] || case " $trusted " in *" $tty_dev "*) true ;; *) false ;; esac; }; then
-                    printf '%s\n' "$tty_dev" > "$tmpdir/ENTER_PRESSED"
+                    : > "$tmpdir/ENTER_PRESSED"
                     break
                 fi
                 remaining=$((deadline - $(date +%s)))
@@ -1563,19 +1593,16 @@ _boot_args_wait_for_tab() {
     for pid in $pids; do kill "$pid" 2>/dev/null; done
     wait 2>/dev/null
     for tty_dev in $ttys; do printf '\r%78s\r' "" > "$tty_dev" 2>/dev/null; done
-    enter_dev=""
-    [ -z "$winner" ] && [ -e "$tmpdir/ENTER_PRESSED" ] && enter_dev="$(cat "$tmpdir/ENTER_PRESSED" 2>/dev/null)"
+    enter_pressed=0
+    [ -z "$winner" ] && [ -e "$tmpdir/ENTER_PRESSED" ] && enter_pressed=1
     rm -rf "$tmpdir"
     if [ -n "$winner" ]; then
         echo "$winner"
         return 0
     fi
-    # ENTER: no edit screen, but the console it was pressed on is where the
-    # operator is - reported so the caller can make that console the active
-    # one for this boot (same as a TAB there would), rather than silently
-    # booting on a different console than the one being watched.
-    if [ -n "$enter_dev" ]; then
-        echo "$enter_dev"
+    # ENTER: no edit screen and no console information at all - the caller
+    # treats it exactly like a timeout that arrived sooner.
+    if [ "$enter_pressed" -eq 1 ]; then
         return 2
     fi
     return 1
@@ -1622,7 +1649,7 @@ _boot_args_default_line() {
     case " $default_line " in
         *" alpine-zfsboot.console="*) : ;;
         *)
-            _is_known_console_name "$tty" && default_line="$default_line alpine-zfsboot.console=$tty${opts:+,$opts}"
+            [ -n "$tty" ] && default_line="$default_line alpine-zfsboot.console=$tty${opts:+,$opts}"
             ;;
     esac
     echo "${default_line# }"
@@ -1736,51 +1763,28 @@ _boot_args_interrupt() {
         fi
     fi
     for tty_dev in $ttys; do
-        printf 'alpine-zfsboot: current console is /dev/%s (%s)\n' \
-            "$ACTIVE_TTY" "$_console_source" > "$tty_dev" 2>/dev/null
+        if [ -n "$CONSOLE_UNUSABLE" ]; then
+            printf 'alpine-zfsboot: WARNING: %s - the boot will STOP in the recovery shell unless you press TAB and change it\n' \
+                "$CONSOLE_UNUSABLE" > "$tty_dev" 2>/dev/null
+        else
+            printf 'alpine-zfsboot: current console is /dev/%s (%s)\n' \
+                "$ACTIVE_TTY" "$_console_source" > "$tty_dev" 2>/dev/null
+        fi
     done
 
     tty_dev="$(_boot_args_wait_for_tab "$ttys" "$BOOT_ARGS_TIMEOUT" "$trusted")"
     _wait_rc=$?
     [ "$_wait_rc" -eq 1 ] && return 0
 
-    # The console that ACTUALLY got the keypress, not necessarily
-    # ACTIVE_TTY - if they match, ACTIVE_CONSOLE_OPTS is the real,
-    # already-resolved line settings; otherwise a bare name is correct
-    # (every registered console already has correct line settings from
-    # the kernel's own console= parsing - see _apply_console_line_settings's
-    # own comment on why a bare name for an already-registered console
-    # needs no explicit options at all).
+    # ENTER (rc 2) only ends the wait early - it is exactly a timeout that
+    # arrived sooner: no edit screen, and NO console change. Which console
+    # is used is decided by the layers in select_console() (kernel default <
+    # EFI/ALPINE/config < cmdline); only a confirmed edit on the TAB screen
+    # overrides them.
+    [ "$_wait_rc" -eq 2 ] && return 0
+    # The console the key was pressed on only decides where the edit screen
+    # is DRAWN (and its TERM). It never decides what the screen proposes.
     tty="${tty_dev##*/}"
-    opts=""
-    if [ "$tty" = "$ACTIVE_TTY" ]; then
-        opts="$ACTIVE_CONSOLE_OPTS"
-    else
-        # A persisted EFI/ALPINE/config console that a cmdline override
-        # outvoted still has its own configured line options; without them
-        # the main loop would reset that unregistered line to 115200.
-        _parse_console_spec "$(read_fat_console_pref)"
-        [ "$_CONSOLE_SPEC_TTY" = "$tty" ] && opts="$_CONSOLE_SPEC_OPTS"
-    fi
-
-    # ENTER (rc 2): continue without the edit screen, but on the console
-    # ENTER was pressed on. Pressing ENTER on a
-    # serial console while the default was tty0 booted the menu on tty0 -
-    # where nobody was looking. Applied exactly like a confirmed edit
-    # (cmdline layer, this boot only) - and only when it actually differs
-    # from what is already active, so a plain ENTER on the right console
-    # changes nothing.
-    if [ "$_wait_rc" -eq 2 ]; then
-        # Only a name select_console() can actually select: ENTER on a
-        # registered-but-unsupported console (hvc0) would otherwise log a
-        # WARNING every loop pass and leave the menu elsewhere.
-        if [ "$tty" != "$ACTIVE_TTY" ] && _is_known_console_name "$tty"; then
-            ZFSBOOT_KV_SOURCE=cmdline
-            apply_zfsboot_kv "alpine-zfsboot.console=$tty${opts:+,$opts}"
-            ZFSBOOT_KV_SOURCE=""
-        fi
-        return 0
-    fi
 
     # TERM for the dialog calls below specifically - nothing sets $TERM
     # at all until the main loop runs, well after this function
@@ -1804,7 +1808,23 @@ _boot_args_interrupt() {
             ;;
     esac
 
-    default_line="$(_boot_args_default_line "$tty" "$opts")"
+    # Tell every OTHER console where the edit screen is, so a boot that now
+    # waits on it never looks hung elsewhere.
+    for _o in $ttys; do
+        [ "$_o" = "$tty_dev" ] || printf 'alpine-zfsboot: TAB pressed - the edit screen is open on /dev/%s\n' "$tty" > "$_o" 2>/dev/null
+    done
+
+    # The proposed console= is what the CONFIG says (EFI/ALPINE/config), not
+    # the console TAB happened to be pressed on - pressing TAB and confirming
+    # unchanged must keep the configured console. With no config, the
+    # resolved default (kernel's console). A cmdline console= already on the
+    # kernel cmdline is kept as-is by _boot_args_default_line.
+    _parse_console_spec "$(read_fat_console_pref)"
+    if [ -n "$_CONSOLE_SPEC_TTY" ]; then
+        default_line="$(_boot_args_default_line "$_CONSOLE_SPEC_TTY" "$_CONSOLE_SPEC_OPTS")"
+    else
+        default_line="$(_boot_args_default_line "$ACTIVE_TTY" "$ACTIVE_CONSOLE_OPTS")"
+    fi
     # $ROOTFS-prefixed (empty at a real boot, so byte-identical to the
     # old hardcoded /tmp/alpine-zfsboot/boot-args-edit there) rather
     # than hardcoded - lets tests exercise this for real against a fake
@@ -1834,6 +1854,7 @@ _boot_args_interrupt() {
     # console that never shows up - that's not the silent fallback this
     # replaces, it's the exact on-screen confirmation the operator asked
     # for to know their forced choice didn't pan out.
+    original_line="$default_line"
     while :; do
         TERM="$dialog_term" dialog --ascii-lines --backtitle "alpine-zfsboot" --inputbox \
             "Boot arguments (alpine-zfsboot.key=value, space-separated - this boot only; edit EFI/ALPINE/config on the ESP to persist):" \
@@ -1844,6 +1865,10 @@ _boot_args_interrupt() {
         rm -f "$out_file"
         TERM="$dialog_term" clear > "$tty_dev" 2>/dev/null || true
         [ "$status" -eq 0 ] || return 0
+        # Nothing typed -> nothing changes (the proposed line is only a view
+        # of the config/cmdline, confirming it unchanged must not turn it into
+        # an override).
+        [ "$edited" = "$original_line" ] && return 0
 
         typed_console=""
         for arg in $edited; do
@@ -1899,6 +1924,9 @@ _boot_args_interrupt() {
         break
     done
 
+    # The edited line IS the cmdline layer now: a console= token the operator
+    # deleted must stop applying too.
+    ZFSBOOT_CONSOLE_CMDLINE=""
     ZFSBOOT_KV_SOURCE=cmdline
     for arg in $edited; do
         apply_zfsboot_kv "$arg"
@@ -2344,7 +2372,12 @@ while :; do
             stty rows 24 cols 80 2>/dev/null
             ;;
     esac
-    export TERM ALPINE_ZFSBOOT_ACTIVE_TTY="$ACTIVE_TTY"
+    export TERM ALPINE_ZFSBOOT_ACTIVE_TTY="$ACTIVE_TTY" ALPINE_ZFSBOOT_ACTIVE_CONSOLE_OPTS="$ACTIVE_CONSOLE_OPTS"
+    # A rescue-SSH session (dropbear wipes the environment) must still hand
+    # the SAME decided console to the next kernel - see boot-dataset.sh.
+    mkdir -p "$ROOTFS/tmp/alpine-zfsboot" 2>/dev/null
+    printf '%s\n' "$ACTIVE_TTY" > "$ROOTFS/tmp/alpine-zfsboot/active-console" 2>/dev/null
+    printf '%s\n' "$ACTIVE_CONSOLE_OPTS" > "$ROOTFS/tmp/alpine-zfsboot/active-console-opts" 2>/dev/null
 
     # Deliberately NOT `exec`: menu.py itself execs straight into
     # boot-dataset.sh on every path that actually boots something (see

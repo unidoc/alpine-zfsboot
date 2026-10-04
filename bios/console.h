@@ -17,4 +17,9 @@ void console_putc(char c);
 void console_puts(const char *s);
 void console_puts_hex32(unsigned long v);
 
+struct boot_video;
+/* Reads the BIOS video state (INT 0x10 AH=0x0F mode/columns/page, AH=0x03
+ * cursor) for the kernel's screen_info - see bootparams.h. */
+void console_query_video(struct boot_video *v);
+
 #endif

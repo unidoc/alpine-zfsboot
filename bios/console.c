@@ -1,4 +1,5 @@
 #include "console.h"
+#include "bootparams.h"
 
 #ifdef ZFSBOOT_TEST_SERIAL
 /*
@@ -161,6 +162,44 @@ void console_putc(char c)
 		: "a"(ax)
 		: "bx", "cx", "dx", "si", "di", "bp", "memory"
 	);
+}
+
+void console_query_video(struct boot_video *v)
+{
+	unsigned short ax, bx, dx;
+
+	/* AH=0x0F: AL = mode, AH = columns, BH = active page. */
+	__asm__ __volatile__(
+		"pushw %%ds\n\t"
+		"pushw %%es\n\t"
+		"int $0x10\n\t"
+		"popw %%es\n\t"
+		"popw %%ds\n\t"
+		: "=a"(ax), "=b"(bx)
+		: "a"((unsigned short)0x0f00)
+		: "cx", "dx", "si", "di", "bp", "memory"
+	);
+	v->mode = (unsigned char)(ax & 0xff);
+	v->cols = (unsigned char)(ax >> 8);
+	v->page = (unsigned char)(bx >> 8);
+
+	/* AH=0x03: BH = page; DH = cursor row, DL = cursor column. AX/BX are
+	 * in-out: some BIOSes (Phoenix) return AX=0, so the compiler must not
+	 * assume they survive. */
+	ax = 0x0300;
+	bx = (unsigned short)(v->page << 8);
+	__asm__ __volatile__(
+		"pushw %%ds\n\t"
+		"pushw %%es\n\t"
+		"int $0x10\n\t"
+		"popw %%es\n\t"
+		"popw %%ds\n\t"
+		: "=d"(dx), "+a"(ax), "+b"(bx)
+		:
+		: "cx", "si", "di", "bp", "memory"
+	);
+	v->cursor_row = (unsigned char)(dx >> 8);
+	v->cursor_col = (unsigned char)(dx & 0xff);
 }
 
 void console_puts(const char *s)

@@ -4,7 +4,8 @@ int bootparams_build(uint8_t boot_params[BOOT_PARAMS_SIZE],
                       const struct setup_header *kernel_hdr,
                       uint32_t initrd_addr, uint32_t initrd_size,
                       uint32_t cmdline_addr,
-                      const struct boot_e820_entry *e820, uint8_t e820_count)
+                      const struct boot_e820_entry *e820, uint8_t e820_count,
+                      const struct boot_video *video)
 {
 	struct setup_header *hdr = (struct setup_header *)(boot_params + BOOT_PARAMS_HDR_OFFSET);
 	struct boot_e820_entry *table =
@@ -46,6 +47,26 @@ int bootparams_build(uint8_t boot_params[BOOT_PARAMS_SIZE],
 	for (i = 0; i < count; i++)
 		table[i] = e820[i];
 	boot_params[BOOT_PARAMS_E820_ENTRIES_OFFSET] = count;
+
+	/*
+	 * screen_info: tell the kernel a colour VGA text console exists and
+	 * where the cursor is, so console=tty0 (vgacon) works. Only for the
+	 * text modes this loader's own INT 0x10 output runs in (0-3, 7 is
+	 * mono and not supported here); anything else leaves it zeroed, as
+	 * before. 25 lines / 16-pixel cells are the standard VGA text mode
+	 * values.
+	 */
+	if (video && video->mode <= 3 && video->cols >= 40) {
+		boot_params[BOOT_PARAMS_SCREEN_ORIG_X] = video->cursor_col;
+		boot_params[BOOT_PARAMS_SCREEN_ORIG_Y] = video->cursor_row;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_PAGE] = video->page;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_MODE] = video->mode;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_COLS] = video->cols;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_EGA_BX] = 3;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_LINES] = 25;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_ISVGA] = 1;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_POINTS] = 16;
+	}
 
 	return 0;
 }

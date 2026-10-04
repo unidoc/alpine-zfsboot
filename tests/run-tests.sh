@@ -3576,7 +3576,7 @@ if [ -s "$d/dev/ttyS0" ]; then
 else
     ok "the active console itself is never written to by notify_inactive_consoles() - only genuinely inactive ones"
 fi
-if grep -q "reboot and press" "$d/dev/tty0" && grep -q "TAB at the 'alpine-zfsboot starting' prompt" "$d/dev/tty0"; then
+if grep -q "reboot, press TAB at" "$d/dev/tty0" && grep -q "'alpine-zfsboot starting' prompt and set" "$d/dev/tty0"; then
     ok "the tty0-specific banner points at the pre-boot TAB-interrupt screen, not a live claim"
 else
     cat "$d/dev/tty0"; bad "tty0's own extra banner line is missing or still references a live claim"
@@ -3954,7 +3954,7 @@ else
 fi
 out="$(run_wait_for_tab 'b"\r"' 0.3 3)"
 if echo "$out" | grep -q "RC=2$"; then
-    ok "a bare ENTER is not treated as a TAB winner (RC=2, distinct from both TAB=0 and a genuine timeout=1) - it fast-forwards the unattended boot, it doesn't open the edit screen, and reports which console it came from"
+    ok "a bare ENTER is not treated as a TAB winner (RC=2, distinct from both TAB=0 and a genuine timeout=1) - it fast-forwards the unattended boot, it doesn't open the edit screen, and carries no console information"
 else
     echo "$out"; bad "ENTER was incorrectly treated as a TAB win - the edit screen would wrongly open"
 fi
@@ -4268,11 +4268,14 @@ fi
 # reject/force yesno about the very console the operator is reading it
 # on - a guaranteed, confusing dead end. No console= should be
 # synthesized for an unrecognized name at all.
+# (Superseded: the proposal now comes from the CONFIG, so a configured
+# unsupported name is SHOWN, never hidden - confirming it unchanged is a
+# no-op, and the yes/no only appears if the operator types it.)
 out="$(run_default_line "quiet" "hvc0" "")"
-if [ "$out" = "" ]; then
-    ok "no console= is synthesized for a tty name select_console() will never recognize (hvc0) - no guaranteed-to-reject default offered"
+if [ "$out" = "quiet alpine-zfsboot.console=hvc0" ] || [ "$out" = "alpine-zfsboot.console=hvc0" ]; then
+    ok "a configured console name is shown on the edit line even if select_console() would not recognize it - the config is never hidden"
 else
-    echo "GOT: [$out]"; bad "a doomed-to-reject console= was still synthesized for an unrecognized tty name"
+    echo "GOT: [$out]"; bad "the configured console was hidden from the edit line"
 fi
 
 # =============================================================================
@@ -4289,12 +4292,21 @@ echo "== init: _boot_args_interrupt() - real dialog/exec side effects make it a 
 func_src="$(awk '/^_boot_args_interrupt\(\)/{f=1} f{print} f && /^}/{exit}' "$REPO_ROOT/init/init")"
 if echo "$func_src" | grep -q '\[ -n "\$ttys" \] || return 0' \
    && echo "$func_src" | grep -q 'tty_dev="\$(_boot_args_wait_for_tab "\$ttys" "\$BOOT_ARGS_TIMEOUT" "\$trusted")"' \
-   && echo "$func_src" | grep -q 'default_line="\$(_boot_args_default_line "\$tty" "\$opts")"' \
+   && echo "$func_src" | grep -q 'default_line="\$(_boot_args_default_line "\$_CONSOLE_SPEC_TTY" "\$_CONSOLE_SPEC_OPTS")"' \
+   && echo "$func_src" | grep -q '_parse_console_spec "\$(read_fat_console_pref)"' \
+   && ! echo "$func_src" | grep -q '_boot_args_default_line "\$tty"' \
    && echo "$func_src" | grep -q '\[ "\$status" -eq 0 \] || return 0' \
    && echo "$func_src" | grep -q 'ZFSBOOT_KV_SOURCE=cmdline'; then
     ok "_boot_args_interrupt() builds the registered-console list, waits for TAB on all of them before doing anything else, and replays a confirmed edit through apply_zfsboot_kv() with the cmdline source tag"
 else
     echo "$func_src"; bad "_boot_args_interrupt()'s own guard/order/source-tag wiring is not as expected"
+fi
+
+# ENTER (rc 2) must return BEFORE anything that could touch console state.
+if echo "$func_src" | awk '/\[ "\$_wait_rc" -eq 2 \] && return 0/{r=NR} /ZFSBOOT_KV_SOURCE=cmdline/{k=NR} END{exit !(r && k && r<k)}'; then
+    ok "_boot_args_interrupt() returns on ENTER (rc 2) before the code that applies a console (ZFSBOOT_KV_SOURCE=cmdline)"
+else
+    bad "_boot_args_interrupt() no longer returns on ENTER before applying a console"
 fi
 
 # =============================================================================
@@ -4368,12 +4380,12 @@ else
 fi
 
 # =============================================================================
-echo "== init: ENTER on a SECOND console makes THAT console the active one - real reported bug (ENTER on serial booted the menu on tty0) =="
+echo "== init: ENTER on a second console does NOT change the console - ENTER only ends the wait early, same as a timeout =="
 # Operator pressed ENTER on ttyS0 to skip the countdown; the menu came up
 # on tty0 (the kernel default) where nobody was looking. Two real ptys,
 # tty0 stand-in ("faketty0", registered) and a serial stand-in (ttyS1);
-# ENTER goes to the serial one only. _boot_args_interrupt() must apply
-# alpine-zfsboot.console=ttyS1 (cmdline layer) and NOT open the edit screen.
+# ENTER goes to the serial one only. _boot_args_interrupt() must end the wait
+# early and apply NOTHING (no console change, no edit screen).
 d="$(fresh_env)"
 mkdir -p "$d/root/sys/class/tty/console"
 echo "faketty0" > "$d/root/sys/class/tty/console/active"
@@ -4386,7 +4398,7 @@ os.symlink(os.ttyname(s1), "$d/root/dev/ttyS1")
 script = '''
 $(extract_boot_args_interrupt_all)
 msg() { :; }
-dialog() { echo "DIALOG_OPENED"; return 1; }
+dialog() { echo "DIALOG_OPENED" >> "$d/dialog.log"; return 1; }
 apply_zfsboot_kv() { echo "APPLIED:\$1"; }
 read_fat_console_pref() { echo ""; }
 ROOTFS="$d/root"
@@ -4400,20 +4412,32 @@ echo "DONE"
 p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     preexec_fn=os.setsid, close_fds=True)
 time.sleep(1)
+t0 = time.time()
 os.write(m1, b"\\r")
 out, _ = p.communicate(timeout=15)
 print(out.decode(errors="replace"))
+print("ELAPSED=%.1f" % (time.time() - t0))
+print(open("$d/dialog.log").read() if os.path.exists("$d/dialog.log") else "")
+import select
+for name, m in (("tty0", m0), ("serial", m1)):
+    buf = b""
+    while select.select([m], [], [], 0.2)[0]:
+        buf += os.read(m, 4096)
+    print("BANNER_%s=%d" % (name, b"press TAB to interrupt" in buf))
 PYEOF
 out="$(timeout 20 python3 "$d/enter_serial.py" 2>&1)"
 rm -rf "$d"
-if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1" && ! echo "$out" | grep -q "DIALOG_OPENED" && echo "$out" | grep -q "^DONE"; then
-    ok "ENTER on the serial console applies console=ttyS1 for this boot without opening the edit screen"
+el="$(echo "$out" | sed -n 's/^ELAPSED=//p')"
+if ! echo "$out" | grep -q "APPLIED:" && ! echo "$out" | grep -q "DIALOG_OPENED" && echo "$out" | grep -q "^DONE" \
+   && echo "$out" | grep -q "BANNER_tty0=1" && echo "$out" | grep -q "BANNER_serial=1" \
+   && [ "${el%.*}" -le 3 ]; then
+    ok "ENTER on the serial console (prompt shown on both consoles) ended the 8s wait in ${el}s, changed no console setting and opened no edit screen (same as a timeout)"
 else
-    echo "$out"; bad "ENTER on a non-active console did not make that console active (or wrongly opened the edit screen)"
+    echo "$out"; bad "ENTER changed the console or opened the edit screen - it must only end the wait early"
 fi
 
 # =============================================================================
-echo "== init: ENTER keeps the console's configured line options; line noise on an unwatched port is not ENTER (PR #18 review F4, F5) =="
+echo "== init: ENTER never applies a console, whatever port it comes from or what is configured =="
 run_enter_case() {
     # $1=FAT pref  $2=python statements writing to the serial stand-in (m1), e.g. os.write(m1, b"x")
     d="$(fresh_env)"
@@ -4428,7 +4452,7 @@ os.symlink(os.ttyname(s1), "$d/root/dev/ttyS1")
 script = '''
 $(extract_boot_args_interrupt_all)
 msg() { :; }
-dialog() { echo "DIALOG_OPENED"; return 1; }
+dialog() { echo "DIALOG_OPENED" >> "$d/dialog.log"; return 1; }
 apply_zfsboot_kv() { echo "APPLIED:\$1"; }
 read_fat_console_pref() { echo "$1"; }
 ROOTFS="$d/root"
@@ -4442,45 +4466,175 @@ echo "DONE"
 p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     preexec_fn=os.setsid, close_fds=True)
 time.sleep(1)
+t0 = time.time()
 $2
 out, _ = p.communicate(timeout=15)
 print(out.decode(errors="replace"))
+print("ELAPSED=%.1f" % (time.time() - t0))
+print(open("$d/dialog.log").read() if os.path.exists("$d/dialog.log") else "")
 PYEOF
     timeout 20 python3 "$d/enter_case.py" 2>&1
     rm -rf "$d"
 }
-# F4: the persisted ttyS1,9600n8 is outvoted by a tty0 cmdline override; ENTER on
-# ttyS1 must carry its 9600n8 along, not apply a bare ttyS1 (which the main loop
-# would reset to 115200).
+# ENTER on a console whose persisted config (ttyS1,9600n8) is outvoted by a tty0
+# cmdline override: applies nothing, ends the 3s wait early.
 out="$(run_enter_case 'ttyS1,9600n8' 'os.write(m1, b"\r")')"
-if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1,9600n8$"; then
-    ok "ENTER on an outvoted EFI/ALPINE/config console keeps that console's configured line options"
+el="$(echo "$out" | sed -n 's/^ELAPSED=//p')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE" && [ "${el%.*}" -le 1 ]; then
+    ok "ENTER on an outvoted EFI/ALPINE/config console applies nothing and ends the wait early (${el}s of 3s)"
 else
-    echo "$out"; bad "ENTER dropped the persisted console's line options"
+    echo "$out"; bad "ENTER applied a console"
 fi
 # F5: a device streaming a status line (any byte before the CR/LF) on a port nobody
-# configured must not become the menu console.
+# configured is not ENTER: it must NOT cut the wait short.
 out="$(run_enter_case '' 'os.write(m1, b"STATUS OL 230V\r\n")')"
-if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
-    ok "line noise (bytes then CR/LF) on an unwatched port does not move the menu there"
+el="$(echo "$out" | sed -n 's/^ELAPSED=//p')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE" && [ "${el%.*}" -ge 1 ]; then
+    ok "line noise (bytes then CR/LF) on an unwatched port is not ENTER - the wait was not cut short (${el}s after the noise)"
 else
-    echo "$out"; bad "a chatty serial device moved the menu console"
+    echo "$out"; bad "a chatty serial device ended the wait early or applied a console"
 fi
 # F8: a PERSON who presses a stray key (arrow, Esc), looks at the screen, then
 # presses ENTER on that unwatched port must still be accepted - only a burst
 # (a device's whole line) is rejected; a quiet second ends the "noise" state.
 out="$(run_enter_case '' 'os.write(m1, b"x"); time.sleep(1.6); os.write(m1, b"\r")')"
-if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1$"; then
-    ok "a stray key, a pause, then ENTER on an unwatched port is accepted (a person, not a device)"
+el="$(echo "$out" | sed -n 's/^ELAPSED=//p')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
+    ok "a stray key, a pause, then ENTER on an unwatched port applies nothing"
 else
-    echo "$out"; bad "ENTER after a stray key and a pause was rejected on the serial-only first-boot path"
+    echo "$out"; bad "ENTER on an unwatched port applied a console"
 fi
-# ...but a bare ENTER on that same unwatched port still does (serial-only machine, no config).
+# ...and a bare ENTER on that same unwatched port ends the wait early (serial-only machine, no config).
 out="$(run_enter_case '' 'os.write(m1, b"\r")')"
-if echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1$"; then
-    ok "a bare ENTER on an unwatched port still selects it - the serial-only first-boot case"
+el="$(echo "$out" | sed -n 's/^ELAPSED=//p')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE" && [ "${el%.*}" -le 1 ]; then
+    ok "a bare ENTER on an unwatched port applies nothing and ends the wait early (${el}s of 3s)"
 else
-    echo "$out"; bad "bare ENTER on a serial-only machine no longer selects the console"
+    echo "$out"; bad "bare ENTER applied a console"
+fi
+
+# A device burst containing a TAB byte on an unwatched port must not open the edit screen there.
+out="$(run_enter_case '' 'os.write(m1, b"OL\t230V\r\n")')"
+if ! echo "$out" | grep -q "DIALOG_OPENED" && echo "$out" | grep -q "^DONE"; then
+    ok "a device status line containing a TAB on an unwatched port does not open the edit screen"
+else
+    echo "$out"; bad "a TAB inside a device burst opened the edit screen on an unwatched port"
+fi
+# Control: a bare TAB (a person) on that same unwatched port still opens it.
+out="$(run_enter_case '' 'os.write(m1, b"\t")')"
+if echo "$out" | grep -q "DIALOG_OPENED"; then
+    ok "a bare TAB on an unwatched port still opens the edit screen (serial-only first boot)"
+else
+    echo "$out"; bad "a person's TAB on an unwatched port no longer opens the edit screen"
+fi
+
+# =============================================================================
+echo "== init: operator scenario - config says ttyS1, operator is on tty0: TAB+confirm, ENTER and a timeout must ALL leave the configured console =="
+run_scenario() {
+    # $1=FAT pref  $2=python statements run ~1s in (keys on m0=tty0 stand-in, m1=ttyS1 stand-in)
+    d="$(fresh_env)"
+    mkdir -p "$d/root/sys/class/tty/console"
+    echo "faketty0" > "$d/root/sys/class/tty/console/active"
+    cat > "$d/scenario.py" <<PYEOF
+import os, pty, time, subprocess
+m0, s0 = pty.openpty()
+m1, s1 = pty.openpty()
+os.symlink(os.ttyname(s0), "$d/root/dev/faketty0")
+os.symlink(os.ttyname(s1), "$d/root/dev/ttyS1")
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+dialog() { printf '%s' "\$8" >&2; return 0; }
+apply_zfsboot_kv() { echo "APPLIED:\$1"; }
+read_fat_console_pref() { echo "$1"; }
+ROOTFS="$d/root"
+ZFSBOOT_CONSOLE_CMDLINE=""
+ACTIVE_TTY="faketty0"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="3"
+_boot_args_interrupt
+echo "DONE"
+'''
+p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(1)
+$2
+out, _ = p.communicate(timeout=15)
+print(out.decode(errors="replace"))
+PYEOF
+    timeout 20 python3 "$d/scenario.py" 2>&1
+    rm -rf "$d"
+}
+# TAB on tty0, confirm the pre-filled line unchanged: the configured console must survive.
+out="$(run_scenario 'ttyS1,9600n8' 'os.write(m0, b"\t")')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
+    ok "config ttyS1,9600n8, TAB pressed on tty0 and confirmed unchanged -> nothing is applied, the configured console stays (not the console TAB was pressed on)"
+else
+    echo "$out"; bad "TAB on tty0 + confirm moved the console away from the configured one"
+fi
+# ENTER on tty0 and a plain timeout: both apply nothing and end identically.
+out="$(run_scenario 'ttyS1,9600n8' 'os.write(m0, b"\r")')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
+    ok "config ttyS1, ENTER on tty0 -> nothing applied (configured console untouched)"
+else
+    echo "$out"; bad "ENTER on tty0 changed the console"
+fi
+out="$(run_scenario 'ttyS1,9600n8' 'pass')"
+if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
+    ok "config ttyS1, no key (timeout) -> nothing applied - identical to ENTER"
+else
+    echo "$out"; bad "a timeout applied a console"
+fi
+# No config: TAB proposes the resolved default (the active console), never another port.
+out="$(run_scenario '' 'os.write(m0, b"\t")')"
+if ! echo "$out" | grep -q "APPLIED:alpine-zfsboot.console=ttyS1"; then
+    ok "no config, TAB on tty0 -> never proposes another port's console"
+else
+    echo "$out"; bad "no-config TAB proposed an unexpected console"
+fi
+
+# =============================================================================
+echo "== init: read_fat_console_pref() never silently loses the config layer (ESP mounted rw elsewhere / mount fails) =="
+extract_pref_fns() {
+    sed -n '/^_read_console_pref_from()/,/^}/p; /^read_fat_console_pref()/,/^}/p' "$REPO_ROOT/init/init"
+}
+d="$(mktemp -d)"
+mkdir -p "$d/esp/EFI/ALPINE"
+echo "alpine-zfsboot.console=ttyS0,115200n8" > "$d/esp/EFI/ALPINE/config"
+echo "ttyS1,9600n8" > "$d/cache"
+# (a) mount fails, device is mounted elsewhere (/proc/mounts) -> read it from there.
+echo "/dev/fake1 $d/esp vfat rw 0 0" > "$d/mounts"
+out_a="$(busybox ash -c "
+$(extract_pref_fns)
+msg() { :; }
+mount() { return 32; }
+awk() { command awk \"\$@\" \"$d/mounts\"; }
+ALPINE_ZFSBOOT_ESP_DEV=/dev/fake1
+_CONSOLE_PREF_CACHE='$d/cache'
+read_fat_console_pref
+" 2>/dev/null)"
+# (b) mount fails and it is not mounted anywhere -> last known value, not empty.
+echo "ttyS1,9600n8" > "$d/cache"
+: > "$d/mounts"
+out_b="$(busybox ash -c "
+$(extract_pref_fns)
+msg() { :; }
+mount() { return 32; }
+awk() { command awk \"\$@\" \"$d/mounts\"; }
+ALPINE_ZFSBOOT_ESP_DEV=/dev/fake1
+_CONSOLE_PREF_CACHE='$d/cache'
+read_fat_console_pref
+" 2>/dev/null)"
+rm -rf "$d"
+if [ "$out_a" = "ttyS0,115200n8" ]; then
+    ok "mount fails but the ESP is mounted elsewhere -> the config console is read from that mount, not lost"
+else
+    echo "GOT: [$out_a]"; bad "config layer lost when the ESP was already mounted read-write"
+fi
+if [ "$out_b" = "ttyS1,9600n8" ]; then
+    ok "ESP unreadable -> the last known configured console is kept (with a warning), never 'no config'"
+else
+    echo "GOT: [$out_b]"; bad "config layer silently disappeared on a failed re-read"
 fi
 
 # =============================================================================
@@ -4733,7 +4887,7 @@ dialog() {
                 # second answer into an infinite edit-again loop (caught
                 # the hard way: this exact test hung and timed out the
                 # whole suite before this fixture was corrected).
-                echo "alpine-zfsboot.console=tty0" >&2
+                echo "alpine-zfsboot.console=tty0 alpine-zfsboot.timeout=5" >&2
             fi
             return 0
             ;;

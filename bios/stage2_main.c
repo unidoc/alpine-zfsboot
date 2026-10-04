@@ -229,6 +229,7 @@ void stage2_main(uint8_t drive_number)
 	uint32_t real_mode_sectors, real_mode_bytes, protected_mode_size, header_len;
 	uint32_t cmdline_len;
 	uint8_t e820_count;
+	struct boot_video video;
 	int i;
 
 	/*
@@ -463,9 +464,11 @@ void stage2_main(uint8_t drive_number)
 
 	for (i = 0; i < (int)BOOT_PARAMS_SIZE; i++)
 		g_boot_params[i] = 0;
-	bootparams_build(g_boot_params, &kernel_hdr, INITRD_LOAD_ADDR, initrd_file.size,
-	                  phys_of(g_cmdline), g_e820, e820_count);
-
+	/* Print first, query after: screen_info's cursor must be where the
+	 * kernel's own console output will start, i.e. below this line. */
 	console_puts("alpine-zfsboot-bios: starting kernel\n");
+	console_query_video(&video);
+	bootparams_build(g_boot_params, &kernel_hdr, INITRD_LOAD_ADDR, initrd_file.size,
+	                  phys_of(g_cmdline), g_e820, e820_count, &video);
 	jump_to_kernel(kernel_hdr.code32_start, phys_of(g_boot_params));
 }

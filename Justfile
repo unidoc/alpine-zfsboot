@@ -152,6 +152,18 @@ test-iso-atapi:
 test-hdd-entry:
     ./tests/bios-hdd-entry-test.sh
 
+# just test-vga-console  - boots the built ISO in QEMU with VGA only (no
+# serial) and requires "press TAB to interrupt" on the VGA text screen;
+# guards the BIOS screen_info fix (bios/bootparams.c). Needs qemu + python3
+# and a prior `just build x86_64`.
+test-vga-console:
+    ./tests/bios-vga-console-test.sh
+
+# just test-bootparams-host  - host-native test of the boot_params
+# screen_info bytes bootparams_build() writes (needs only gcc).
+test-bootparams-host:
+    ./bios/tests/run-bootparams-host-test.sh
+
 # just test-ata-atapi-host  - host-native regression test for
 # ata_atapi.c's own multi-phase transfer bookkeeping (see
 # ata_atapi_host_test.c's own header comment).
