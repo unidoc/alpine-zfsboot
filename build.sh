@@ -618,6 +618,10 @@ mkdir -p "$BUILD_DIR/features.d"
     # path die() points at). Same fail-loudly rule as sgdisk above.
     command -v fsck.fat
     command -v fsck.vfat
+    # zdb (ships in the same `zfs` apk package as zpool/zfs above): ZFS has
+    # no fsck, and zdb (-l labels, -u uberblocks, -e on an unimported pool)
+    # is what a recovery session reaches for when `zpool import` refuses.
+    command -v zdb
     # apk itself, in the RESCUE SHELL - not this build container's own
     # copy re-purposed, a real, deliberate design choice: rather than
     # hand-picking one more individual tool into this list every time
