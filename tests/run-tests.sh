@@ -4529,6 +4529,99 @@ else
 fi
 
 # =============================================================================
+echo "== init: the pre-boot prompt warns when the selected console is present but dead (PR #21 review F2) =="
+d="$(fresh_env)"
+mkdir -p "$d/root/sys/class/tty/console"
+echo "faketty0" > "$d/root/sys/class/tty/console/active"
+cat > "$d/deadwarn.py" <<PYEOF
+import os, pty, time, subprocess, select
+m0, s0 = pty.openpty()
+os.symlink(os.ttyname(s0), "$d/root/dev/faketty0")
+os.symlink("/dev/null", "$d/root/dev/ttyS1")   # exists, but stty -g fails: the PORT_UNKNOWN shape
+script = '''
+$(extract_boot_args_interrupt_all)
+msg() { :; }
+dialog() { return 1; }
+apply_zfsboot_kv() { :; }
+read_fat_console_pref() { echo "ttyS1"; }
+ROOTFS="$d/root"
+ZFSBOOT_CONSOLE_CMDLINE=""
+CONSOLE_UNUSABLE=""
+ACTIVE_TTY="ttyS1"
+ACTIVE_CONSOLE_OPTS=""
+BOOT_ARGS_TIMEOUT="2"
+_boot_args_interrupt
+echo "DONE"
+'''
+p = subprocess.Popen(["busybox", "ash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid, close_fds=True)
+time.sleep(0.5)
+os.write(m0, b"\\r")
+out, _ = p.communicate(timeout=15)
+buf = b""
+while select.select([m0], [], [], 0.3)[0]:
+    buf += os.read(m0, 4096)
+print(buf.decode(errors="replace"))
+PYEOF
+out="$(timeout 20 python3 "$d/deadwarn.py" 2>&1)"
+rm -rf "$d"
+if echo "$out" | grep -q "the boot will STOP in the recovery shell"; then
+    ok "a configured console that exists but cannot be opened gets the 'boot will STOP' warning on the prompt, not a plain 'current console'"
+else
+    echo "$out"; bad "no warning for a present-but-dead selected console"
+fi
+
+# =============================================================================
+echo "== boot-dataset.sh: console handoff - line options, rescue-SSH (no env), netconsole= word match (PR #21 review F4) =="
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+ALPINE_ZFSBOOT_ACTIVE_TTY=ttyS1 ALPINE_ZFSBOOT_ACTIVE_CONSOLE_OPTS=9600n8 STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -q -- "--command-line=root=ZFS=zroot/ROOT/alpine ro console=ttyS1,9600n8 " "$d/log" 2>/dev/null; then
+    ok "the configured line options (9600n8) reach the next kernel's console=, not a hardcoded 115200n8"
+else
+    cat "$d/log" 2>/dev/null; bad "console line options were not handed to the next kernel"
+fi
+rm -rf "$d"
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot" "$d/root/tmp/alpine-zfsboot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+echo "ttyS1" > "$d/root/tmp/alpine-zfsboot/active-console"
+echo "9600n8" > "$d/root/tmp/alpine-zfsboot/active-console-opts"
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" >"$d/out" 2>&1 || true
+if grep -q -- "--command-line=root=ZFS=zroot/ROOT/alpine ro console=ttyS1,9600n8 " "$d/log" 2>/dev/null; then
+    ok "a rescue-SSH session (no environment) still hands over the console /init decided, from its active-console files"
+else
+    cat "$d/log" 2>/dev/null; bad "rescue-SSH handoff did not use /init's decided console"
+fi
+rm -rf "$d"
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+ALPINE_ZFSBOOT_ACTIVE_TTY=ttyS0 STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" "" "netconsole=@/,@10.0.0.1/ x=1" >"$d/out" 2>&1 || true
+if grep -q -- "console=ttyS0,115200n8 panic=10 netconsole=" "$d/log" 2>/dev/null; then
+    ok "netconsole= in the cmdline does not suppress the injected console= (word match, not substring)"
+else
+    cat "$d/log" 2>/dev/null; bad "netconsole= suppressed the console= handoff"
+fi
+rm -rf "$d"
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+ALPINE_ZFSBOOT_ACTIVE_TTY=ttyS0 STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" \
+    run_stubbed "$REPO_ROOT/init/boot-dataset.sh" "zroot/ROOT/alpine" "zroot" "" "quiet
+console=ttyS1,57600" >"$d/out" 2>&1 || true
+if ! grep -q -- "console=ttyS0,115200n8" "$d/log" 2>/dev/null && grep -q -- "console=ttyS1,57600" "$d/log" 2>/dev/null; then
+    ok "a console= at the start of a later line of a multi-line cmdline is still an explicit console (whitespace normalised)"
+else
+    cat "$d/log" 2>/dev/null; bad "a multi-line cmdline's console= was not recognised"
+fi
+rm -rf "$d"
+
+# =============================================================================
 echo "== init: operator scenario - config says ttyS1, operator is on tty0: TAB+confirm, ENTER and a timeout must ALL leave the configured console =="
 run_scenario() {
     # $1=FAT pref  $2=python statements run ~1s in (keys on m0=tty0 stand-in, m1=ttyS1 stand-in)
@@ -4544,7 +4637,7 @@ os.symlink(os.ttyname(s1), "$d/root/dev/ttyS1")
 script = '''
 $(extract_boot_args_interrupt_all)
 msg() { :; }
-dialog() { printf '%s' "\$8" >&2; return 0; }
+dialog() { printf 'PROPOSED=[%s]\n' "\$8" >> "$d/proposed.log"; printf '%s' "\$8" >&2; return 0; }
 apply_zfsboot_kv() { echo "APPLIED:\$1"; }
 read_fat_console_pref() { echo "$1"; }
 ROOTFS="$d/root"
@@ -4561,12 +4654,18 @@ time.sleep(1)
 $2
 out, _ = p.communicate(timeout=15)
 print(out.decode(errors="replace"))
+print(open("$d/proposed.log").read() if os.path.exists("$d/proposed.log") else "PROPOSED=(dialog not opened)")
 PYEOF
     timeout 20 python3 "$d/scenario.py" 2>&1
     rm -rf "$d"
 }
 # TAB on tty0, confirm the pre-filled line unchanged: the configured console must survive.
 out="$(run_scenario 'ttyS1,9600n8' 'os.write(m0, b"\t")')"
+if echo "$out" | grep -qx 'PROPOSED=\[alpine-zfsboot.console=ttyS1,9600n8\]'; then
+    ok "config ttyS1,9600n8, TAB on tty0 -> the edit line proposes the CONFIGURED console (a mutant proposing the pressed console fails this)"
+else
+    echo "$out" | grep PROPOSED; bad "TAB on tty0 did not propose the configured console"
+fi
 if ! echo "$out" | grep -q "APPLIED:" && echo "$out" | grep -q "^DONE"; then
     ok "config ttyS1,9600n8, TAB pressed on tty0 and confirmed unchanged -> nothing is applied, the configured console stays (not the console TAB was pressed on)"
 else

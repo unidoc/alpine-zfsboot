@@ -966,7 +966,7 @@ countdown (15s by default), on every openable console at once
 only console is serial or only VGA is reachable from the first boot with
 no config. TAB on any of them opens an editable line pre-filled with the
 configured console (`EFI/ALPINE/config`, or the resolved default when none is
-configured), whichever console TAB was pressed on; ENTER only ends the countdown early - it is exactly a
+configured), regardless of which console TAB was pressed on; ENTER only ends the countdown early - it is exactly a
 timeout that arrived sooner and never changes the console (a port that
 sends bytes in a burst, like a UPS status line, is not treated as a person
 pressing ENTER). A confirmed edit there is a genuine, full passthrough

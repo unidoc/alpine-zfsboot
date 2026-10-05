@@ -39,6 +39,15 @@ int main(void)
 	      BOOT_PARAMS_SCREEN_VIDEO_LINES == 0x0e && BOOT_PARAMS_SCREEN_VIDEO_ISVGA == 0x0f &&
 	      BOOT_PARAMS_SCREEN_VIDEO_POINTS == 0x10);
 
+	/* Bit 7 of the BIOS mode byte ("memory not cleared") is masked off. */
+	v.mode = 0x83;
+	memset(bp, 0, sizeof(bp));
+	bootparams_build(bp, &hdr, 0x4000000, 1234, 0x20000, &e, 1, &v);
+	CHECK(bp[BOOT_PARAMS_SCREEN_VIDEO_ISVGA] == 1);
+	CHECK(bp[BOOT_PARAMS_SCREEN_VIDEO_MODE] == 3);
+	CHECK(bp[BOOT_PARAMS_SCREEN_VIDEO_LINES] == 25);
+	v.mode = 3;
+
 	/* No video info, or a non-text/graphics mode: left zeroed, as before. */
 	memset(bp, 0, sizeof(bp));
 	bootparams_build(bp, &hdr, 0x4000000, 1234, 0x20000, &e, 1, NULL);

@@ -458,6 +458,8 @@ ALPINE_ZFSBOOT_PANIC_TIMEOUT=""
 # not set" abort under this file's own `set -u` instead, on every
 # select_console() call on such a machine.
 ALPINE_ZFSBOOT_ESP_DEV=""
+# Last successfully read persisted console (see read_fat_console_pref()).
+_CONSOLE_PREF_CACHE=/tmp/alpine-zfsboot-console-pref.cache
 # Persisted console choice (see select_console()'s own comment for the
 # full mechanism) - empty means "no persisted preference", not "tty0
 # specifically"; select_console()'s own kernel-reported default still
@@ -696,7 +698,7 @@ if [ -z "$ROOTFS" ]; then
         if mount -t vfat -o ro "$esp_candidate" /tmp/esp-config 2>/dev/null; then
             # Seed the console-pref cache (see read_fat_console_pref).
             sed -n 's/^alpine-zfsboot\.console=//p' /tmp/esp-config/EFI/ALPINE/config 2>/dev/null |
-                tail -n 1 | tr -d '\r' > /tmp/alpine-zfsboot-console-pref.cache
+                tail -n 1 | tr -d '\r' > "$_CONSOLE_PREF_CACHE"
             if [ -r "/tmp/esp-config/EFI/ALPINE/config" ]; then
                 msg "applying persisted config (cmdline still overrides)"
                 ZFSBOOT_KV_SOURCE=config
@@ -875,7 +877,6 @@ export ALPINE_ZFSBOOT_NET \
 # shell to fix it - the very fix path die() points at), read it from where
 # it is already mounted, and failing that fall back to the value last read
 # successfully (seeded at boot) WITH a warning - never "no config".
-_CONSOLE_PREF_CACHE=/tmp/alpine-zfsboot-console-pref.cache
 _read_console_pref_from() {
     sed -n 's/^alpine-zfsboot\.console=//p' "$1/EFI/ALPINE/config" 2>/dev/null |
         tail -n 1 | tr -d '\r'
@@ -1614,15 +1615,12 @@ _boot_args_wait_for_tab() {
 # there, nothing synthesized) - plus an explicit console=TTY[,OPTS],
 # only when cmdline didn't already name one itself, so there is always
 # something concrete and correct to look at, never a blank line
-# pretending nothing is configured. TTY/OPTS are passed in explicitly
-# by the caller (_boot_args_interrupt(), from _boot_args_wait_for_tab()'s
-# own winning device) - NOT read from ACTIVE_TTY/ACTIVE_CONSOLE_OPTS,
-# since the operator may have pressed TAB on a DIFFERENT console than
-# the one select_console() would otherwise have picked as primary (the
-# real incident this whole multi-console poll exists for: kernel
-# default was ttyS0, the operator was watching tty0 over VGA). Echoes
-# the line; reads $ROOTFS/proc/cmdline (same ROOTFS-prefix convention
-# the real cmdline-parsing loop near the top of this file already
+# pretending nothing is configured. TTY/OPTS are passed in explicitly by
+# the caller (_boot_args_interrupt()): the console the CONFIG names
+# (EFI/ALPINE/config), or the resolved default when none is configured -
+# never the console TAB happened to be pressed on. Echoes the line; reads
+# $ROOTFS/proc/cmdline (same ROOTFS-prefix convention the real
+# cmdline-parsing loop near the top of this file already
 # uses).
 _boot_args_default_line() {
     tty="$1"
@@ -1633,19 +1631,10 @@ _boot_args_default_line() {
             alpine-zfsboot.*) default_line="$default_line $arg" ;;
         esac
     done
-    # A gap: synthesizing a console= default
-    # for a tty select_console() will NEVER actually recognize (see
-    # _known_console_names's own comment - e.g. an operator editing
-    # from a kernel-registered hvc0) handed back a default line that,
-    # confirmed completely unchanged, immediately triggers the
-    # reject/force yesno about the very console the operator is
-    # reading it on - a guaranteed, confusing dead end for the one
-    # case (editing from an unsupported-but-real console) this synthesis
-    # was supposed to make convenient. Leaving console= out of the
-    # default line entirely here is strictly safer than proposing a
-    # value already known to be rejected - an operator who wants to set
-    # one can still type it by hand, informed by
-    # notify_inactive_consoles()'s own matching fix for this same gap.
+    # The configured console is always SHOWN, even a name select_console()
+    # would not recognize (a hand-edited ttyS3/hvc0): hiding it would make
+    # the operator think nothing is configured. Confirming the line
+    # unchanged is a no-op, so showing it can never apply it.
     case " $default_line " in
         *" alpine-zfsboot.console="*) : ;;
         *)
@@ -1762,10 +1751,17 @@ _boot_args_interrupt() {
             _console_source="kernel default"
         fi
     fi
+    # Same two gates the main loop dies on: CONSOLE_UNUSABLE, and a selected
+    # node that exists but cannot be opened (PORT_UNKNOWN serial).
+    _unusable="$CONSOLE_UNUSABLE"
+    if [ -z "$_unusable" ] && [ -n "$ACTIVE_TTY" ] \
+        && ! ( stty -g < "$ROOTFS/dev/$ACTIVE_TTY" ) >/dev/null 2>&1; then
+        _unusable="/dev/$ACTIVE_TTY ($_console_source) cannot be opened this boot"
+    fi
     for tty_dev in $ttys; do
-        if [ -n "$CONSOLE_UNUSABLE" ]; then
+        if [ -n "$_unusable" ]; then
             printf 'alpine-zfsboot: WARNING: %s - the boot will STOP in the recovery shell unless you press TAB and change it\n' \
-                "$CONSOLE_UNUSABLE" > "$tty_dev" 2>/dev/null
+                "$_unusable" > "$tty_dev" 2>/dev/null
         else
             printf 'alpine-zfsboot: current console is /dev/%s (%s)\n' \
                 "$ACTIVE_TTY" "$_console_source" > "$tty_dev" 2>/dev/null

@@ -56,11 +56,14 @@ int bootparams_build(uint8_t boot_params[BOOT_PARAMS_SIZE],
 	 * before. 25 lines / 16-pixel cells are the standard VGA text mode
 	 * values.
 	 */
-	if (video && video->mode <= 3 && video->cols >= 40) {
+	/* Bit 7 of INT 0x10 AH=0x0F's AL is the "memory not cleared" flag on
+	 * some BIOSes (SeaBIOS ORs it in from BDA 0x487); Linux's own real-mode
+	 * setup masks it the same way (arch/x86/boot/video.c). */
+	if (video && (video->mode & 0x7f) <= 3 && video->cols >= 40) {
 		boot_params[BOOT_PARAMS_SCREEN_ORIG_X] = video->cursor_col;
 		boot_params[BOOT_PARAMS_SCREEN_ORIG_Y] = video->cursor_row;
 		boot_params[BOOT_PARAMS_SCREEN_VIDEO_PAGE] = video->page;
-		boot_params[BOOT_PARAMS_SCREEN_VIDEO_MODE] = video->mode;
+		boot_params[BOOT_PARAMS_SCREEN_VIDEO_MODE] = video->mode & 0x7f;
 		boot_params[BOOT_PARAMS_SCREEN_VIDEO_COLS] = video->cols;
 		boot_params[BOOT_PARAMS_SCREEN_VIDEO_EGA_BX] = 3;
 		boot_params[BOOT_PARAMS_SCREEN_VIDEO_LINES] = 25;

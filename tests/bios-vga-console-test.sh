@@ -39,14 +39,36 @@ result="$(python3 - "$PORT" "$W/vga.bin" "$NEEDLE" <<'PYEOF'
 import socket, sys, time
 port, path, needle = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 
+def read_until_prompt(s, timeout=10.0):
+    # Same pattern as tests/bios-iso-entry-test.sh: wait for the monitor's
+    # "(qemu)" prompt instead of a fixed sleep (a fixed sleep read stale data
+    # under a host stall).
+    s.settimeout(0.5)
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+        if buf.rstrip().endswith(b"(qemu)"):
+            break
+    return buf
+
 def snap():
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    time.sleep(0.2); s.recv(4096)
-    s.sendall(f'pmemsave 0xb8000 0x4000 "{path}"\n'.encode())
-    time.sleep(0.4); s.recv(8192); s.close()
+    read_until_prompt(s)
+    # vgacon hardware-scrolls through its whole 32 KiB window once the screen
+    # fills, so the prompt is not necessarily in the first 25 rows: save the
+    # whole window and search every row.
+    s.sendall(f'pmemsave 0xb8000 0x8000 "{path}"\n'.encode())
+    read_until_prompt(s); s.close()
     d = open(path, "rb").read()
     return "\n".join("".join(chr(d[(r*80+c)*2]) if 32 <= d[(r*80+c)*2] < 127 else " "
-                             for c in range(80)).rstrip() for r in range(25))
+                             for c in range(80)).rstrip() for r in range(len(d) // 160))
 
 time.sleep(2)
 deadline, last = time.time() + 150, "(no screen captured)"

@@ -737,7 +737,7 @@ active_tty="${ALPINE_ZFSBOOT_ACTIVE_TTY:-}"
 [ -n "$active_tty" ] || active_tty="$(cat "$ROOTFS/tmp/alpine-zfsboot/active-console" 2>/dev/null)"
 active_opts="${ALPINE_ZFSBOOT_ACTIVE_CONSOLE_OPTS:-}"
 [ -n "$active_opts" ] || active_opts="$(cat "$ROOTFS/tmp/alpine-zfsboot/active-console-opts" 2>/dev/null)"
-case " $extra_cmdline " in
+case " $(printf '%s' "$extra_cmdline" | tr -s '[:space:]' ' ') " in
     *" console="*) console_cmdline="" ;;
     *)
         case "${active_tty:-tty0}" in
