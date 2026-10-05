@@ -956,17 +956,20 @@ priority: tty0 (the kernel's own baked-in default); a persisted
 and only persisted preference - no UEFI NVRAM variable, no
 firmware-dependent second mechanism, and matched against the real
 `/dev` node regardless of whether the kernel itself ever registered it
-as a console); and an explicit `console=` on the real kernel cmdline,
-which always wins. Before any of this runs, `/init` shows a GRUB-style
+as a console); and an explicit `alpine-zfsboot.console=` on the kernel
+cmdline (or typed on the TAB edit line), which always wins. A plain kernel
+`console=` only sets the default that `EFI/ALPINE/config` then overrides.
+Before any of this runs, `/init` shows a GRUB-style
 "press TAB to interrupt or ENTER to continue now" prompt with a
 countdown (15s by default), on every openable console at once
 (`tty0`, `ttyS0`-`ttyS2`, `ttyAMA0`), on every boot, so a machine whose
 only console is serial or only VGA is reachable from the first boot with
 no config. TAB on any of them opens an editable line pre-filled with the
-resolved default; ENTER skips the rest of the countdown. Either way the
-console the key was pressed on becomes the active console for that boot
-(a port that sends bytes in a burst, like a UPS status line, is not
-treated as a person pressing ENTER). A confirmed edit there is a genuine, full passthrough
+configured console (`EFI/ALPINE/config`, or the resolved default when none is
+configured), regardless of which console TAB was pressed on; ENTER only ends the countdown early - it is exactly a
+timeout that arrived sooner and never changes the console (a port that
+sends bytes in a burst, like a UPS status line, is not treated as a person
+pressing ENTER). A confirmed edit there is a genuine, full passthrough
 onto the same cmdline layer (`alpine-zfsboot install --console`, or
 hand-editing `EFI/ALPINE/config`, is how a
 choice is made to persist across reboots instead).

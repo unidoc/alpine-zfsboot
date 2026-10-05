@@ -25,6 +25,34 @@
  */
 #define BOOT_PARAMS_SIZE 4096
 
+/*
+ * struct screen_info sits at offset 0 of boot_params
+ * (include/uapi/linux/screen_info.h). This loader enters the kernel at its
+ * 32-bit entry point, so the kernel's own real-mode setup code - the code
+ * that normally reads the BIOS video state into screen_info - never runs.
+ * Left zeroed, the kernel has no idea a VGA text console exists and tty0
+ * (console=tty0) shows nothing on the screen after "starting kernel".
+ * Only the fields vgacon actually uses are modelled.
+ */
+#define BOOT_PARAMS_SCREEN_ORIG_X 0x00          /* uint8_t  cursor column */
+#define BOOT_PARAMS_SCREEN_ORIG_Y 0x01          /* uint8_t  cursor row */
+#define BOOT_PARAMS_SCREEN_VIDEO_PAGE 0x04      /* uint16_t */
+#define BOOT_PARAMS_SCREEN_VIDEO_MODE 0x06      /* uint8_t  BIOS mode (3 = 80x25 colour text) */
+#define BOOT_PARAMS_SCREEN_VIDEO_COLS 0x07      /* uint8_t */
+#define BOOT_PARAMS_SCREEN_VIDEO_EGA_BX 0x0a    /* uint16_t low byte != 0x10 => EGA/VGA colour */
+#define BOOT_PARAMS_SCREEN_VIDEO_LINES 0x0e     /* uint8_t */
+#define BOOT_PARAMS_SCREEN_VIDEO_ISVGA 0x0f     /* uint8_t  1 = VGA */
+#define BOOT_PARAMS_SCREEN_VIDEO_POINTS 0x10    /* uint16_t character height */
+
+/* BIOS video state, as read via INT 0x10 (console_query_video()). */
+struct boot_video {
+	uint8_t mode;
+	uint8_t cols;
+	uint8_t page;
+	uint8_t cursor_row;
+	uint8_t cursor_col;
+};
+
 #define BOOT_PARAMS_HDR_OFFSET 0x1f1          /* struct setup_header, see below */
 #define BOOT_PARAMS_E820_ENTRIES_OFFSET 0x1e8 /* uint8_t: number of valid entries in the table below */
 #define BOOT_PARAMS_E820_TABLE_OFFSET 0x2d0   /* struct boot_e820_entry[128], 20 bytes each */
@@ -122,6 +150,7 @@ int bootparams_build(uint8_t boot_params[BOOT_PARAMS_SIZE],
                       const struct setup_header *kernel_hdr,
                       uint32_t initrd_addr, uint32_t initrd_size,
                       uint32_t cmdline_addr,
-                      const struct boot_e820_entry *e820, uint8_t e820_count);
+                      const struct boot_e820_entry *e820, uint8_t e820_count,
+                      const struct boot_video *video);
 
 #endif
