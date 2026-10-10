@@ -223,7 +223,7 @@ func TestWritePayloadWithRollback_MissingVersionRollsBackWholeGeneration(t *test
 	initrd := buildFakeInitrdBytes(t, "2.4.4-1")
 	cmdlineTxt := []byte("root=ZFS=zroot/ROOT/default ro\n") // no alpine-zfsboot.version=/buildstamp=
 
-	err := writePayloadWithRollback(mountpoint, "aarch64", "", "", kernel, initrd, cmdlineTxt)
+	err := writePayloadWithRollback(mountpoint, "aarch64", "", "", kernel, initrd, cmdlineTxt, "warn")
 	if err == nil {
 		t.Fatal("writePayloadWithRollback with no version/buildstamp: want an error, got nil")
 	}
@@ -244,7 +244,7 @@ func TestWritePayloadWithRollback_WritesRealMetadata(t *testing.T) {
 	initrd := buildFakeInitrdBytes(t, "2.4.4-1")
 	cmdlineTxt := []byte("root=ZFS=zroot/ROOT/default ro alpine-zfsboot.buildstamp=20260923T150000Z alpine-zfsboot.version=0.1.0\n")
 
-	if err := writePayloadWithRollback(mountpoint, "aarch64", "0.1.0", "20260923T150000Z", kernel, initrd, cmdlineTxt); err != nil {
+	if err := writePayloadWithRollback(mountpoint, "aarch64", "0.1.0", "20260923T150000Z", kernel, initrd, cmdlineTxt, "warn"); err != nil {
 		t.Fatalf("writePayloadWithRollback: %v", err)
 	}
 
@@ -303,11 +303,14 @@ func TestWritePayloadWithRollback_MetadataFailureRollsBackWholeGeneration(t *tes
 	// SUCCEEDS - but the metadata-generation step that runs AFTER it
 	// will fail for real when it tries to actually deep-inspect these
 	// bytes, exactly the failure this test exists to drive.
-	newKernel := buildFakeKernelBytes("6.18.53-0-lts")
+	// bzImage-shaped, so the x86_64 CHECKSUM generation (which runs
+	// before any write) accepts it and the failure really comes from
+	// metadata generation after the payload was written.
+	newKernel := buildFakeBzImage("6.18.53-0-lts", 0x4e)
 	newInitrd := []byte("not a real initrd at all")
 	newCmdline := []byte("NEW-cmdline\n")
 
-	err := writePayloadWithRollback(mountpoint, "x86_64", "0.1.0", "20260923T150000Z", newKernel, newInitrd, newCmdline)
+	err := writePayloadWithRollback(mountpoint, "x86_64", "0.1.0", "20260923T150000Z", newKernel, newInitrd, newCmdline, "warn")
 	if err == nil {
 		t.Fatal("want an error (metadata generation must fail on an unparseable initrd), got nil")
 	}
@@ -820,7 +823,7 @@ func TestBackupPayload_UnreadableExistingFileRefusesBeforeWriting(t *testing.T) 
 	}
 	err = writePayloadWithRollback(mountpoint, "x86_64", "0.1.0", "20260923T150000Z",
 		buildFakeKernelBytes("6.18.53-0-lts"), buildFakeInitrdBytes(t, "9.9.9-1"),
-		[]byte("root=ZFS=zroot/ROOT/default ro\n"))
+		[]byte("root=ZFS=zroot/ROOT/default ro\n"), "warn")
 	if err == nil {
 		t.Fatal("writePayloadWithRollback on an untrustworthy backup: want an error, got nil")
 	}

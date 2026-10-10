@@ -67,6 +67,11 @@ jobs:
       - name: efi/cmdline_core_test.c
         run: cc -std=c11 -Wall -Wextra -Werror -DALPINE_ZFSBOOT_CMDLINE_TEST -o /tmp/cmdline_core_test efi/cmdline_core_test.c && /tmp/cmdline_core_test
 
+      # The same with the release toolchain (Alpine gcc, -Werror): a newer
+      # gcc's new warnings must show up here, not first in a release build.
+      - name: efi/cmdline_core_test.c (Alpine toolchain)
+        run: ./tests/ci-alpine.sh sh -c 'cc -std=c11 -Wall -Wextra -Werror -DALPINE_ZFSBOOT_CMDLINE_TEST -o /tmp/cmdline_core_test efi/cmdline_core_test.c && /tmp/cmdline_core_test'
+
   kernel-integration-test:
     # tests/kernel-integration-test.sh's own header comment for the
     # full why - boots a REAL Linux kernel in QEMU against a real,
@@ -129,14 +134,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install xorriso, dosfstools, mtools, qemu
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y xorriso dosfstools mtools qemu-system-x86
+      # In alpine:<alpine-version.txt> (tests/ci-alpine.sh): the release
+      # toolchain, not the runner's gcc.
+      - name: Run tests/bios-iso-entry-test.sh (Alpine toolchain)
+        run: ./tests/ci-alpine.sh ./tests/bios-iso-entry-test.sh
 
-      - name: Run tests/bios-iso-entry-test.sh
-        run: ./tests/bios-iso-entry-test.sh
+      # The ISO's per-block checks under fault injection (INT 13h and
+      # ATAPI backends), the ISO without CHECKSUM/BLKSUM, and every cap.
+      - name: Run tests/bios-iso-fault-test.sh (Alpine toolchain)
+        run: ./tests/ci-alpine.sh ./tests/bios-iso-fault-test.sh
 
   bios-iso-atapi-test:
     # Same real QEMU boot as bios-iso-entry-test, but forces
@@ -179,14 +185,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install xorriso, dosfstools, mtools, qemu
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y xorriso dosfstools mtools qemu-system-x86
-
-      - name: Run tests/bios-iso-entry-test.sh (FORCE_ATAPI=1)
-        run: FORCE_ATAPI=1 ./tests/bios-iso-entry-test.sh
+      - name: Run tests/bios-iso-entry-test.sh (FORCE_ATAPI=1, Alpine toolchain)
+        run: FORCE_ATAPI=1 ./tests/ci-alpine.sh ./tests/bios-iso-entry-test.sh
 
   bios-hdd-entry-test:
     # tests/bios-hdd-entry-test.sh's own header comment for the full
@@ -204,15 +204,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # Tags too: the old1-*/new1-old2 scenarios build the v0.4.1
+          # stage1/stage2 from the tag to boot them against this one.
+          fetch-depth: 0
 
-      - name: Install dosfstools, mtools, qemu
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y dosfstools mtools qemu-system-x86
+      # Size budget first: builds both stages with the release toolchain
+      # (Alpine gcc, tests/ci-alpine.sh) - check-bss-bounds fails the build
+      # if the stage no longer fits - and prints the headroom left.
+      - name: BIOS stage size budget (Alpine toolchain)
+        run: ./tests/ci-alpine.sh sh -c 'make -C bios all ZFSBOOT_VERSION=ci && make -C bios size-report ZFSBOOT_VERSION=ci'
 
+      # Every scenario (see the script's header): CHECKSUM modes
+      # (warn/enforce, cmdline overrides), no CHECKSUM, a corrupted stage2
+      # tail, too little RAM, an init_size overlapping the initrd,
+      # diagnostics, and every pairing of v0.4.1's stage1/stage2 with
+      # this one.
       - name: Run tests/bios-hdd-entry-test.sh
-        run: ./tests/bios-hdd-entry-test.sh
+        run: ./tests/ci-alpine.sh ./tests/bios-hdd-entry-test.sh
+
+      - name: Run tests/bios-hdd-int13-limit-test.sh
+        run: ./tests/ci-alpine.sh ./tests/bios-hdd-int13-limit-test.sh
+
+      # CF=0 with wrong data from the "BIOS" (fault-injection builds):
+      # healed, reported, refused per integrity mode; a mirror disk as
+      # second source; CHS without extensions; 4096-byte sectors.
+      - name: Run tests/bios-hdd-fault-test.sh
+        run: ./tests/ci-alpine.sh ./tests/bios-hdd-fault-test.sh
 
   ata-atapi-host-test:
     # bios/tests/ata_atapi_host_test.c - regression guard for the same
@@ -229,7 +246,7 @@ jobs:
           persist-credentials: false
 
       - name: Run bios/tests/run-ata-atapi-host-test.sh
-        run: ./bios/tests/run-ata-atapi-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-ata-atapi-host-test.sh
 
   bootparams-host-test:
     # bios/tests/bootparams_host_test.c - guards the boot_params.screen_info
@@ -244,7 +261,7 @@ jobs:
           persist-credentials: false
 
       - name: Run bios/tests/run-bootparams-host-test.sh
-        run: ./bios/tests/run-bootparams-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-bootparams-host-test.sh
 
   fat-host-test:
     # bios/tests/fat_host_test.c/build_fat_fixtures.py existed in the tree
@@ -264,7 +281,22 @@ jobs:
           persist-credentials: false
 
       - name: Run bios/tests/run-fat-host-test.sh
-        run: ./bios/tests/run-fat-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-fat-host-test.sh
+
+      - name: Run bios/tests/run-disk-policy-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-disk-policy-host-test.sh
+
+      - name: Run bios/tests/run-e820-range-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-e820-range-host-test.sh
+
+      - name: Run bios/tests/run-payload-sum-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-payload-sum-host-test.sh
+
+      - name: Run bios/tests/run-cmdline-opt-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-cmdline-opt-host-test.sh
+
+      - name: Run bios/tests/run-blkverify-host-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-blkverify-host-test.sh
 
   build-x86_64:
     # Same build.sh invocation release.yml uses for the real tag-

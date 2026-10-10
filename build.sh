@@ -482,6 +482,9 @@ mkdir -p "$BUILD_DIR/features.d"
     # network/dropbear/lifecycle separation this exists to keep real.
     echo "/net-config.sh"
     echo "/rescue-ssh.sh"
+    # esp-select.sh - which ESP /init takes config/keys from (mirrored
+    # boot), sourced by /init.
+    echo "/esp-select.sh"
     # pid-alive.sh - the one _pid_alive() implementation, sourced by
     # both rescue-ssh.sh (a stale dropbear PIDFILE) and zfs-unlock.sh
     # (reclaiming a stale per-encryptionroot operation lock) rather than
@@ -858,12 +861,13 @@ cp "$REPO_ROOT/init/boot-dataset.sh" /boot-dataset.sh
 cp "$REPO_ROOT/init/fix-kexec-dtb.py" /fix-kexec-dtb.py
 cp "$REPO_ROOT/init/net-config.sh" /net-config.sh
 cp "$REPO_ROOT/init/rescue-ssh.sh" /rescue-ssh.sh
+cp "$REPO_ROOT/init/esp-select.sh" /esp-select.sh
 cp "$REPO_ROOT/init/pid-alive.sh" /pid-alive.sh
 cp "$REPO_ROOT/init/zfs-unlock.sh" /zfs-unlock.sh
 cp "$REPO_ROOT/init/zfs-unlock" /zfs-unlock
 cp "$REPO_ROOT/init/alpine-zfsboot-shell" /alpine-zfsboot-shell
 cp "$REPO_ROOT/init/dialogrc" /etc/dialogrc
-chmod +x /menu.py /boot-dataset.sh /fix-kexec-dtb.py /net-config.sh /rescue-ssh.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
+chmod +x /menu.py /boot-dataset.sh /fix-kexec-dtb.py /net-config.sh /rescue-ssh.sh /esp-select.sh /pid-alive.sh /zfs-unlock.sh /zfs-unlock /alpine-zfsboot-shell
 
 # cmd/tool's own binary, built by `just build-tool` (a Justfile
 # dependency of the `build` recipe - see Justfile) BEFORE this script
@@ -1462,8 +1466,12 @@ fi
 # entry uses, see its own header comment) - aarch64 has no legacy-BIOS
 # equivalent, so iso.sh gets called with just the two required
 # arguments there, same as always.
+#
+# PAYLOAD_MANIFEST_CMD: the tool's own writer of EFI/ALPINE/CHECKSUM and
+# BLKSUM (internal/payloadsum), so the BIOS ISO boot checks every block
+# of its kernel/initrd as it loads, like an installed disk does.
 if [ "$ARCH" = "x86_64" ]; then
-    "$REPO_ROOT/iso.sh" "$OUT_FILE" "$ARCH" \
+    PAYLOAD_MANIFEST_CMD="$OUT_DIR/alpine-zfsboot-$ARCH payload-manifest" "$REPO_ROOT/iso.sh" "$OUT_FILE" "$ARCH" \
         "$BUILD_DIR/bios/stage-iso.bin" "$KERNEL" initramfs.img cmdline.txt
 else
     "$REPO_ROOT/iso.sh" "$OUT_FILE" "$ARCH"

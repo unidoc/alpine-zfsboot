@@ -12,6 +12,12 @@ case "$1" in
         # org.alpinezfsboot:commandline alike. Matching that here
         # (rather than just printing nothing) keeps the stub honest
         # about what real zfs actually returns.
+        # STUB_POOL_INSTALL_ID: the pool's org.alpinezfsboot:install-id
+        # (mirrored boot identity cross-check, init/esp-select.sh).
+        case "$*" in
+            *org.alpinezfsboot:install-id*)
+                if [ -n "${STUB_POOL_INSTALL_ID:-}" ]; then echo "$STUB_POOL_INSTALL_ID"; exit 0; fi ;;
+        esac
         echo "-"
         ;;
 esac

@@ -141,11 +141,14 @@ func WriteStage2(disk string, stage2 []byte) (previous []byte, err error) {
 		return nil, fmt.Errorf("backing up the current stage2 region of %s: %w", disk, err)
 	}
 
-	zero := make([]byte, layout.Stage2Bytes)
-	if _, err := f.WriteAt(zero, offset); err != nil {
-		return previous, fmt.Errorf("zeroing the stage2 region of %s: %w", disk, err)
-	}
-	if _, err := f.WriteAt(stage2, offset); err != nil {
+	// ONE write of the whole region (stage2 followed by zero padding), not
+	// "zero everything, then write stage2": a crash between those two
+	// writes left an all-zero stage2 that no stage1 boots. A torn write of
+	// this single 32 KiB write is still possible; nothing short of two
+	// stage2 slots would close that.
+	region := make([]byte, layout.Stage2Bytes)
+	copy(region, stage2)
+	if _, err := f.WriteAt(region, offset); err != nil {
 		return previous, fmt.Errorf("writing stage2 to %s: %w", disk, err)
 	}
 	if err := f.Sync(); err != nil {

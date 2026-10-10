@@ -134,4 +134,52 @@ int fat_read_range(const struct fat_volume *vol, const struct fat_file *file,
                     uint32_t offset, uint32_t length, uint32_t dst_phys,
                     fat_progress_fn progress, void *progress_ctx);
 
+/*
+ * Why the last fat_read_range() failed. A bare -1 used to cover six
+ * different things (a read error from the BIOS, a chain that ends early, a
+ * cycle, ...) and stage2 printed the same sentence for all of them, which
+ * made the first real-hardware failure impossible to tell apart. Reset to
+ * FAT_ERR_NONE at the start of every call; the fields that do not apply to
+ * a reason are 0.
+ */
+enum fat_err {
+	FAT_ERR_NONE = 0,
+	FAT_ERR_GEOMETRY,      /* the volume geometry is unusable */
+	FAT_ERR_RANGE,         /* offset/length lie outside the file */
+	FAT_ERR_START_CLUSTER, /* the file's first cluster is not a data cluster */
+	FAT_ERR_CHAIN_END,     /* the chain ended, or points at a non-data value, before the file's size was covered */
+	FAT_ERR_CHAIN_CYCLE,   /* the chain loops */
+	FAT_ERR_CHAIN_LONG,    /* the chain is longer than the volume */
+	FAT_ERR_FAT_READ,      /* the BIOS failed reading a FAT-table sector */
+	FAT_ERR_DATA_READ,     /* the BIOS failed reading file data */
+};
+
+struct fat_error {
+	enum fat_err reason;
+	uint32_t cluster;   /* the cluster being left (CHAIN_*), or the bad one */
+	uint32_t value;     /* CHAIN_END: the raw FAT entry found there (0x0fffffff = end of chain) */
+	uint32_t remaining; /* bytes of the requested range not yet delivered */
+	uint64_t lba;       /* FAT_READ / DATA_READ: the sector the BIOS failed on */
+};
+extern struct fat_error g_fat_error;
+
+/* Forget the cached FAT sectors: before re-reading after wrong data was
+ * delivered (a cached FAT sector may be the wrong one), and around every
+ * switch to another drive (the cache is keyed by LBA only). */
+void fat_cache_invalidate(void);
+
+/* The LBA holding byte `offset` of a file (for reports); 0 or -1. */
+int fat_offset_lba(const struct fat_volume *vol, const struct fat_file *file, uint32_t offset, uint64_t *lba);
+
+/* A short name for a reason, for the fatal message. */
+const char *fat_err_name(enum fat_err r);
+
+/* fat_read_range()'s own staging buffer, where every BIOS read lands before
+ * it is copied to its destination. Free for other use between
+ * fat_read_range() calls; stage2_main.c hashes through it after loading
+ * and finally builds boot_params in it (at least BOOT_PARAMS_SIZE bytes,
+ * asserted in fat.c). */
+extern uint8_t *const g_fat_io_buf_ptr;
+extern const uint32_t g_fat_io_buf_size;
+
 #endif

@@ -12,6 +12,15 @@ echo "umount $*" >> "${STUB_LOG:-/dev/null}"
 # forever - undetectable against a umount stub that never actually
 # removes anything. `mv`, not `rm -rf`: the caller/test still owns
 # cleaning its own fixture dir up afterward, same as every other test.
+# Fake ESPs (see the mount stub): unmounting empties the mountpoint, so
+# the next ESP mounted there never sees the previous one's files.
+if [ -n "${STUB_ESP_DIR:-}" ]; then
+    target="$*"
+    for target; do :; done
+    case "$target" in
+        */tmp/esp-config) find "$target" -mindepth 1 -delete 2>/dev/null ;;
+    esac
+fi
 if [ -n "${STUB_UMOUNT_REALLY_UNMOUNT:-}" ]; then
     target="$*"
     for target; do :; done

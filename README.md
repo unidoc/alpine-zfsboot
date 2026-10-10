@@ -288,7 +288,10 @@ directly instead.
 
 ```
 protective MBR (LBA 0)                                 <- stage1
-  -> fixed-LBA (34) extended INT13h read -> jump
+  -> fixed-LBA (34) extended INT13h reads, 16 sectors at a time,
+     each retried; checks stage2's magic word and, when the stage2
+     header announces them, its length and 16-bit checksum (set by
+     bios/Makefile) -> jump, or halt with '!'
 
 BIOS boot partition (type GUID 21686148-6449-6E6F-744E-656564454649,
 starts at LBA 34 by construction - stage1 never parses GPT at all)
@@ -302,9 +305,19 @@ starts at LBA 34 by construction - stage1 never parses GPT at all)
      EFI/ALPINE/{KERNEL,INITRD,CMDLINE} - the exact same kernel/
      initramfs/cmdline build.sh already produces for the UEFI path,
      as ordinary files, not a separate packed format
+  -> gathers the E820 memory map and checks the kernel (at 1MB, and
+     the init_size area it will occupy once it runs) and the initrd (at
+     64MB) against it: a destination above the end of all RAM stops the
+     boot; anything else unusual (a hole, a reserved range, init_size
+     reaching the initrd) is a printed warning and the boot goes on
   -> "unreal mode" (bios/switch32.S) to place the kernel at 1MB and
-     the initrd above it, gathers the E820 memory map, builds a
-     Linux/x86 boot_params, and jumps into the kernel per
+     the initrd above it; INT13h reads are split into chunks of at most
+     16 sectors (configurable, see "INT 13h transfer size" below) and
+     retried with smaller chunks if the BIOS refuses one
+  -> if EFI/ALPINE/CHECKSUM exists (disk boots; see below): SHA-256 of
+     the kernel and initrd as they are in RAM, compared with it; a
+     mismatch prints both digests and, by default, boots anyway
+  -> builds a Linux/x86 boot_params, and jumps into the kernel per
      Documentation/arch/x86/boot.rst's 32-bit boot protocol
 
 kernel + initramfs - identical to the UEFI path from here on: /init,
@@ -314,6 +327,248 @@ EFI/ALPINE/{config,authorized_keys,ssh_host_ed25519_key} on
 this same partition - stage1/stage2 never touch machine configuration
 or rescue-SSH policy at all.
 ```
+
+#### Loaded-payload check and BIOS diagnostics
+
+`alpine-zfsboot install`/`update` (BIOS) write `EFI/ALPINE/CHECKSUM`
+together with KERNEL/INITRD: the size and SHA-256 of exactly the bytes
+the BIOS loader places in RAM (for KERNEL, the part after its real-mode
+setup sectors; for INITRD, the whole file - format in
+`internal/payloadsum`). After loading, stage2 hashes the kernel and
+initrd as they are in RAM and compares. What a mismatch does depends on
+the integrity mode:
+
+| mode | what stage2 does |
+| --- | --- |
+| `warn` (default) | hash; on a mismatch print both digests and the RAM range, then boot anyway |
+| `off` | do not hash (saves boot time with a very large initrd) |
+| `enforce` | refuse to boot on a mismatch - for diagnosing a failing host, use it only when the machine has another way to boot (rescue ISO, IPMI/KVM) |
+
+The mode is stored in CHECKSUM (`--integrity=off|warn|enforce` on
+`install`/`update`, default `warn`; change it later with
+`alpine-zfsboot integrity <mode>`, which rewrites the file atomically;
+`status` shows it). `alpine-zfsboot.integrity=off|warn|enforce` in
+`EFI/ALPINE/CMDLINE` overrides it for a boot: command line, then
+CHECKSUM, then `warn`. No CHECKSUM (an install from before it existed):
+one notice line, the boot is unchanged; `status`/`verify` show it as
+INFO and do not fail, `update` or `verify --repair` adds it.
+
+This is boot INTEGRITY - against disk/BIOS read corruption and against
+a kernel/initrd replaced without updating CHECKSUM - NOT secure boot:
+CHECKSUM lives on the same unauthenticated FAT partition as the kernel,
+so anyone who can write the disk can change both. Real tamper
+resistance needs a root of trust outside the disk (UEFI Secure Boot
+with a signed loader), which BIOS boot does not have. The ISO uses
+CHECKSUM (and BLKSUM, below) too when the image was built with them
+(build.sh does; an ISO built without them boots as before).
+
+#### INT 13h transfer size
+
+The disk stage2 never asks the BIOS for more than a fixed number of
+512-byte sectors in one INT 13h read: 16 (8 KiB) by default. A read that
+fails is retried in halves from there down to one sector. One hypothesis
+for physical machines that fail to load the kernel is a BIOS or controller
+that mishandles large transfers; the halving only helps when the BIOS
+reports the error, not when it returns wrong data with success, so the
+default is small on purpose. stage1 always reads stage2 in 4 x 16 sectors.
+
+Set it per machine (1..127, or `default`), in `EFI/ALPINE/CMDLINE` as
+`alpine-zfsboot.int13chunk=N`:
+
+    alpine-zfsboot int13chunk 8        # next boot uses at most 8 sectors per read
+    alpine-zfsboot int13chunk default  # back to the build default (16)
+
+or `--int13chunk=N` on `install`/`update` (`update` keeps the installed
+value when the flag is not given). `status` shows the value in effect.
+The setting applies to every read after the FAT partition is mounted
+(kernel, initrd and their FAT metadata); the handful of small reads
+before that always use the build default. The FAT layer asks for at
+most 32 sectors at a time, so a value above 32 behaves like 32. The
+BIOS interface limits it too (127 for EDD; the sectors per track when
+stage2 has to fall back to CHS). The ISO boot path reads the key too and
+caps its 2048-byte CD sectors at N/4 (at least 1, at most 4: 8 KiB). A stage2 older than the
+setting ignores the key; an older rescue initramfs prints a harmless
+"unrecognized option" line for it.
+
+To A/B a machine that fails in BIOS mode: boot once with
+`alpine-zfsboot.int13chunk=8` and once with `=32` (plus
+`alpine-zfsboot.diag=1` so the `summary:` lines below are printed even
+when nothing went wrong) and compare.
+
+Measured load time in QEMU (TCG, no KVM; stage2 start to "starting
+kernel", real 14.5 MB kernel + 69 MB initrd, no CHECKSUM, two runs each):
+
+| cap (sectors) | disk path | INT 13h calls (disk) | ISO path |
+| --- | --- | --- | --- |
+| 64 | 9.2 / 9.2 s | 7034 | 8.2 / 8.4 s |
+| 32 | 8.9 / 9.6 s | 9585 | 8.6 / 8.7 s |
+| 16 | 9.6 / 9.2 s | 14685 | 9.1 / 9.1 s |
+| 8 | 10.6 / 10.6 s | 24886 | 9.8 / 10.1 s |
+
+16 costs nothing measurable over 64 on the disk path. Each call on a real
+disk costs far less than under emulation. (These numbers predate the
+32-sector FAT batch and the per-block checks; see the next section for
+the current ones.)
+
+#### How the loader protects itself against bad BIOS reads
+
+A BIOS disk read can fail loudly (carry flag set), or - the case the
+loader used to be blind to - "succeed" and deliver wrong bytes. The
+disk and ISO stage2 handle both:
+
+- **Small transfers, split and halved.** Every read goes to the BIOS in
+  pieces of at most the cap (above; 16 sectors by default). A read the
+  BIOS refuses is retried after a controller reset in halves, down to
+  one sector, and the smaller size is kept.
+- **Asking the BIOS what it is.** INT 13h AH=41h (extensions present?
+  EDD version), AH=48h (bytes per sector, flags) and, only when the
+  extended read (AH=42h) does not work at all, AH=08h geometry and CHS
+  reads with AH=02h - a BIOS without extensions used to be unbootable.
+  AH=41h/48h report no maximum transfer of their own; the EDD limit of
+  127 sectors is used. When AH=48h reports sectors of other than 512
+  bytes on the boot drive, stage2 says so and goes on reading 512-byte
+  units - stage1 has just read stage2 that way from the same BIOS, so the
+  BIOS addresses 512-byte units whatever AH=48h claims (and earlier
+  versions booted such a machine). A truly native 4096-byte-sector disk
+  cannot boot this loader at all (the on-disk layout - stage1's LBA 34,
+  GPT, FAT - is in 512-byte units, so stage1 would read the wrong place):
+  `alpine-zfsboot install`/`update`/`esp add` refuse BIOS writes to a
+  disk whose logical sectors are not 512 bytes, and such a drive is never
+  used as a second source.
+- **Every 64 KiB block checked as it lands.** `install`/`update` write
+  `EFI/ALPINE/BLKSUM` next to CHECKSUM (format: `bios/blkverify.h`,
+  `internal/payloadsum`): for each 64 KiB block of the kernel's and
+  initrd's RAM image, the SHA-256 chaining state after that block (the
+  last entry is the file's SHA-256, the one CHECKSUM records). stage2
+  streams this table in step with the payload - a table sector at a
+  time, each sector checked against its own SHA-256 - and checks every
+  block right after it is in RAM, as part of the one SHA-256 pass over
+  the file. A block that does not match is re-read from disk, after a
+  controller reset, up to 8 times with the transfer size halved each
+  time (same size first, then half, ... down to one sector); a size that
+  heals it is kept for the rest of the boot. Nothing is printed when a
+  re-read heals a block. After 3 blocks of one file that could not be
+  healed, the rest of that file is only checked and counted (no more
+  re-reads, no report per block, one line with the count): a file whose
+  every block is wrong must not turn the boot into hours of re-reads.
+- **A second source.** A block still wrong after that is read from
+  another BIOS hard disk (0x80.. as many as the BIOS reports) whose ESP
+  has a CHECKSUM describing exactly the same KERNEL and INITRD (a
+  mirror member) - and checked against the table like any other read.
+- **What stays wrong** is reported with the file, block, file offset,
+  LBA, the expected and the actual SHA-256 state and the number of
+  re-reads; then integrity mode decides: `warn` (default) boots,
+  `enforce` refuses, `off` skips all checking (no hashing at all). The
+  whole-file SHA-256 check right before the jump stays as the final,
+  end-to-end check of what is in RAM at that moment.
+- **A summary that travels with the machine.** Whenever anything had to
+  be retried, healed, served by the other disk or stayed wrong, stage2
+  prints - without diagnostics turned on - right before "starting
+  kernel":
+
+      summary: drive 80 lba bps 0200 cap 0010 now 0010 int13 00001a53 fail 0000
+      summary: blocks mism 0001 reread 0008 healed 0000 2nd 0000 bad 0001
+      summary: bad KERNEL @00030a00 lba 00000e94 exp ad1b370413b9 got e01c7b2a7bf8
+
+  (from a fault-injection boot in which one kernel sector is always
+  delivered wrong)
+
+  (all numbers hex: the BIOS drive, LBA or CHS reads, bytes per sector
+  AH=48h reports, the configured cap and the one in force now, INT 13h
+  calls and failed calls; blocks that did not match at first, re-reads,
+  blocks healed, served by the second source, still wrong; the first
+  block that stayed wrong - file offset, LBA, the first 6 bytes of the
+  expected and the actual SHA-256 state - when there is one). With
+  `alpine-zfsboot.diag=1` it is printed on every boot, plus a line with
+  the EDD version, interface bits, AH=48h flags, the BIOS interface limit
+  and the largest transfer.
+
+What this can and cannot do, honestly:
+
+- It detects any wrong byte that reaches RAM through a read - a block is
+  judged with SHA-256 (a wrong block going unnoticed is about as likely
+  as a SHA-256 collision) - and heals it when the error is transient or
+  depends on the transfer size.
+- A BIOS that returns the SAME wrong data every time is detected and
+  reported, but cannot be healed without a second source.
+- Corruption after a block was checked (bad RAM, a DMA write from
+  something else, the kernel's own decompression and relocation after
+  the jump) is not seen by the per-block checks; the final whole-file
+  check before the jump catches what happened up to then, nothing after.
+- It needs CHECKSUM and BLKSUM written by the tool for this payload:
+  without BLKSUM there is only the whole-file check; without CHECKSUM
+  nothing is checked (as before). A BLKSUM from another payload is
+  ignored with a notice.
+- It is not a defence against someone who can write the disk (see
+  CHECKSUM above).
+- Only a failing physical machine can show whether its failure is of a
+  kind this catches; the tests (`tests/bios-hdd-fault-test.sh`,
+  `tests/bios-iso-fault-test.sh`, `bios/tests/blkverify_host_test.c`)
+  prove the mechanism against injected faults: a flipped bit, a sector
+  of zeros, stale data, another LBA's data and a short transfer, once,
+  above a transfer size or on every read; a mirror disk; a BIOS without
+  extensions; 4096-byte sectors.
+
+Cost, measured in QEMU without KVM (stage2 start to "starting kernel",
+real 14.5 MB kernel + 69 MB initrd; two runs each). The transfer size
+actually in force: disk int13chunk=16 -> 16 sectors, int13chunk=64 -> 32
+(the FAT batch); the ISO reads 4 CD sectors (8 KiB) either way, so its
+two columns are the same configuration measured twice:
+
+| | disk, 16 sectors | disk, 32 sectors | ISO, 8 KiB | ISO, 8 KiB (again) |
+| --- | --- | --- | --- | --- |
+| no CHECKSUM | 9.9 / 10.1 s | 9.6 / 9.1 s | 11.1 / 10.6 s | 11.3 / 10.6 s |
+| CHECKSUM only | 14.9 / 15.2 s | 14.4 / 14.5 s | 23.1 s | 22.9 s |
+| CHECKSUM + BLKSUM | 20.9 / 21.6 s | 20.0 / 20.4 s | 31.8 / 31.0 s | 32.5 / 31.5 s |
+
+Each check is one SHA-256 pass over 84 MB. Under emulation most of that
+time is the CPU mode switches of reading high memory back (8 or 16 KiB at
+a time); the same SHA-256 code runs at about 200 MB/s natively on the
+machine these were measured on, so on real hardware a pass should take
+in the order of a second (estimated, not measured). `alpine-zfsboot
+integrity off` (or `alpine-zfsboot.integrity=off` for one boot) turns
+all of it off.
+
+#### Compatibility between versions (BIOS)
+
+Tested in QEMU (`tests/bios-hdd-entry-test.sh`, stage1/stage2 of
+v0.2.0, v0.3.0 and v0.4.1 - built from their tags and the v0.4.1
+release binaries - against this version):
+
+| stage1 | stage2 | CHECKSUM | boots? |
+| --- | --- | --- | --- |
+| v0.2.0+ (old) | old | any or none | yes - old stage2 never reads CHECKSUM |
+| old | this version | none | yes (notice: not verified) |
+| old | this version | matching | yes, verified |
+| this version | old (v0.2.0 - v0.4.x) | any or none | yes - stage1 checks only the magic word of a stage2 without the length/checksum marker, like the old stage1 |
+| this version | this version | none / matching / stale (`warn`) | yes; a stale one prints both digests and a WARNING |
+| this version | this version | stale, `enforce` (file or cmdline) | no - refused on purpose |
+| any | this version, damaged on disk | - | the new stage1 halts with `!`; an old stage1 jumps in (it cannot tell) |
+| v0.2.0+ | v0.1.0 | - | no, as before (v0.2.0+ stage1 requires the magic word v0.1.0 lacks) |
+
+`install`/`update` write stage2 first and stage1 last (rollback in the
+reverse order), so every intermediate state above is one of the booting
+rows. stage1 and stage2 are always written together in one run; the
+tool refuses, before writing anything, a stage2 that stage1 would not
+jump into (no magic word, or a length/checksum that does not add up)
+unless `--force`. An old tool on a new install leaves CHECKSUM alone
+(harmless; if it then writes a new payload, a stale CHECKSUM is a
+warning at boot unless its mode is `enforce`). A new tool reports an old
+install's missing CHECKSUM as INFO.
+
+For a machine that fails to boot in BIOS mode, add the word
+`alpine-zfsboot.diag=1` to `EFI/ALPINE/CMDLINE` (one boot's worth of
+output; `update` rewrites the file) or build stage2 with
+`make -C bios stage2.bin EXTRA_CFLAGS=-DBIOS_DIAG`. stage2 then prints
+the E820 map, every physical range it owns or writes (stage2, its disk
+I/O buffer, kernel, the kernel's init_size area, initrd, boot_params,
+cmdline), the kernel's code32_start, kernel_alignment,
+relocatable_kernel, pref_address and init_size, and every failed or
+retried BIOS disk read (LBA, sector count, attempt, BIOS status), and
+before the jump the INT 13h counters (cap, chunk in use, largest
+transfer, number of calls). All
+of it starts with `diag:` and fits an 80x25 screen on a typical
+machine. A normal boot prints none of it.
 
 `build.sh` produces `alpine-zfsboot-x86_64-bios-{stage1,stage2}.bin`
 alongside the usual `.EFI`/`.iso` assets and the loose
@@ -405,6 +660,223 @@ boot `.EFI` at `/boot/efi/EFI/BOOT/BOOTX64.EFI` /
 Pointing that installer at this project's release assets instead of
 its current boot-image source is a small, separate change to that
 repo, not done here.
+
+Installer-facing settings of `alpine-zfsboot install` that the tool also
+reads from the environment (a flag, when given, wins):
+
+| Environment | Flag | Persisted as | Meaning |
+|---|---|---|---|
+| `ALPINE_ZFSBOOT_ESP_UUIDS=A,B` | `--esp-uuids A,B` | `alpine-zfsboot.esp-uuids=` in `EFI/ALPINE/config` (BIOS: also in `EFI/ALPINE/CMDLINE`) | the ESPs of a mirrored boot - see [Mirrored boot](#mirrored-boot-several-esps) |
+| `ALPINE_ZFSBOOT_NET_MAC=aa:bb:cc:dd:ee:ff` | `--net-mac aa:bb:cc:dd:ee:ff` | `alpine-zfsboot.net.mac=` in `EFI/ALPINE/config` | the rescue network card, instead of `eth0` - see [Choosing the rescue network card](#choosing-the-rescue-network-card-alpine-zfsbootnetmac) |
+
+`install` normalizes and validates both before writing anything
+(malformed UUIDs, a repeated UUID, a malformed, all-zero or multicast
+MAC address are refused with exit status 1). The other settings
+(`--ssh-key`, `--net`, `--ipv4*`, `--ipv6*`, `--ssh-*`, `--console`)
+stay flags, as before.
+
+## Mirrored boot (several ESPs)
+
+A ZFS mirror keeps the pool alive when a disk dies - but the machine
+must also still BOOT from the remaining disk. That needs one ESP (FAT
+boot partition) per disk, each with the full boot chain: on BIOS the
+boot loader (stage1/stage2) on each disk plus the payload on its ESP, on
+UEFI the loader on each ESP. alpine-zfsboot keeps such a set of ESPs
+identical and knows, at boot, which one to take the rescue SSH keys,
+host key and network settings from.
+
+### Setting up a mirror
+
+**New installation** (both disks partitioned the same way, with an ESP
+each, the pool created as a mirror - the installer's or your own
+`zpool create zroot mirror ...`):
+
+```sh
+mkfs.vfat -F32 -n EFI /dev/sda2          # ESP on disk 1 (your partition numbers)
+mkfs.vfat -F32 -n EFI /dev/sdb2          # ESP on disk 2
+blkid /dev/sda2 /dev/sdb2                # note both UUID="XXXX-XXXX" values
+mount /dev/sda2 /mnt/boot/efi            # one ESP mounted, as for a single disk
+alpine-zfsboot install /dev/sda --root /mnt --firmware bios \
+    --esp-uuids 6AC5-0B94,6AC5-2367 --ssh-key "$(cat key.pub)" -y
+#   (or: ALPINE_ZFSBOOT_ESP_UUIDS=6AC5-0B94,6AC5-2367 alpine-zfsboot install ...)
+```
+
+`install` writes the ESP mounted at `--root/boot/efi` and every other
+ESP of the list (it finds them by UUID and mounts them itself); BIOS:
+stage1/stage2 onto the disk of each ESP. Every ESP gets the same
+config, `authorized_keys` and rescue host key (one key, generated once),
+and an `EFI/ALPINE/MEMBER` marker. Instead of a list,
+`--add-esp /dev/sdb2` names the additional ESPs; then no list is stored
+and the members are recognised by their markers alone (below).
+
+**An existing single-disk installation, second disk added**:
+
+```sh
+mkfs.vfat -F32 -n EFI /dev/sdb2
+alpine-zfsboot esp add /dev/sdb2         # copies the installed boot chain, config,
+                                         # keys and host key - no download
+```
+
+**Two ESPs copied by hand before 0.5.0** (both carry alpine-zfsboot
+files, no markers - init refuses to choose between them and applies
+neither's config):
+
+```sh
+alpine-zfsboot esp adopt 6AC5-0B94 6AC5-2367          # shows what it would do
+alpine-zfsboot esp adopt 6AC5-0B94 6AC5-2367 --yes    # writes the markers
+alpine-zfsboot verify                                 # names any ESP that differs
+alpine-zfsboot update                                 # brings a stale one in line
+```
+
+**A disk died / was replaced**:
+
+```sh
+alpine-zfsboot status                    # exit 3: ESP 6AC5-2367 MISSING
+alpine-zfsboot esp remove 6AC5-2367      # the dead one leaves the set (only the
+                                         # other ESPs' member lists change)
+mkfs.vfat -F32 -n EFI /dev/sdb2          # on the new disk, after zpool replace
+alpine-zfsboot esp add /dev/sdb2
+```
+
+The tool does not partition disks or create the pool or the FAT
+filesystems - only the alpine-zfsboot files on them. The firmware must
+be able to boot either disk: on BIOS every member disk carries stage1/
+stage2, so any disk the BIOS tries first boots; on UEFI every ESP has
+the loader at the fallback path `EFI/BOOT/BOOTX64.EFI` (`BOOTAA64.EFI`),
+so check the firmware's boot order includes both disks.
+
+### Day to day
+
+`status`, `verify`, `update`, `integrity` and `int13chunk` work on every
+ESP of the set without any option:
+
+- `update` writes **one ESP at a time**, each with the same atomic,
+  rolled-back writes as a single ESP. A failure on one ESP leaves that
+  ESP on its previous build (it still boots) and the run goes on to the
+  others; the summary names the ESP that failed and the run exits 1. An
+  ESP that is already up to date is left alone. `config`,
+  `authorized_keys` and the host key are copied from the newest ESP to
+  the others.
+- `verify` checks every ESP as it checks a single one, then **compares
+  them**: stage1, stage2, `KERNEL`, `INITRD`, `CMDLINE` (without the
+  per-ESP words below), `metadata`, `CHECKSUM`, config, keys, host key.
+  An ESP that differs from the newest one is named, with the files that
+  differ and whether it is **STALE** (older generation or build) or
+  merely **differs** (same build - damaged or hand-edited).
+- `status` lists the set (each ESP, its generation, which one is stale,
+  which one is missing, which ESP-looking partitions are NOT used and
+  why).
+
+Exit status of `status`, `verify`, `update`, `install`, `integrity`,
+`int13chunk` and `esp`:
+
+| Status | Meaning |
+|---|---|
+| 0 | everything fine |
+| 1 | something failed (on a mirror: on any ESP) |
+| 3 | everything present is fine, but an ESP of the set is **missing** - a dead or detached disk (a degraded mirror). Never returned with a single ESP, so callers that only know 0/1 see no change there. |
+
+### How members are recognised
+
+Every ESP of a set carries `EFI/ALPINE/MEMBER` (an 8.3 name; plain
+`KEY=value` text, written atomically, always **last** in a write - after
+the payload and config were written and verified):
+
+```
+alpine-zfsboot esp-member 1
+INSTALL_ID=0f6c1e9a-4b1d-4c7e-9a55-1d2e3f405162   # random, generated at this host's first install
+GENERATION=7                                     # raised by every install/update that wrote this ESP
+ESP_UUID=6AC5-0B94                               # this ESP's own FAT UUID
+MEMBERS=6AC5-0B94,6AC5-2367                      # every ESP of the set
+POOL=zroot                                       # informational
+DISK=ata-ST4000NM-XXXX                           # informational
+WRITTEN=2026-10-09T12:00:00Z                     # informational
+```
+
+The identity is `INSTALL_ID`, not the pool GUID: the first install
+runs before anything guarantees the pool exists, and one id must cover
+the host from that first write. The tool also stores it in the pool
+property `org.alpinezfsboot:install-id` (best-effort, when `zfs` and the
+pool are there); `init` compares the two after importing the pool and
+warns when they differ (it never changes anything then - the config was
+applied long before).
+
+A marker only counts when it decodes and its `ESP_UUID` is the ESP's
+own UUID: an `EFI/` tree copied onto another ESP does not make that ESP
+a member (`esp add` does). A FAT UUID on two devices (a `dd` clone, an
+md RAID member) is never guessed between.
+
+**At boot**, `init` (`init/esp-select.sh`) picks the ONE ESP whose
+config, `authorized_keys` and host key it applies, strongest rule first:
+
+1. `alpine-zfsboot.esp-uuids=A,B` on the kernel command line: only
+   those ESPs. The installation is that of the first listed ESP with a
+   marker; a listed ESP marked for another installation is skipped. Best
+   = highest generation, then list order.
+2. The ESP this boot came from: the tool writes
+   `alpine-zfsboot.esp-self=<its own UUID>` into each BIOS ESP's own
+   `CMDLINE`, so `init` knows which disk stage2 booted from - its config
+   belongs to the kernel that is running, and is used even when another
+   ESP has a newer generation (a warning names it). **UEFI** cannot tell
+   which ESP it booted from (the cmdline is the shared `.EFI`'s), so this
+   step does not apply there.
+3. The markers: the ESPs carrying one installation id - if there is
+   exactly one installation among the ESPs present (or step 2 named it).
+   Best = highest generation, then UUID order (never device names, which
+   can swap between boots). If the best ESP's own config holds
+   `alpine-zfsboot.esp-uuids=`, step 1 applies with that list - taken only
+   from this installation's own ESP, never from an arbitrary one.
+4. No marker anywhere (every install before 0.5.0): exactly the old
+   rule - one qualifying `LABEL=EFI` ESP is used; several are refused,
+   now with a message that names their UUIDs and the two ways out
+   (`esp adopt ... --yes`, or `alpine-zfsboot.esp-uuids=`). Two unmarked
+   ESPs whose configs carry the same `alpine-zfsboot.esp-uuids=` list are
+   used as that list.
+
+In steps 1 and 3 the chosen ESP must also carry a boot binary or `KERNEL`
+and config/keys, and - when it has a `CHECKSUM` - its `KERNEL`/`INITRD`
+must match it; otherwise the next best ESP is used, with a warning.
+Members that are expected (`MEMBERS=`, or the list) but not present are
+named in a warning; stale ones too.
+
+Whatever `init` cannot decide safely - two installations and nothing to
+choose, a listed UUID on two devices, every listed ESP unusable - it
+says why and applies **no** ESP config: the boot goes on with
+defaults/cmdline only and rescue SSH unconfigured, exactly what it did
+before for an ambiguous ESP. **The pool boot never depends on this.**
+For one boot, `alpine-zfsboot.esp-uuids=` can be added at the
+"press TAB" screen.
+
+**The tool** writes only to members: the ESPs of the set, plus ESPs it
+is told to add (`--add-esp`, `esp add`, `esp adopt`). An ESP marked for
+**another** installation is never written without `--force-adopt`. An
+ESP with alpine-zfsboot files but no marker beside a marked set is
+reported and left alone. With several installations' ESPs present and
+nothing naming this host's (no list, no ESP mounted at `/boot/efi`, no
+`esp-self`), the tool refuses as `init` does. BIOS: two ESPs of the set
+on one disk, an ESP on a whole disk without a partition table, and an
+ESP on md/dm RAID are refused before anything is written (stage1/stage2
+belong to a plain disk, once).
+
+**Limits**: this protects against accidents - a disk moved in from
+another machine, an old rescue stick, a previous deployment, a stale
+member - feeding the wrong keys, host key or network settings into this
+machine, or getting its boot overwritten. It is **not** a defence
+against someone who can write to the disk: anyone who can write an ESP
+can write a matching marker (the same is true of everything else on the
+FAT partition - see the `CHECKSUM` note above).
+
+| Setting | Where | Meaning |
+|---|---|---|
+| `alpine-zfsboot.esp-uuids=A,B` | cmdline, `EFI/ALPINE/config`, BIOS `CMDLINE`; `--esp-uuids`; `ALPINE_ZFSBOOT_ESP_UUIDS` | the explicit set (overrides the markers) |
+| `alpine-zfsboot.esp-self=UUID` | BIOS `CMDLINE`, written by the tool | which ESP this `CMDLINE` is on |
+| `--add-esp DEV\|UUID,...` | `install`, `update` | make these ESPs members and write them too |
+| `--force-adopt` | `install`, `update`, `esp add`, `esp adopt` | also take an ESP marked for another installation |
+| `esp list` / `add` / `remove` / `adopt` | subcommands | see `alpine-zfsboot esp --help` |
+
+Older versions of `init` ignore these keys (with their usual
+"unrecognized option" warning); an ESP set written by 0.5.0 then boots
+exactly as a single ESP did, with today's rule 4.
 
 ## ZFS layout and Boot Environments
 
@@ -649,6 +1121,38 @@ their own `alpine-zfsboot.*` cmdline options:
 | `alpine-zfsboot.ssh.listen=` | `ipv4`\|`ipv6`\|`both` | `both` |
 | `alpine-zfsboot.ssh.port=` | 1-65535 | `22` - noise reduction only, **not** a security control |
 | `alpine-zfsboot.ssh.allow=` | CIDR, e.g. `2a01:db8::123/128` | unset (reachable from anywhere, key-only auth still applies) |
+| `alpine-zfsboot.net.mac=` | MAC address, e.g. `52:54:00:ab:cd:02` | unset: `eth0` - see below |
+
+### Choosing the rescue network card (`alpine-zfsboot.net.mac=`)
+
+The rescue network uses `eth0` - the first network card the kernel
+finds. On a machine with several cards, USB cards, or a changing PCI
+enumeration order, the card that is actually cabled may not be `eth0`.
+Name it by MAC address instead (in `EFI/ALPINE/config`, set with
+`install --net-mac` / `ALPINE_ZFSBOOT_NET_MAC`, or on the kernel command
+line, which wins):
+
+```
+alpine-zfsboot.net.mac=52:54:00:ab:cd:02
+```
+
+When rescue SSH is brought up, the card with that address is found in
+`/sys/class/net/*/address` (any case, `:` or `-` separators; the
+loopback device and virtual interfaces - bridges, bonds, VLANs, which
+copy a card's MAC - are ignored). A card whose driver is still loading
+is waited for, up to 15 seconds, with a message. A MAC that no card has
+(or two cards have, or that is malformed) is a configuration error: a
+message naming the cards that ARE there, and rescue SSH does not start -
+**never a silent fallback to `eth0`**, the same "configured value is
+authoritative" rule as `alpine-zfsboot.console=`. The menu's Network
+item and Diagnostics follow the same card. Without the key nothing
+changes: `eth0`, and `/sys` is not even looked at. A healthy boot never
+waits for any of this (it only happens when rescue SSH is needed), so a
+wrong MAC cannot stop the pool from booting. `alpine-zfsboot status`
+shows the configured MAC and, on the running system, which interface
+has it. A MAC (a property of the card) is used rather than an interface
+name or index on purpose: names follow enumeration order, which is
+exactly what can change.
 
 `ipv6=auto` is kernel-native SLAAC (router-advertisement autoconfig,
 no daemon) - genuinely different from `ipv6=dhcp` (a real, separate
@@ -1112,12 +1616,18 @@ alpine-zfsboot update              # fetch+install the latest release over it
 alpine-zfsboot install <disk> \    # write alpine-zfsboot's own artifacts onto an
   --root <path> --firmware <bios|uefi>  # already-partitioned, already-formatted disk
 alpine-zfsboot version <path>      # inspect one .EFI file directly (unchanged, standalone)
+alpine-zfsboot esp list|add|remove|adopt   # the ESPs of a mirrored boot
 ```
 
-`status`/`verify`/`update` auto-discover the canonical FAT/ESP partition
-by volume label + marker files (the same algorithm `/init` itself uses
-at boot - refuses to guess if more than one candidate qualifies) - no
-path argument needed. `install` is the one exception: it writes onto a
+`status`/`verify`/`update` auto-discover this host's ESP - or, on a
+[mirrored boot](#mirrored-boot-several-esps), its whole set of ESPs - by
+the same rules `/init` itself uses at boot (an explicit
+`--esp-uuids`/`ALPINE_ZFSBOOT_ESP_UUIDS`/`alpine-zfsboot.esp-uuids=`
+list, else the `EFI/ALPINE/MEMBER` markers, else the single legacy ESP
+by volume label + marker files - never a guess between several) - no
+path argument needed. On a mirrored boot every one of them works on
+every ESP of the set; see that section for the exit statuses (3: an ESP
+of the set is missing). `install` is the one exception: it writes onto a
 disk that has no bootable identity yet, so both the target disk and
 `--firmware` are explicit, required arguments - see that command's own
 `--help` for why firmware is never auto-detected there.
@@ -1216,6 +1726,19 @@ runner doesn't have, so the TUI rendering itself isn't covered here
 of running the real binary). Needs `bash` specifically (not just any
 POSIX `sh`) - the "key held" tests exercise `read -t N -n 1`, which
 plain `dash` doesn't support at all.
+
+Mirrored boot and the rescue card by MAC: `run-tests.sh` covers
+`init/esp-select.sh`'s rules over fake ESPs (`tests/stubs/blkid` prints
+busybox's real output format, the `mount` stub copies a directory per
+device) and `net_resolve_iface` over fake `/sys/class/net` trees; the Go
+side (`internal/bootenv`, `internal/espmember`, `internal/netmac`,
+`cmd/tool/mirror_test.go`) runs install/update/verify/esp over image
+files and directories, no mount or loop device needed.
+`just test-mirror-boot` (`tests/bios-mirror-boot-test.sh`) boots the
+real chain in QEMU - two virtio disks, BIOS boot order "disk 2 only",
+the built kernel/initramfs with this tree's init scripts - with the
+first disk absent, wrecked, stale, beside a foreign ESP, with an
+explicit list, and two NICs for `alpine-zfsboot.net.mac=`.
 
 An empty `ROOTFS`/`STUB_ROOT` env var is the only thing standing
 between these scripts and real boot behaviour - it's unset (so every
