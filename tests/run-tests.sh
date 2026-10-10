@@ -125,6 +125,7 @@ run_stubbed() {
         dropbear() { "$STUBS/dropbear" "$@"; }
         dropbearkey() { "$STUBS/dropbearkey" "$@"; }
         cpio()     { "$STUBS/cpio" "$@"; }
+        blkid()    { "$STUBS/blkid" "$@"; }
         # setsid, not a plain `. "$script"` in this same subshell -
         # found the hard way, running this suite interactively on real
         # hardware (bureau): a bare fd-redirected subshell (`>"$d/out"
@@ -153,7 +154,7 @@ run_stubbed() {
         # setsid execs a genuinely NEW bash process - unlike a plain `(
         # ... )` subshell, it does not inherit function definitions any
         # other way.
-        export -f mount umount zpool zfs kexec modprobe mdev ifconfig udhcpc udhcpc6 ip nft dropbear dropbearkey cpio
+        export -f mount umount zpool zfs kexec modprobe mdev ifconfig udhcpc udhcpc6 ip nft dropbear dropbearkey cpio blkid
         # export -f only carries each function's own body text - $STUBS
         # itself (every stub function's own closed-over reference to
         # where the real tests/stubs/* scripts live) is a PLAIN variable,
@@ -198,7 +199,7 @@ stage_rescue_ssh() {
 
 # =============================================================================
 echo "== syntax check =="
-for f in init/init init/boot-dataset.sh init/alpine-zfsboot-shell init/net-config.sh init/rescue-ssh.sh init/pid-alive.sh init/zfs-unlock.sh init/zfs-unlock build.sh iso.sh; do
+for f in init/init init/boot-dataset.sh init/alpine-zfsboot-shell init/net-config.sh init/rescue-ssh.sh init/esp-select.sh init/pid-alive.sh init/zfs-unlock.sh init/zfs-unlock build.sh iso.sh; do
     if sh -n "$REPO_ROOT/$f"; then ok "sh -n $f"; else bad "sh -n $f"; fi
 done
 if python3 -m py_compile "$REPO_ROOT/init/menu.py" 2>/tmp/pyc.log; then
@@ -3364,6 +3365,26 @@ if ! grep -qi "unrecognized option alpine-zfsboot.version" "$d/out" 2>/dev/null 
     ok "version=/buildstamp= produce no warning, while a genuinely unrecognized key on the SAME cmdline still does"
 else
     cat "$d/out"; bad "version=/buildstamp= warned as unrecognized, or the catch-all stopped catching real typos"
+fi
+rm -rf "$d"
+
+# =============================================================================
+echo "== init: alpine-zfsboot.diag=1 / integrity= / int13chunk= (read by the BIOS stage2 loader only) are recognized no-ops =="
+# An operator turns on the BIOS loader's diagnostics by adding this word to
+# EFI/ALPINE/CMDLINE; the same cmdline then reaches /init, which must not
+# warn about it. A genuinely bogus key on the same line must still warn.
+d="$(fresh_env)"
+printf 'console=tty0 root=ZFS=zroot/ROOT/alpine ro quiet alpine-zfsboot.pool=zroot alpine-zfsboot.timeout=0 alpine-zfsboot.diag=1 alpine-zfsboot.integrity=enforce alpine-zfsboot.int13chunk=8 alpine-zfsboot.ipv6.gw=typo\n' \
+    > "$d/root/proc/cmdline"
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" STUB_BOOTFS="-" \
+    run_stubbed "$REPO_ROOT/init/init" >"$d/out" 2>&1 || true
+if ! grep -qi "unrecognized option alpine-zfsboot.diag" "$d/out" 2>/dev/null \
+   && ! grep -qi "unrecognized option alpine-zfsboot.integrity" "$d/out" 2>/dev/null \
+   && ! grep -qi "unrecognized option alpine-zfsboot.int13chunk" "$d/out" 2>/dev/null \
+   && grep -qi "unrecognized option alpine-zfsboot.ipv6.gw=typo" "$d/out" 2>/dev/null; then
+    ok "diag=1, integrity= and int13chunk= produce no warning, while a genuinely unrecognized key on the SAME cmdline still does"
+else
+    cat "$d/out"; bad "diag=1 warned as unrecognized, or the catch-all stopped catching real typos"
 fi
 rm -rf "$d"
 
@@ -9355,6 +9376,388 @@ if grep -q -- "^ip route add default via 203.0.113.1 dev eth0$" "$d/log" 2>/dev/
 else
     cat "$d/log" 2>/dev/null; bad "IPv4 default route was not given an explicit dev"
 fi
+rm -rf "$d"
+
+# =============================================================================
+# Mirrored boot (issue #24): init/esp-select.sh - which ESP /init takes its
+# config, authorized_keys and host key from. Fake ESPs are directories
+# ($E/esps/<dev>) the mount stub copies in (STUB_ESP_DIR), listed by the
+# blkid stub in busybox's real output format (STUB_BLKID). Scenario names
+# match internal/bootenv's TestSelectHost.
+
+ID_A="0f6c1e9a-4b1d-4c7e-9a55-1d2e3f405162"
+ID_B="9a8b7c6d-1111-4222-8333-444455556666"
+
+esp_env() {
+    E="$(mktemp -d)"
+    mkdir -p "$E/esps" "$E/root/tmp" "$E/root/proc"
+    : > "$E/blkid"
+    echo "$E"
+}
+
+# mk_esp E DEV UUID [LABEL] - a qualifying alpine-zfsboot ESP (boot binary,
+# config, keys, host key), each file naming its own device.
+mk_esp() {
+    _dir="$1/esps/$2"
+    mkdir -p "$_dir/EFI/ALPINE" "$_dir/EFI/BOOT"
+    : > "$_dir/EFI/BOOT/BOOTX64.EFI"
+    printf 'alpine-zfsboot.ssh.port=22\n' > "$_dir/EFI/ALPINE/config"
+    printf 'ssh-ed25519 AAAAKEY%s key-of-%s\n' "$2" "$2" > "$_dir/EFI/ALPINE/authorized_keys"
+    printf 'HOSTKEY-OF-%s\n' "$2" > "$_dir/EFI/ALPINE/ssh_host_ed25519_key"
+    printf '/dev/%s: LABEL="%s" UUID="%s" TYPE="vfat"\n' "$2" "${4:-EFI}" "$3" >> "$1/blkid"
+}
+
+# mk_member E DEV ID GEN MEMBERS ESP_UUID - writes EFI/ALPINE/MEMBER.
+mk_member() {
+    printf 'alpine-zfsboot esp-member 1\nINSTALL_ID=%s\nGENERATION=%s\nESP_UUID=%s\nMEMBERS=%s\n' "$3" "$4" "$6" "$5" > "$1/esps/$2/EFI/ALPINE/MEMBER"
+}
+
+# run_esp_select E [CMDLINE_LIST] [SELF] - runs esp_select with the stubs;
+# prints its messages and a final "RESULT ..." line.
+run_esp_select() {
+    (
+        set +e
+        mount()  { "$STUBS/mount" "$@"; }
+        umount() { "$STUBS/umount" "$@"; }
+        blkid()  { "$STUBS/blkid" "$@"; }
+        msg()    { echo "MSG: $*"; }
+        ROOTFS="$1/root" STUB_ESP_DIR="$1/esps" STUB_BLKID="$1/blkid"
+        export STUB_ESP_DIR STUB_BLKID
+        ESP_SELECT_CMDLINE_LIST="${2:-}" ESP_SELECT_SELF="${3:-}"
+        . "$REPO_ROOT/init/esp-select.sh"
+        esp_select
+        echo "RESULT rc=$? dev=$ESP_SELECTED_DEV uuid=$ESP_SELECTED_UUID id=$ESP_SELECTED_INSTALL_ID"
+    ) 2>&1
+}
+
+# expect_esp NAME E WANT_RESULT_SUBSTRING [CMDLINE_LIST] [SELF] [MSG_SUBSTRING]
+expect_esp() {
+    _out="$(run_esp_select "$2" "${4:-}" "${5:-}")"
+    if printf '%s\n' "$_out" | grep -qF -- "$3" && { [ -z "${6:-}" ] || printf '%s\n' "$_out" | grep -qF -- "$6"; }; then
+        ok "esp-select: $1"
+    else
+        printf '%s\n' "$_out"; bad "esp-select: $1 (want '$3' / '${6:-}')"
+    fi
+}
+
+echo "== esp-select.sh: ESP selection rules =="
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002 BOOT
+rm -rf "$E/esps/vdb1/EFI"
+expect_esp "legacy single ESP - unchanged" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001 id=" "" "" ""
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001 BOOTX
+expect_esp "legacy single ESP needs the EFI label, as before" "$E" "rc=1 dev= " "" "" "no alpine-zfsboot ESP found"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+expect_esp "two legacy ESPs, no list: refuse, name UUIDs and the way out" "$E" "rc=1 dev= " "" "" "esp adopt AAAA-0001 BBBB-0002 --yes', or set alpine-zfsboot.esp-uuids=AAAA-0001,BBBB-0002"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+for x in vda1 vdb1; do printf 'alpine-zfsboot.esp-uuids=BBBB-0002,AAAA-0001\r\n' >> "$E/esps/$x/EFI/ALPINE/config"; done
+expect_esp "two legacy ESPs agreeing on a config list (CRLF)" "$E" "rc=0 dev=/dev/vdb1 uuid=BBBB-0002"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 4 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 5 AAAA-0001,BBBB-0002 BBBB-0002
+expect_esp "same install id: highest generation wins, stale one named" "$E" "rc=0 dev=/dev/vdb1 uuid=BBBB-0002 id=$ID_A" "" "" "ESP AAAA-0001 (/dev/vda1) is STALE (generation 4 < 5)"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 BBBB-0002; mk_esp "$E" vdb1 AAAA-0001
+mk_member "$E" vda1 "$ID_A" 5 AAAA-0001,BBBB-0002 BBBB-0002; mk_member "$E" vdb1 "$ID_A" 5 AAAA-0001,BBBB-0002 AAAA-0001
+expect_esp "equal generations: by FAT UUID, not by device name" "$E" "rc=0 dev=/dev/vdb1 uuid=AAAA-0001"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vdb1 "$ID_A" 5 AAAA-0001,BBBB-0002 BBBB-0002
+expect_esp "missing member (first disk gone): boots from the other, warns" "$E" "rc=0 dev=/dev/vdb1 uuid=BBBB-0002" "" "" "ESP AAAA-0001 of this host's set is not present"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdc1 CCCC-0003
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001 AAAA-0001; mk_member "$E" vdc1 "$ID_B" 50 CCCC-0003 CCCC-0003
+printf 'ssh-ed25519 AAAAEVIL attacker\n' > "$E/esps/vdc1/EFI/ALPINE/authorized_keys"
+expect_esp "two installations and nothing to choose: refuse" "$E" "rc=1 dev= " "" "" "ESPs of more than one alpine-zfsboot installation"
+expect_esp "booted ESP (esp-self) names this host's installation; foreign ignored" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001 id=$ID_A" "" "aaaa-0001" ""
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 4 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 6 AAAA-0001,BBBB-0002 BBBB-0002
+expect_esp "booted ESP is used even when a sibling is newer (warning)" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001" "" "AAAA-0001" "has a NEWER generation (6)"
+rm -rf "$E/esps/vda1/EFI/ALPINE/config" "$E/esps/vda1/EFI/ALPINE/authorized_keys" "$E/esps/vda1/EFI/ALPINE/ssh_host_ed25519_key"
+expect_esp "booted ESP without config: its siblings (same installation) instead" "$E" "rc=0 dev=/dev/vdb1 uuid=BBBB-0002" "" "AAAA-0001" "looking for its siblings"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vdb1 "$ID_A" 6 AAAA-0001,BBBB-0002 BBBB-0002
+expect_esp "booted ESP not visible to Linux: siblings" "$E" "rc=0 dev=/dev/vdb1" "" "AAAA-0001" "is not visible to Linux"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001 AAAA-0001
+cp "$E/esps/vda1/EFI/ALPINE/MEMBER" "$E/esps/vdb1/EFI/ALPINE/MEMBER"
+expect_esp "copied marker is not a member" "$E" "rc=0 dev=/dev/vda1" "" "" "ignoring ESP BBBB-0002 (/dev/vdb1): its MEMBER marker was copied"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vdb1 "$ID_A" 3 AAAA-0001 AAAA-0001
+expect_esp "copied marker alone is not a legacy candidate either" "$E" "rc=1 dev= " "" "" "no alpine-zfsboot ESP found"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 AAAA-0001
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 3 AAAA-0001 AAAA-0001
+expect_esp "dd clone (duplicate UUID): refuse" "$E" "rc=1 dev= " "" "" "is on more than one device (/dev/vda1, /dev/vdb1)"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 3 BBBB-0002 BBBB-0002
+printf 'alpine-zfsboot esp-member 2\nINSTALL_ID=%s\nGENERATION=9\nESP_UUID=BBBB-0002\n' "$ID_A" > "$E/esps/vdb1/EFI/ALPINE/MEMBER"
+expect_esp "a marker of an unknown (newer) format is not a member" "$E" "rc=0 dev=/dev/vda1" "" "" "MEMBER marker is unreadable or of an unknown format"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 3 AAAA-0001,BBBB-0002 BBBB-0002
+printf 'alpine-zfsboot.esp-uuids=BBBB-0002,AAAA-0001\n' >> "$E/esps/vda1/EFI/ALPINE/config"
+expect_esp "the best member's own config list applies" "$E" "rc=0 dev=/dev/vdb1 uuid=BBBB-0002"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdc1 CCCC-0003
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001 AAAA-0001; mk_member "$E" vdc1 "$ID_B" 99 CCCC-0003 CCCC-0003
+printf 'alpine-zfsboot.esp-uuids=CCCC-0003,AAAA-0001\n' >> "$E/esps/vdc1/EFI/ALPINE/config"
+expect_esp "a foreign ESP's config list is never used (booted ESP)" "$E" "rc=0 dev=/dev/vda1" "" "AAAA-0001" ""
+rm -f "$E/esps/vda1/EFI/ALPINE/MEMBER"; mk_member "$E" vda1 "$ID_A" 3 AAAA-0001 AAAA-0001
+mk_esp "$E" vdb1 BBBB-0002; mk_member "$E" vdb1 "$ID_A" 3 AAAA-0001,BBBB-0002 BBBB-0002
+expect_esp "a foreign ESP's config list is never used (listed first, higher generation)" "$E" "rc=1 dev= " "" "" "more than one alpine-zfsboot installation"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdc1 CCCC-0003
+expect_esp "cmdline list: listed only, missing reported, unlisted ignored" "$E" "rc=0 dev=/dev/vda1" "BBBB-0002,aaaa-0001" "" "ESP BBBB-0002 of this host's set is not present"
+expect_esp "cmdline list: the unlisted ESP is named" "$E" "rc=0 dev=/dev/vda1" "BBBB-0002,AAAA-0001" "" "ignoring ESP CCCC-0003 (/dev/vdc1): not in alpine-zfsboot.esp-uuids"
+expect_esp "cmdline list: none present" "$E" "rc=1 dev= " "BBBB-0002" "" "none of the ESPs listed"
+expect_esp "cmdline list: malformed" "$E" "rc=1 dev= " "AAAA-0001,,BBBB" "" "is malformed"
+expect_esp "cmdline list: listed twice" "$E" "rc=1 dev= " "AAAA-0001,aaaa-0001" "" "is malformed"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdc1 CCCC-0003
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001 AAAA-0001; mk_member "$E" vdc1 "$ID_B" 99 CCCC-0003 CCCC-0003
+expect_esp "cmdline list naming a foreign ESP (higher generation, listed second): skipped" "$E" "rc=0 dev=/dev/vda1" "AAAA-0001,CCCC-0003" "" "carries the marker of ANOTHER installation"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 AAAA-0001
+expect_esp "cmdline list: listed UUID on two devices" "$E" "rc=1 dev= " "AAAA-0001" "" "on more than one device"
+rm -rf "$E"
+
+# CHECKSUM fallback: the best member's KERNEL no longer matches its CHECKSUM.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 7 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 6 AAAA-0001,BBBB-0002 BBBB-0002
+for x in vda1 vdb1; do
+    head -c 2048 /dev/urandom > "$E/esps/$x/EFI/ALPINE/KERNEL"; head -c 4096 /dev/urandom > "$E/esps/$x/EFI/ALPINE/INITRD"
+    { echo "alpine-zfsboot payload-sum 1"; echo "MODE warn"
+      echo "KERNEL 2048 512 $(tail -c +513 "$E/esps/$x/EFI/ALPINE/KERNEL" | sha256sum | cut -d' ' -f1)"
+      echo "INITRD 4096 0 $(sha256sum < "$E/esps/$x/EFI/ALPINE/INITRD" | cut -d' ' -f1)"; } > "$E/esps/$x/EFI/ALPINE/CHECKSUM"
+done
+expect_esp "CHECKSUM present and matching: the best member" "$E" "rc=0 dev=/dev/vda1"
+printf 'X' | dd of="$E/esps/vda1/EFI/ALPINE/KERNEL" bs=1 seek=1000 conv=notrunc 2>/dev/null
+expect_esp "best member fails its CHECKSUM: the next member" "$E" "rc=0 dev=/dev/vdb1" "" "" "KERNEL on /dev/vda1 does not match its CHECKSUM"
+sed -i '1s/.*/alpine-zfsboot payload-sum 2/' "$E/esps/vda1/EFI/ALPINE/CHECKSUM"
+expect_esp "a CHECKSUM of an unknown format is never a mismatch" "$E" "rc=0 dev=/dev/vda1"
+rm -rf "$E"
+
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 7 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 6 AAAA-0001,BBBB-0002 BBBB-0002
+cp -a "$E/esps/vda1" "$E/esps/vda1.real"; : > "$E/esps/vda1/.mountfail"
+expect_esp "best member does not mount (corrupt FAT): the next member" "$E" "rc=0 dev=/dev/vdb1"
+rm -rf "$E"
+
+# =============================================================================
+echo "== init: mirrored boot end to end - config, keys and host key from the right ESP, never from a foreign one =="
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+E="$(esp_env)"
+mk_esp "$E" vdb1 BBBB-0002; mk_member "$E" vdb1 "$ID_A" 5 AAAA-0001,BBBB-0002 BBBB-0002
+mk_esp "$E" vdc1 CCCC-0003; mk_member "$E" vdc1 "$ID_B" 90 CCCC-0003 CCCC-0003
+printf 'ssh-ed25519 AAAAEVIL attacker\n' > "$E/esps/vdc1/EFI/ALPINE/authorized_keys"
+printf 'alpine-zfsboot.ssh.port=2222\n' >> "$E/esps/vdb1/EFI/ALPINE/config"
+printf 'root=ZFS=zroot/ROOT/alpine ro alpine-zfsboot.timeout=0 alpine-zfsboot.esp-self=BBBB-0002\n' > "$d/root/proc/cmdline"
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" STUB_BOOTFS="zroot/ROOT/alpine" \
+STUB_ESP_DIR="$E/esps" STUB_BLKID="$E/blkid" \
+    run_stubbed "$REPO_ROOT/init/init" >"$d/out" 2>&1 || true
+if grep -q "alpine-zfsboot ESP found on /dev/vdb1 (UUID BBBB-0002: the ESP this boot came from)" "$d/out" \
+   && grep -q "AAAAKEYvdb1" "$d/root/tmp/alpine-zfsboot/authorized_keys" 2>/dev/null \
+   && ! grep -q "EVIL" "$d/root/tmp/alpine-zfsboot/authorized_keys" 2>/dev/null \
+   && grep -q "HOSTKEY-OF-vdb1" "$d/root/tmp/alpine-zfsboot/ssh_host_ed25519_key" 2>/dev/null \
+   && grep -q "ESP AAAA-0001 of this host's set is not present" "$d/out"; then
+    ok "init took config/keys/host key from the booted member, warned about the missing one, never staged the foreign ESP's key"
+else
+    cat "$d/out"; cat "$d/root/tmp/alpine-zfsboot/authorized_keys" 2>/dev/null; bad "init mirrored-boot ESP selection end to end"
+fi
+rm -rf "$d" "$E"
+
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+E="$(esp_env)"
+mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+printf 'root=ZFS=zroot/ROOT/alpine ro alpine-zfsboot.timeout=0\n' > "$d/root/proc/cmdline"
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" STUB_BOOTFS="zroot/ROOT/alpine" \
+STUB_ESP_DIR="$E/esps" STUB_BLKID="$E/blkid" \
+    run_stubbed "$REPO_ROOT/init/init" >"$d/out" 2>&1 || true
+if grep -q "ambiguous, applying NONE of it" "$d/out" && grep -q "esp adopt AAAA-0001 BBBB-0002 --yes" "$d/out" \
+   && [ ! -s "$d/root/tmp/alpine-zfsboot/authorized_keys" ] && grep -q "importing pool: zroot" "$d/out"; then
+    ok "two unmarked ESPs without a list: nothing applied (as before), the message names them and the way out, the pool boot goes on"
+else
+    cat "$d/out"; bad "two legacy ESPs end to end"
+fi
+rm -rf "$d" "$E"
+
+d="$(fresh_env)"
+mkdir -p "$d/pooldata/boot"
+: > "$d/pooldata/boot/vmlinuz-lts"; : > "$d/pooldata/boot/initramfs-lts"
+E="$(esp_env)"
+mk_esp "$E" vda1 AAAA-0001; mk_member "$E" vda1 "$ID_A" 5 AAAA-0001 AAAA-0001
+printf 'root=ZFS=zroot/ROOT/alpine ro alpine-zfsboot.timeout=0\n' > "$d/root/proc/cmdline"
+STUB_LOG="$d/log" STUB_ROOT="$d/root" STUB_POOL_DATA="$d/pooldata" STUB_BOOTFS="zroot/ROOT/alpine" \
+STUB_ESP_DIR="$E/esps" STUB_BLKID="$E/blkid" STUB_POOL_INSTALL_ID="$ID_B" \
+    run_stubbed "$REPO_ROOT/init/init" >"$d/out" 2>&1 || true
+if grep -q "WARNING: pool zroot belongs to alpine-zfsboot installation $ID_B, but the ESP config/keys were taken from installation $ID_A" "$d/out"; then
+    ok "after import: a pool whose install-id differs from the ESP's is warned about"
+else
+    grep -i "pool\|ESP" "$d/out" | head -20; bad "pool identity cross-check"
+fi
+rm -rf "$d" "$E"
+
+# =============================================================================
+echo "== net-config.sh: alpine-zfsboot.net.mac= picks the rescue NIC by MAC, never falls back to eth0 =="
+# fake_sysnet DIR NAME|PATH|MAC... - a /sys/class/net look-alike: each
+# interface a symlink into ../../devices/<PATH>/net/<NAME>, like the real one.
+fake_sysnet() {
+    _r="$1"; shift
+    mkdir -p "$_r/sys/class/net"
+    for _spec in "$@"; do
+        _n="${_spec%%|*}"; _rest="${_spec#*|}"; _p="${_rest%%|*}"; _m="${_rest#*|}"
+        mkdir -p "$_r/sys/devices/$_p/net/$_n"
+        printf '%s\n' "$_m" > "$_r/sys/devices/$_p/net/$_n/address"
+        if [ "$_n" = lo ]; then echo 772; else echo 1; fi > "$_r/sys/devices/$_p/net/$_n/type"
+        ln -s "../../devices/$_p/net/$_n" "$_r/sys/class/net/$_n"
+    done
+}
+run_resolve() {
+    (
+        set +e
+        ROOTFS="$1" ALPINE_ZFSBOOT_NET_MAC="$2" NET_MAC_WAIT="${3:-2}" NET_CONFIG_POLL_INTERVAL=0
+        export ROOTFS
+        . "$REPO_ROOT/init/net-config.sh"
+        iface="$(net_resolve_iface)"; rc=$?
+        echo "RESOLVED rc=$rc iface=$iface"
+    ) 2>&1
+}
+d="$(mktemp -d)"
+fake_sysnet "$d" 'lo|virtual/net|00:00:00:00:00:00' 'eth0|pci0000:00/0000:00:03.0|52:54:00:00:00:01' \
+    'eth1|pci0000:00/0000:00:04.0|52:54:00:aa:bb:02' 'br0|virtual/net|52:54:00:aa:bb:02'
+out="$(run_resolve "$d" "")"
+case "$out" in *"RESOLVED rc=0 iface=eth0"*) ok "no net.mac: eth0, as before" ;; *) echo "$out"; bad "default iface" ;; esac
+out="$(run_resolve "/nonexistent" "")"
+case "$out" in *"RESOLVED rc=0 iface=eth0"*) ok "no net.mac: /sys is never even read" ;; *) echo "$out"; bad "default iface without /sys" ;; esac
+out="$(run_resolve "$d" "52:54:00:AA:BB:02")"
+case "$out" in *"RESOLVED rc=0 iface=eth1"*) ok "net.mac (upper case) resolves to eth1; the bridge with the same MAC is ignored" ;; *) echo "$out"; bad "MAC resolution" ;; esac
+out="$(run_resolve "$d" "52-54-00-00-00-01")"
+case "$out" in *"RESOLVED rc=0 iface=eth0"*) ok "net.mac with '-' separators" ;; *) echo "$out"; bad "MAC with dashes" ;; esac
+out="$(run_resolve "$d" "52:54:00:00:00:09")"
+case "$out" in *"RESOLVED rc=1 iface="|*"RESOLVED rc=1 iface=") ;; esac
+if printf '%s' "$out" | grep -q "RESOLVED rc=1 iface=$" && printf '%s' "$out" | grep -q "NOT falling back to eth0" && printf '%s' "$out" | grep -q "eth1=52:54:00:aa:bb:02" && ! printf '%s' "$out" | grep -q "br0="; then
+    ok "net.mac matching no card: configuration error naming the cards found, no eth0 fallback"
+else
+    echo "$out"; bad "MAC not found"
+fi
+for badmac in "52:54:00:00:01" "zz:54:00:00:00:01" "52:54-00:00:00:01" "ff:ff:ff:ff:ff:ff" "00:00:00:00:00:00"; do
+    out="$(run_resolve "$d" "$badmac")"
+    if printf '%s' "$out" | grep -q "RESOLVED rc=1 iface=$"; then ok "malformed/unusable net.mac '$badmac' refused"; else echo "$out"; bad "malformed net.mac '$badmac' accepted"; fi
+done
+rm -rf "$d"
+
+d="$(mktemp -d)"
+fake_sysnet "$d" 'eth0|pci0000:00/0000:00:03.0|52:54:00:00:00:01' 'eth1|pci0000:00/0000:00:04.0|52:54:00:00:00:01'
+out="$(run_resolve "$d" "52:54:00:00:00:01")"
+if printf '%s' "$out" | grep -q "RESOLVED rc=1" && printf '%s' "$out" | grep -q "more than one card"; then ok "the same MAC on two physical cards: refused"; else echo "$out"; bad "duplicate MAC"; fi
+rm -rf "$d"
+
+# A late driver: the card appears while net_resolve_iface waits.
+d="$(mktemp -d)"
+fake_sysnet "$d" 'eth0|pci0000:00/0000:00:03.0|52:54:00:00:00:01'
+( sleep 1; mkdir -p "$d/sys/devices/usb1/net/eth1"; echo 52:54:00:00:00:07 > "$d/sys/devices/usb1/net/eth1/address"; echo 1 > "$d/sys/devices/usb1/net/eth1/type"; ln -s ../../devices/usb1/net/eth1 "$d/sys/class/net/eth1" ) &
+out="$(
+    ROOTFS="$d" ALPINE_ZFSBOOT_NET_MAC=52:54:00:00:00:07 NET_MAC_WAIT=10 NET_CONFIG_POLL_INTERVAL=1 \
+    sh -c '. "$1"; iface="$(net_resolve_iface)"; echo "RESOLVED rc=$? iface=$iface"' -- "$REPO_ROOT/init/net-config.sh" 2>&1
+)"
+wait
+if printf '%s' "$out" | grep -q "RESOLVED rc=0 iface=eth1" && printf '%s' "$out" | grep -q "waiting up to 10s"; then
+    ok "a card whose driver appears late is found within the bounded wait"
+else
+    echo "$out"; bad "late NIC"
+fi
+rm -rf "$d"
+
+echo "== rescue-ssh.sh: a configured net.mac that matches no card -> no network bring-up, no dropbear =="
+d="$(fresh_env)"
+stage_rescue_ssh "$d/root"
+fake_sysnet "$d/root" 'eth0|pci0000:00/0000:00:03.0|52:54:00:00:00:01'
+(
+    set +e
+    ip() { "$STUBS/ip" "$@"; }; ifconfig() { "$STUBS/ifconfig" "$@"; }; udhcpc() { "$STUBS/udhcpc" "$@"; }
+    udhcpc6() { "$STUBS/udhcpc6" "$@"; }; dropbear() { "$STUBS/dropbear" "$@"; }; dropbearkey() { "$STUBS/dropbearkey" "$@"; }
+    nft() { "$STUBS/nft" "$@"; }
+    STUB_LOG="$d/log" STUB_ROOT="$d/root" ALPINE_ZFSBOOT_NET_MAC=52:54:00:00:00:99 NET_MAC_WAIT=1 NET_CONFIG_POLL_INTERVAL=0
+    export STUB_LOG STUB_ROOT ALPINE_ZFSBOOT_NET_MAC NET_MAC_WAIT NET_CONFIG_POLL_INTERVAL
+    msg() { echo "MSG: $*"; }
+    . "$REPO_ROOT/init/rescue-ssh.sh"
+    ROOTFS="$d/root"
+    start_rescue_ssh; echo "START rc=$?"
+) >"$d/out" 2>&1
+if grep -q "START rc=1" "$d/out" && grep -q "rescue network card not found" "$d/out" && ! grep -q "^ip link set\|^dropbear \|^udhcpc" "$d/log" 2>/dev/null; then
+    ok "start_rescue_ssh refuses (no eth0 fallback, nothing brought up, no dropbear)"
+else
+    cat "$d/out" "$d/log" 2>/dev/null; bad "rescue ssh with unresolvable net.mac"
+fi
+rm -rf "$d"
+
+d="$(fresh_env)"
+stage_rescue_ssh "$d/root"
+fake_sysnet "$d/root" 'eth0|pci0000:00/0000:00:03.0|52:54:00:00:00:01' 'eth1|pci0000:00/0000:00:04.0|52:54:00:00:00:02'
+(
+    set +e
+    ip() { "$STUBS/ip" "$@"; }; ifconfig() { "$STUBS/ifconfig" "$@"; }; udhcpc() { "$STUBS/udhcpc" "$@"; }
+    udhcpc6() { "$STUBS/udhcpc6" "$@"; }; dropbear() { "$STUBS/dropbear" "$@"; }; dropbearkey() { "$STUBS/dropbearkey" "$@"; }
+    nft() { "$STUBS/nft" "$@"; }
+    STUB_LOG="$d/log" STUB_ROOT="$d/root" ALPINE_ZFSBOOT_NET_MAC=52:54:00:00:00:02 ALPINE_ZFSBOOT_IPV6=off
+    export STUB_LOG STUB_ROOT ALPINE_ZFSBOOT_NET_MAC ALPINE_ZFSBOOT_IPV6
+    msg() { echo "MSG: $*"; }
+    . "$REPO_ROOT/init/rescue-ssh.sh"
+    ROOTFS="$d/root"
+    start_rescue_ssh; echo "START rc=$?"
+) >"$d/out" 2>&1
+if grep -q "^ip link set eth1 up" "$d/log" 2>/dev/null && ! grep -q "eth0" "$d/log" 2>/dev/null; then
+    ok "start_rescue_ssh brings up the card the MAC names (eth1), never eth0"
+else
+    cat "$d/out" "$d/log" 2>/dev/null; bad "rescue ssh on the MAC-selected card"
+fi
+rm -rf "$d"
+
+echo "== menu.py: rescue_iface() follows alpine-zfsboot.net.mac= with the same rules =="
+d="$(mktemp -d)"
+fake_sysnet "$d" 'eth0|pci0000:00/0000:00:03.0|52:54:00:00:00:01' 'eth1|pci0000:00/0000:00:04.0|52:54:00:aa:bb:02' 'br0|virtual/net|52:54:00:aa:bb:02'
+for c in "|eth0|" "52:54:00:AA:BB:02|eth1|" "52-54-00-00-00-01|eth0|" "52:54:00:00:00:09||no network card has MAC 52:54:00:00:00:09" "bogus||is not a network card"; do
+    mac="${c%%|*}"; rest="${c#*|}"; want_if="${rest%%|*}"; want_err="${rest#*|}"
+    out="$(STUB_ROOT="$d" ALPINE_ZFSBOOT_NET_MAC="$mac" python3 - "$REPO_ROOT/init" <<'PYEOF' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import menu
+iface, err = menu.rescue_iface()
+print(f"IFACE={iface or ''} ERR={err or ''}")
+PYEOF
+)"
+    if printf '%s' "$out" | grep -q "IFACE=$want_if ERR=.*$want_err"; then ok "menu.py rescue_iface() for net.mac='$mac'"; else echo "$out"; bad "menu.py rescue_iface() for net.mac='$mac'"; fi
+done
 rm -rf "$d"
 
 # =============================================================================

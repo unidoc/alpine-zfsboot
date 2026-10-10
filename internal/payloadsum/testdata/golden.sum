@@ -1,0 +1,4 @@
+alpine-zfsboot payload-sum 1
+MODE warn
+KERNEL 8192 2048 94b76fcdb16f0907d0eab4c0401063d21b7a57dc1f97db321902cde8fc1cdfe6
+INITRD 5000 0 ab914b45858228984686becdaac63b77fca308e6ca9578f04cf94ef05c644e15

@@ -43,6 +43,7 @@ import (
 	"github.com/unidoc/alpine-zfsboot/internal/kernelinfo"
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
 	"github.com/unidoc/alpine-zfsboot/internal/metadata"
+	"github.com/unidoc/alpine-zfsboot/internal/payloadsum"
 	"github.com/unidoc/alpine-zfsboot/internal/release"
 	"github.com/unidoc/alpine-zfsboot/internal/uefiboot"
 
@@ -94,6 +95,10 @@ something an operator needs to know or do by hand.`,
 		newVerifyCmd(),
 		newUpdateCmd(),
 		newInstallCmd(),
+		newIntegrityCmd(),
+		newInt13ChunkCmd(),
+		newESPCmd(),
+		newPayloadManifestCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -252,49 +257,31 @@ type target struct {
 	cleanup    func()
 }
 
-// discover gathers what status/verify/update need before doing
-// anything else. firmwareOverride ("uefi"/"bios"/"") exists for the
-// SAME reason install's own --firmware flag is required, not
-// auto-detected (see newInstallCmd's own doc comment): a caller
-// invoking these against a not-yet-booted --root (alpine-installer's
-// own verify_installation(), right after install) has no live
-// /sys/firmware/efi under that root to check - bootenv.IsUEFI(root)
-// would silently misdetect there. Empty string keeps the normal,
-// correct behavior for the common case this WAS built for: a live,
-// already-booted system, where root is "/" and its own real
-// /sys/firmware/efi is exactly the right thing to trust.
+// discoverHost (mirror.go) gathers what status/verify/update/integrity/
+// int13chunk need before doing anything else: the set of this host's ESPs
+// - one for a single-ESP install, exactly as discover() always did - each
+// mounted, with its target.
+//
+// discover is the single-ESP view of the same discovery, for code that
+// works on exactly one ESP: the one member of a single-ESP install; with a
+// mirrored boot it refuses (use discoverHost/forEachMember, which handle
+// every ESP of the set).
 func discover(root, firmwareOverride string, readonly bool) (*target, error) {
-	var uefi bool
-	switch firmwareOverride {
-	case "uefi":
-		uefi = true
-	case "bios":
-		uefi = false
-	case "":
-		uefi = bootenv.IsUEFI(root)
-	default:
-		return nil, fmt.Errorf("--firmware must be \"uefi\" or \"bios\" (got %q)", firmwareOverride)
-	}
-	t := &target{uefi: uefi, arch: detectArch()}
-
-	espDev, err := bootenv.FindESP()
+	h, err := discoverHost(root, firmwareOverride, readonly, hostOpts{})
 	if err != nil {
 		return nil, err
 	}
-	t.espDev = espDev
-	t.disk = bootenv.DevicePartitionBase(espDev)
-	if !t.uefi {
-		if l, err := bootenv.DetectDiskLayout(t.disk); err == nil {
-			t.layoutKind = l
-		}
+	if len(h.members) != 1 || len(h.set.Missing) > 0 {
+		h.cleanup()
+		return nil, fmt.Errorf("this host has a mirrored boot (%d ESPs present, %d missing) - this operation works on one ESP only; use a command that handles the whole set", len(h.members), len(h.set.Missing))
 	}
-
-	mountpoint, cleanup, err := bootenv.MountESP(espDev, readonly)
-	if err != nil {
-		return nil, err
+	m := h.members[0]
+	if m.mountErr != nil {
+		h.cleanup()
+		return nil, m.mountErr
 	}
-	t.mountpoint, t.cleanup = mountpoint, cleanup
-	return t, nil
+	m.target.cleanup = h.cleanup
+	return m.target, nil
 }
 
 // report is one fact-finding pass over an already-discovered target -
@@ -362,6 +349,21 @@ type report struct {
 	// `verify` while reporting the real answer as `verify: OK` two
 	// lines later.
 	metadataVerified bool
+
+	// BIOS only: EFI/ALPINE/CHECKSUM (internal/payloadsum), which the
+	// BIOS loader checks the loaded kernel/initrd against before every
+	// boot. payloadSumErr: present but undecodable, or its recorded sizes
+	// no longer match the installed files (status checks that much; only
+	// verify hashes). payloadSumVerified: verify hashed the payload and
+	// it matched.
+	payloadSumPresent  bool
+	payloadSumErr      error
+	payloadSumVerified bool
+	payloadSumMode     string // CHECKSUM's MODE, when it decoded
+	int13Chunk         string // status line for the BIOS INT 13h transfer cap
+	payloadSumWarn     bool   // verify: mismatch, but not enforce - warned, not failed
+	integrityOverride  string // alpine-zfsboot.integrity= in CMDLINE (wins at boot), if valid
+	blkSum             string // status/verify line for EFI/ALPINE/BLKSUM
 
 	zfs zfsCompat
 }
@@ -443,6 +445,8 @@ func inspect(t *target) report {
 		r.stage2Err = fmt.Errorf("stage2 extent is empty - nothing installed")
 	} else {
 		r.stage2Bytes = len(stage2)
+		cmdRaw, _ := os.ReadFile(filepath.Join(t.mountpoint, layout.CmdlineFile))
+		r.int13Chunk = int13ChunkStatus(cmdRaw, stage2)
 		if v, _, err := biosboot.ExtractStage2Version(stage2); err != nil {
 			// Not fatal to the stage2 health check itself - an older
 			// stage2.bin built before this string existed is still a
@@ -497,6 +501,9 @@ func inspect(t *target) report {
 		}
 	}
 
+	r.payloadSumPresent, r.payloadSumMode, r.payloadSumErr = inspectPayloadSum(t.mountpoint)
+	r.blkSum = inspectBlkSum(t.mountpoint)
+
 	// bootPool stays empty (never a fatal error on its own - r.cmdlineErr
 	// above already covers a genuinely missing/unreadable cmdline.txt)
 	// if this read fails - inspectZFSCompat/selectBootPool below treat
@@ -504,6 +511,7 @@ func inspect(t *target) report {
 	var bootPool string
 	if raw, err := os.ReadFile(filepath.Join(t.mountpoint, layout.CmdlineFile)); err == nil {
 		bootPool = cmdline.ParseText(raw).Pool
+		r.integrityOverride = cmdlineIntegrity(string(raw))
 	}
 
 	r.zfs = inspectZFSCompat(bootPool)
@@ -645,6 +653,9 @@ func (r report) print(verbose bool) {
 		printField("Stage1", r.stage1Err, "OK ("+r.stage1Desc+")")
 		printField("Stage2", r.stage2Err, "OK ("+r.stage2Desc+")")
 		fmt.Printf("  %-20s %s\n", "Stage2 version:", orNone(r.installedVersion))
+		if r.int13Chunk != "" {
+			fmt.Printf("  %-20s %s\n", "INT13 chunk:", r.int13Chunk)
+		}
 	} else {
 		printField("EFI loader", r.loaderErr, "OK ("+r.loaderPath+")")
 	}
@@ -695,6 +706,30 @@ func (r report) print(verbose bool) {
 		fmt.Printf("  %-20s from manifest (run 'alpine-zfsboot verify' to confirm it matches the real payload)\n", "Metadata:")
 	default:
 		fmt.Printf("  %-20s MISSING (deep-inspected instead - run 'alpine-zfsboot verify --repair' to add it)\n", "Metadata:")
+	}
+
+	if r.firmware == "BIOS" {
+		switch {
+		case r.payloadSumErr != nil:
+			fmt.Printf("  %-20s WARNING (%v)\n", "Payload sum:", r.payloadSumErr)
+		case r.payloadSumWarn:
+			fmt.Printf("  %-20s WARNING (does not match the installed kernel/initrd; mode %s - the BIOS loader does not refuse it)\n", "Payload sum:", r.payloadSumMode)
+		case r.payloadSumVerified:
+			fmt.Printf("  %-20s OK (SHA-256 confirmed against the installed kernel/initrd)\n", "Payload sum:")
+		case r.payloadSumPresent:
+			fmt.Printf("  %-20s present, sizes match (run 'alpine-zfsboot verify' to confirm the SHA-256)\n", "Payload sum:")
+		default:
+			fmt.Printf("  %-20s INFO: not present (older install, run 'alpine-zfsboot update' or 'verify --repair' to add it)\n", "Payload sum:")
+		}
+		if r.blkSum != "" {
+			fmt.Printf("  %-20s %s\n", "Block table:", r.blkSum)
+		}
+		switch {
+		case r.integrityOverride != "":
+			fmt.Printf("  %-20s %s - set by alpine-zfsboot.integrity= in %s, which wins over CHECKSUM's %q (%s)\n", "Integrity mode:", r.integrityOverride, layout.CmdlineFile, r.payloadSumMode, integrityModeHelp(r.integrityOverride))
+		case r.payloadSumMode != "":
+			fmt.Printf("  %-20s %s (%s)\n", "Integrity mode:", r.payloadSumMode, integrityModeHelp(r.payloadSumMode))
+		}
 	}
 
 	fmt.Println("ZFS compatibility")
@@ -774,7 +809,277 @@ func (r report) errs() []error {
 			out = append(out, e)
 		}
 	}
+	// A CHECKSUM problem is only an installation defect when the BIOS
+	// loader would act on it by refusing to boot (integrity mode
+	// enforce). Otherwise the machine boots exactly as without the file:
+	// print() shows it as a WARNING, and status/verify do not fail on it.
+	if r.payloadSumErr != nil && r.payloadSumMode == payloadsum.ModeEnforce {
+		out = append(out, r.payloadSumErr)
+	}
 	return out
+}
+
+// inspectPayloadSum is status' cheap check of EFI/ALPINE/CHECKSUM
+// (BIOS installs): does it exist, does it decode, and do its recorded
+// sizes still match the installed KERNEL/INITRD. No hashing - that is
+// verify's job (verifyPayloadSum). present=false, err=nil: simply absent
+// (an install from before the file existed - the BIOS loader then boots
+// without checking, which is not a failure).
+func inspectPayloadSum(mountpoint string) (present bool, mode string, err error) {
+	raw, err := os.ReadFile(filepath.Join(mountpoint, layout.PayloadSumFile))
+	if os.IsNotExist(err) {
+		return false, "", nil
+	}
+	if err != nil {
+		return true, "", fmt.Errorf("%s exists but could not be read: %w", layout.PayloadSumFile, err)
+	}
+	m, err := payloadsum.Decode(raw)
+	if err != nil {
+		return true, "", fmt.Errorf("%s: %w - the BIOS loader will boot without checking kernel/initrd", layout.PayloadSumFile, err)
+	}
+	for _, f := range []struct {
+		rel  string
+		want uint32
+	}{{layout.KernelFile, m.Kernel.Size}, {layout.InitrdFile, m.Initrd.Size}} {
+		st, err := os.Stat(filepath.Join(mountpoint, f.rel))
+		if err != nil {
+			continue // reported as missing by inspect() itself
+		}
+		if uint64(st.Size()) != uint64(f.want) {
+			return true, m.Mode, fmt.Errorf("%s is %d bytes but %s records %d - stale manifest or a changed file (the BIOS loader %s)", f.rel, st.Size(), layout.PayloadSumFile, f.want, mismatchAction(m.Mode))
+		}
+	}
+	return true, m.Mode, nil
+}
+
+// cmdlineIntegrity returns the value of alpine-zfsboot.integrity= in a
+// kernel command line when it is one stage2 accepts (it ignores others).
+func cmdlineIntegrity(cmd string) string {
+	for _, w := range strings.Fields(cmd) {
+		if v, ok := strings.CutPrefix(w, "alpine-zfsboot.integrity="); ok && payloadsum.ValidMode(v) {
+			return v
+		}
+	}
+	return ""
+}
+
+// integrityModeHelp/mismatchAction: what the BIOS loader does per mode.
+func integrityModeHelp(mode string) string {
+	switch mode {
+	case payloadsum.ModeOff:
+		return "the BIOS loader does not hash kernel/initrd"
+	case payloadsum.ModeEnforce:
+		return "the BIOS loader refuses to boot a kernel/initrd that does not match"
+	default:
+		return "the BIOS loader hashes kernel/initrd and on a mismatch shows both digests, then boots"
+	}
+}
+
+func mismatchAction(mode string) string {
+	if mode == payloadsum.ModeEnforce {
+		return "will refuse to boot it - integrity mode enforce"
+	}
+	return "will warn and boot"
+}
+
+// setIntegrityMode rewrites CHECKSUM with a new MODE (atomically, via
+// espconfig.WriteFile's temp-file + rename). A missing CHECKSUM is created
+// from the installed payload - the same trust level as `verify --repair`.
+// A CHECKSUM that no longer matches the payload is NOT re-blessed: only
+// its MODE line changes, so a stale manifest stays visibly stale.
+func setIntegrityMode(t *target, mode string) error {
+	if !payloadsum.ValidMode(mode) {
+		return fmt.Errorf("integrity mode %q is not off, warn or enforce", mode)
+	}
+	path := filepath.Join(t.mountpoint, layout.PayloadSumFile)
+	raw, err := os.ReadFile(path)
+	var m payloadsum.Manifest
+	switch {
+	case os.IsNotExist(err):
+		kernel, initrd, _, rerr := readInstalledKernelInitrd(t)
+		if rerr != nil {
+			return fmt.Errorf("no %s yet, and reading the installed kernel/initrd to create it failed: %w", layout.PayloadSumFile, rerr)
+		}
+		if m, err = payloadsum.New(kernel, initrd, mode); err != nil {
+			return err
+		}
+		// Its BLKSUM first (see writePayloadWithRollback's ordering).
+		blk, err := payloadsum.GenerateBlkSum(kernel, initrd)
+		if err != nil {
+			return err
+		}
+		if err := espconfig.WriteFile(t.mountpoint, layout.BlkSumFile, blk, 0o644); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	default:
+		if m, err = payloadsum.Decode(raw); err != nil {
+			return fmt.Errorf("%s: %w - not rewriting a manifest that does not decode (run 'alpine-zfsboot update' to write a fresh one)", layout.PayloadSumFile, err)
+		}
+		m.Mode = mode
+	}
+	return espconfig.WriteFile(t.mountpoint, layout.PayloadSumFile, payloadsum.Encode(m), 0o644)
+}
+
+func newIntegrityCmd() *cobra.Command {
+	var root, firmware string
+	var ho hostOpts
+	cmd := &cobra.Command{
+		Use:   "integrity <off|warn|enforce>",
+		Short: "BIOS: set how the BIOS loader checks the loaded kernel/initrd against EFI/ALPINE/CHECKSUM",
+		Long: `Sets the MODE line of EFI/ALPINE/CHECKSUM (BIOS installs):
+
+  warn     (default) hash the loaded kernel/initrd; on a mismatch show both
+           digests and the RAM range, then boot anyway
+  off      do not hash (saves boot time with a very large initrd)
+  enforce  refuse to boot on a mismatch - for diagnosing a failing host,
+           use it only when the machine has another way to boot (rescue
+           ISO, IPMI/KVM)
+
+alpine-zfsboot.integrity=off|warn|enforce in EFI/ALPINE/CMDLINE overrides
+the file for that boot. This is an integrity check against corruption and
+forgotten updates, not secure boot: CHECKSUM sits on the same
+unauthenticated FAT partition as the kernel, so anyone who can write the
+disk can change both.`,
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			// Every ESP of a mirrored boot (mirror.go), so they never drift.
+			os.Exit(forEachMember(root, firmware, ho, func(t *target) error {
+				if t.uefi {
+					return fmt.Errorf("integrity modes apply to BIOS installs only (the UEFI loader does not read %s)", layout.PayloadSumFile)
+				}
+				if err := setIntegrityMode(t, args[0]); err != nil {
+					return err
+				}
+				fmt.Printf("%s: integrity mode %s (%s)\n", layout.PayloadSumFile, args[0], integrityModeHelp(args[0]))
+				return nil
+			}))
+		},
+	}
+	cmd.Flags().StringVar(&root, "root", "/", "root of the target OS (rescue-initramfs use)")
+	cmd.Flags().StringVar(&firmware, "firmware", "", "override firmware detection (\"uefi\"/\"bios\")")
+	addHostFlags(cmd, &ho, false)
+	return cmd
+}
+
+// verifyPayloadSum is verify's full check of EFI/ALPINE/CHECKSUM: the
+// SHA-256 of exactly the bytes the BIOS loader will place in RAM, compared
+// the way the loader compares them. Same policy as verifyMetadata: a
+// missing file is not a failure and --repair writes it from the current
+// payload; a present-but-broken one is reported (inspect() already did)
+// and never silently replaced; a mismatch is always a failure.
+func verifyPayloadSum(t *target, r *report, repair bool) []error {
+	if r.payloadSumErr != nil {
+		return nil // already in r.errs()
+	}
+	if !r.payloadSumPresent && !repair {
+		return nil
+	}
+	kernel, initrd, _, err := readInstalledKernelInitrd(t)
+	if err != nil {
+		return []error{fmt.Errorf("payload-sum: could not read the installed kernel/initrd to check against: %w", err)}
+	}
+	if !r.payloadSumPresent {
+		// Never MODE enforce: --repair describes whatever is installed
+		// now, it did not install it (see payloadsum's doc comment).
+		raw, err := payloadsum.Generate(kernel, initrd, payloadsum.ModeWarn)
+		var blk []byte
+		if err == nil {
+			blk, err = payloadsum.GenerateBlkSum(kernel, initrd)
+		}
+		if err == nil {
+			err = espconfig.WriteFile(t.mountpoint, layout.BlkSumFile, blk, 0o644)
+		}
+		if err == nil {
+			err = espconfig.WriteFile(t.mountpoint, layout.PayloadSumFile, raw, 0o644)
+		}
+		if err != nil {
+			return []error{fmt.Errorf("payload-sum --repair: %w", err)}
+		}
+		fmt.Printf("payload-sum --repair: wrote %s and %s from the installed kernel/initrd\n", layout.BlkSumFile, layout.PayloadSumFile)
+		r.payloadSumPresent, r.payloadSumVerified = true, true
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(t.mountpoint, layout.PayloadSumFile))
+	if err != nil {
+		return []error{fmt.Errorf("payload-sum: %w", err)}
+	}
+	m, err := payloadsum.Decode(raw)
+	if err != nil {
+		return []error{fmt.Errorf("payload-sum: %w", err)}
+	}
+	errs := payloadsum.Verify(m, kernel, initrd)
+	if len(errs) == 0 {
+		errs = verifyBlkSum(t, r, m, kernel, initrd, repair)
+	}
+	r.payloadSumVerified = len(errs) == 0
+	r.payloadSumMode = m.Mode
+	if len(errs) > 0 && m.Mode != payloadsum.ModeEnforce {
+		// MODE warn: the BIOS loader prints the mismatch and boots anyway,
+		// so this is a warning, not a verify failure (the metadata check
+		// above already fails verify when the payload itself changed).
+		for _, e := range errs {
+			fmt.Fprintf(os.Stderr, "alpine-zfsboot: WARNING: %v (integrity mode %s: the BIOS loader does not refuse it)\n", e, m.Mode)
+		}
+		r.payloadSumWarn = true
+		return nil
+	}
+	return errs
+}
+
+// inspectBlkSum is status' line for EFI/ALPINE/BLKSUM (BIOS installs): no
+// hashing of the payload, only the file's own structure and its agreement
+// with CHECKSUM's sizes.
+func inspectBlkSum(mountpoint string) string {
+	raw, err := os.ReadFile(filepath.Join(mountpoint, layout.BlkSumFile))
+	if os.IsNotExist(err) {
+		return "INFO: not present (blocks are not checked as they load; 'alpine-zfsboot update' or 'verify --repair' adds it)"
+	}
+	if err != nil {
+		return fmt.Sprintf("WARNING (%v)", err)
+	}
+	b, err := payloadsum.DecodeBlkSum(raw)
+	if err != nil {
+		return fmt.Sprintf("WARNING (%v - the BIOS loader ignores it)", err)
+	}
+	return fmt.Sprintf("v%d, KERNEL %d + INITRD %d blocks of %d KiB (run 'alpine-zfsboot verify' to check them)",
+		payloadsum.BlkSumVersion, b.Kernel.Blocks, b.Initrd.Blocks, payloadsum.BlockSize/1024)
+}
+
+// verifyBlkSum checks EFI/ALPINE/BLKSUM against the installed payload and
+// CHECKSUM (m). Missing: not a failure (an install made before it
+// existed); --repair writes it. Problems count like CHECKSUM's: a failure
+// only in integrity mode enforce, a warning otherwise (the caller decides).
+func verifyBlkSum(t *target, r *report, m payloadsum.Manifest, kernel, initrd []byte, repair bool) []error {
+	raw, err := os.ReadFile(filepath.Join(t.mountpoint, layout.BlkSumFile))
+	if os.IsNotExist(err) {
+		if !repair {
+			r.blkSum = "INFO: not present (blocks are not checked as they load; 'alpine-zfsboot update' or 'verify --repair' adds it)"
+			return nil
+		}
+		blk, gerr := payloadsum.GenerateBlkSum(kernel, initrd)
+		if gerr == nil {
+			gerr = espconfig.WriteFile(t.mountpoint, layout.BlkSumFile, blk, 0o644)
+		}
+		if gerr != nil {
+			return []error{fmt.Errorf("blksum --repair: %w", gerr)}
+		}
+		fmt.Printf("blksum --repair: wrote %s from the installed kernel/initrd\n", layout.BlkSumFile)
+		raw = blk
+	} else if err != nil {
+		return []error{fmt.Errorf("blksum: %w", err)}
+	}
+	b, err := payloadsum.DecodeBlkSum(raw)
+	if err != nil {
+		return []error{fmt.Errorf("%s: %w", layout.BlkSumFile, err)}
+	}
+	errs := payloadsum.VerifyBlkSum(b, m, kernel, initrd)
+	if len(errs) == 0 {
+		r.blkSum = fmt.Sprintf("OK (v%d, KERNEL %d + INITRD %d blocks of %d KiB confirmed against the installed payload)",
+			payloadsum.BlkSumVersion, b.Kernel.Blocks, b.Initrd.Blocks, payloadsum.BlockSize/1024)
+	}
+	return errs
 }
 
 // --- status --------------------------------------------------------
@@ -782,17 +1087,20 @@ func (r report) errs() []error {
 func newStatusCmd() *cobra.Command {
 	var root, firmware string
 	var verbose bool
+	var ho hostOpts
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "report this machine's own alpine-zfsboot installation",
-		Args:  cobra.NoArgs,
+		Long: `status reports this machine's own alpine-zfsboot installation - on a
+mirrored boot, every ESP of the set (see README "Mirrored boot").
+
+Exit status: 0, or ` + exitCodesHelp,
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			t, err := discover(root, firmware, true)
-			die(err)
-			defer withCleanup(t.cleanup)()
-			inspect(t).print(verbose)
+			os.Exit(runStatus(root, firmware, ho, verbose))
 		},
 	}
+	addHostFlags(cmd, &ho, false)
 	cmd.Flags().StringVar(&root, "root", "/", "root of the target OS to inspect (rescue-initramfs use)")
 	cmd.Flags().StringVar(&firmware, "firmware", "", "override firmware detection (\"uefi\"/\"bios\") - only needed when --root isn't a live, booted system (see install's own --help)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show the full per-feature Pool features list instead of just the active/enabled counts")
@@ -980,8 +1288,88 @@ func verifyMountReadonly(repair bool) bool {
 	return !repair
 }
 
+// verifyFiles are verify's optional --*-file reference files.
+type verifyFiles struct {
+	efi, stage1, stage2, kernel, initrd, cmdline string
+}
+
+// verifyTarget is verify's whole check of one ESP (and, BIOS, its disk) -
+// the former Run closure body, run once per ESP of a mirrored boot.
+func verifyTarget(t *target, deep, repair bool, f verifyFiles) (report, []error) {
+	r := inspect(t)
+	errs := appendCompatErr(r.errs(), r)
+	metaErrs := verifyMetadata(t, deep, repair)
+	r.metadataVerified = len(metaErrs) == 0
+	errs = append(errs, metaErrs...)
+	if !t.uefi {
+		// --repair only writes a missing CHECKSUM when the metadata
+		// check passed: never bless a payload whose recorded hashes
+		// just failed to match.
+		errs = append(errs, verifyPayloadSum(t, &r, repair && len(metaErrs) == 0)...)
+	}
+
+	if t.uefi {
+		if f.efi != "" {
+			want, err := os.ReadFile(f.efi)
+			die(err)
+			if err := uefiboot.VerifyLoader(t.mountpoint, t.arch, want); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	} else {
+		if f.stage1 != "" {
+			want, err := os.ReadFile(f.stage1)
+			die(err)
+			// Same trim install/update need (see trimStage1Asset's
+			// own doc comment, found on real hardware) - a
+			// --stage1-file passed here is exactly the kind of
+			// real, unmodified release asset (512 bytes, the full
+			// MBR sector) that check exists for, and this verify
+			// path was never updated alongside install/update's
+			// own fix. Without this, `alpine-zfsboot verify
+			// --stage1-file` against a genuine release asset
+			// (alpine-installer's own verify_installation() does
+			// exactly this) failed with the same "512 bytes, want
+			// exactly 440" error trimStage1Asset already fixed
+			// for install/update.
+			want, err = trimStage1Asset(want)
+			die(err)
+			if err := biosboot.VerifyStage1(t.disk, want); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if f.stage2 != "" {
+			want, err := os.ReadFile(f.stage2)
+			die(err)
+			if err := biosboot.VerifyStage2(t.disk, want); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		// cmd.MarkFlagsRequiredTogether below guarantees these
+		// three are either all empty or all set by the time
+		// this runs (F12, unidoc-alip's PR #5 review) - no
+		// partial-set case to special-case here anymore.
+		if f.kernel != "" {
+			kernel, err := os.ReadFile(f.kernel)
+			die(err)
+			initrd, err := os.ReadFile(f.initrd)
+			die(err)
+			cmdlineBytes, err := os.ReadFile(f.cmdline)
+			die(err)
+			// The CMDLINE comparison ignores the tool's own per-ESP
+			// mirror words (alpine-zfsboot.esp-self=/esp-uuids=, see
+			// mirror.go) - a release cmdline.txt never has them.
+			if err := verifyPayloadIgnoringMirrorWords(t.mountpoint, kernel, initrd, cmdlineBytes); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return r, errs
+}
+
 func newVerifyCmd() *cobra.Command {
 	var root, firmware string
+	var ho hostOpts
 	var efiFile, stage1File, stage2File, kernelFile, initrdFile, cmdlineFile string
 	var verbose, deep, repair bool
 	cmd := &cobra.Command{
@@ -994,85 +1382,22 @@ the INSTALLED artifact against that exact reference file - the strong
 check install/update already perform on themselves immediately after
 writing (see internal/biosboot/internal/uefiboot's own Verify* calls),
 available here standalone too, e.g. to re-confirm nothing drifted after
-a later step like a partition-table reread or a reboot.`,
+a later step like a partition-table reread or a reboot.
+
+On a mirrored boot every ESP of the set is verified, and the ESPs are
+compared with each other (payload, stage1/stage2, metadata, config, keys,
+host key): verify names the ESP that differs and whether it is stale.
+
+Exit status: 0, or ` + exitCodesHelp,
 		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			t, err := discover(root, firmware, verifyMountReadonly(repair))
-			die(err)
-			defer withCleanup(t.cleanup)()
-
-			r := inspect(t)
-			errs := appendCompatErr(r.errs(), r)
-			metaErrs := verifyMetadata(t, deep, repair)
-			r.metadataVerified = len(metaErrs) == 0
-			errs = append(errs, metaErrs...)
-
-			if t.uefi {
-				if efiFile != "" {
-					want, err := os.ReadFile(efiFile)
-					die(err)
-					if err := uefiboot.VerifyLoader(t.mountpoint, t.arch, want); err != nil {
-						errs = append(errs, err)
-					}
-				}
-			} else {
-				if stage1File != "" {
-					want, err := os.ReadFile(stage1File)
-					die(err)
-					// Same trim install/update need (see trimStage1Asset's
-					// own doc comment, found on real hardware) - a
-					// --stage1-file passed here is exactly the kind of
-					// real, unmodified release asset (512 bytes, the full
-					// MBR sector) that check exists for, and this verify
-					// path was never updated alongside install/update's
-					// own fix. Without this, `alpine-zfsboot verify
-					// --stage1-file` against a genuine release asset
-					// (alpine-installer's own verify_installation() does
-					// exactly this) failed with the same "512 bytes, want
-					// exactly 440" error trimStage1Asset already fixed
-					// for install/update.
-					want, err = trimStage1Asset(want)
-					die(err)
-					if err := biosboot.VerifyStage1(t.disk, want); err != nil {
-						errs = append(errs, err)
-					}
-				}
-				if stage2File != "" {
-					want, err := os.ReadFile(stage2File)
-					die(err)
-					if err := biosboot.VerifyStage2(t.disk, want); err != nil {
-						errs = append(errs, err)
-					}
-				}
-				// cmd.MarkFlagsRequiredTogether below guarantees these
-				// three are either all empty or all set by the time
-				// this runs (F12, unidoc-alip's PR #5 review) - no
-				// partial-set case to special-case here anymore.
-				if kernelFile != "" {
-					kernel, err := os.ReadFile(kernelFile)
-					die(err)
-					initrd, err := os.ReadFile(initrdFile)
-					die(err)
-					cmdlineBytes, err := os.ReadFile(cmdlineFile)
-					die(err)
-					if err := espconfig.VerifyPayload(t.mountpoint, kernel, initrd, cmdlineBytes); err != nil {
-						errs = append(errs, err)
-					}
-				}
-			}
-
-			r.print(verbose)
-			if len(errs) == 0 {
-				fmt.Println("\nverify: OK")
-				return
-			}
-			fmt.Printf("\nverify: %d problem(s) found:\n", len(errs))
-			for _, e := range errs {
-				fmt.Println("  -", e)
-			}
-			os.Exit(1)
+			os.Exit(runVerify(root, firmware, ho, verbose, deep, repair, verifyFiles{
+				efi: efiFile, stage1: stage1File, stage2: stage2File,
+				kernel: kernelFile, initrd: initrdFile, cmdline: cmdlineFile,
+			}))
 		},
 	}
+	addHostFlags(cmd, &ho, false)
 	cmd.Flags().StringVar(&root, "root", "/", "root of the target OS to verify (rescue-initramfs use)")
 	cmd.Flags().StringVar(&firmware, "firmware", "", "override firmware detection (\"uefi\"/\"bios\") - only needed when --root isn't a live, booted system (see install's own --help)")
 	cmd.Flags().StringVar(&efiFile, "efi-file", "", "UEFI: byte-compare the installed loader against this exact local file")
@@ -1105,36 +1430,37 @@ func newUpdateCmd() *cobra.Command {
 	var efiFile, efiURL string
 	var stage1File, stage1URL, stage2File, stage2URL string
 	var kernelFile, kernelURL, initrdFile, initrdURL, cmdlineFile, cmdlineURL string
+	var opts biosOpts
+	var ho hostOpts
 
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "fetch and install the latest alpine-zfsboot build over this machine's own installation",
-		Args:  cobra.NoArgs,
+		Long: `update installs the latest (or the given) build over this machine's own
+installation - on a mirrored boot, onto every ESP of the set, one ESP at a
+time. A failure on one ESP leaves that ESP on its previous build (rolled
+back) and the run goes on to the others. Config, authorized_keys and the
+rescue host key are copied from the newest member to the others.
+
+Exit status: 0, or ` + exitCodesHelp,
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			t, err := discover(root, firmware, false)
-			die(err)
-			defer withCleanup(t.cleanup)()
-
-			workdir, err := os.MkdirTemp("", "alpine-zfsboot-update-*")
-			die(err)
-			defer os.RemoveAll(workdir)
-
-			if t.uefi {
-				updateUEFI(t, workdir, yes, release.Source{File: efiFile, URL: efiURL})
-				return
-			}
-			updateBIOS(t, workdir, yes, release.BIOSSources{
+			os.Exit(runUpdate(root, firmware, ho, yes, release.Source{File: efiFile, URL: efiURL}, release.BIOSSources{
 				Stage1:  release.Source{File: stage1File, URL: stage1URL},
 				Stage2:  release.Source{File: stage2File, URL: stage2URL},
 				Kernel:  release.Source{File: kernelFile, URL: kernelURL},
 				Initrd:  release.Source{File: initrdFile, URL: initrdURL},
 				Cmdline: release.Source{File: cmdlineFile, URL: cmdlineURL},
-			})
+			}, biosOpts{force: opts.force, integrity: opts.integrity, integritySet: cmd.Flags().Changed("integrity"), int13chunk: opts.int13chunk}))
 		},
 	}
+	addHostFlags(cmd, &ho, true)
 	cmd.Flags().StringVar(&root, "root", "/", "root of the target OS to update (rescue-initramfs use)")
 	cmd.Flags().StringVar(&firmware, "firmware", "", "override firmware detection (\"uefi\"/\"bios\") - only needed when --root isn't a live, booted system (see install's own --help)")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the overwrite confirmation prompt")
+	cmd.Flags().BoolVar(&opts.force, "force", false, "BIOS: write stage1/stage2 even if the stage2 would not pass stage1's own check (no magic word, bad length/checksum)")
+	cmd.Flags().StringVar(&opts.int13chunk, "int13chunk", "", "BIOS: the largest BIOS disk read (512-byte sectors, 1..127, or \"default\") the boot loader issues - written as alpine-zfsboot.int13chunk= into EFI/ALPINE/CMDLINE. update keeps the installed value when not given. Change later with 'alpine-zfsboot int13chunk'")
+	cmd.Flags().StringVar(&opts.integrity, "integrity", payloadsum.ModeWarn, "BIOS: the BIOS loader's check of the loaded kernel/initrd against EFI/ALPINE/CHECKSUM: warn (hash; on a mismatch show both digests and boot anyway), off (no hashing), enforce (refuse to boot on a mismatch - for diagnosing a failing host only, when you have another way to boot it). Change later with 'alpine-zfsboot integrity'")
 	cmd.Flags().StringVar(&efiFile, "efi-file", "", "UEFI: install this local .EFI file instead of fetching the latest release")
 	cmd.Flags().StringVar(&efiURL, "efi-url", "", "UEFI: fetch the .EFI from this URL instead of the latest release (must be minisign-signed: <url>.minisig must exist and verify)")
 	cmd.Flags().StringVar(&stage1File, "stage1-file", "", "BIOS: local stage1.bin instead of the latest release")
@@ -1150,40 +1476,78 @@ func newUpdateCmd() *cobra.Command {
 	return cmd
 }
 
-func updateUEFI(t *target, workdir string, yes bool, src release.Source) {
+// uefiAsset is one resolved UEFI loader build: the local file (a download
+// or a copy of --efi-file), its bytes, and its own embedded cmdline.
+type uefiAsset struct {
+	path  string
+	bytes []byte
+	info  cmdline.Info
+}
+
+// loadUEFIAsset resolves and reads the UEFI build once per run - every
+// ESP of a mirrored boot gets these exact bytes, never a second download
+// that could be a different "latest".
+func loadUEFIAsset(src release.Source, arch, workdir string) (uefiAsset, error) {
+	path, err := release.ResolveEFI(src, arch, workdir)
+	if err != nil {
+		return uefiAsset{}, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return uefiAsset{}, err
+	}
+	info, err := cmdline.Read(path)
+	if err != nil {
+		return uefiAsset{}, err
+	}
+	return uefiAsset{path: path, bytes: b, info: info}, nil
+}
+
+// updateUEFITarget updates one ESP's loader (the former updateUEFI,
+// returning errors instead of exiting, so a mirrored boot can go on to its
+// other ESPs). seed: this ESP is a new mirror member with no loader yet -
+// installed without the "is it newer" comparison. wrote reports whether
+// the ESP was changed.
+func updateUEFITarget(t *target, a uefiAsset, yes, seed bool) (wrote bool, err error) {
 	rel, err := uefiboot.LoaderPath(t.arch)
-	die(err)
+	if err != nil {
+		return false, err
+	}
 	target := filepath.Join(t.mountpoint, rel)
+	latest := a.info
 
-	path, err := release.ResolveEFI(src, t.arch, workdir)
-	die(err)
-
-	local, err := cmdline.Read(target)
-	die(err)
-	latest, err := cmdline.Read(path)
-	die(err)
-	die(uefiboot.CheckArchMatch(target, local, latest))
-
-	if latest.BuildStamp <= local.BuildStamp {
-		fmt.Printf("%s is already up to date (%s)\n", rel, cmdline.HumanVersion(local.BuildStamp))
-		return
+	if seed {
+		fmt.Printf("%s on %s: new member - installing %s\n", rel, t.espDev, cmdline.HumanVersion(latest.BuildStamp))
+	} else {
+		local, err := cmdline.Read(target)
+		if err != nil {
+			return false, err
+		}
+		if err := uefiboot.CheckArchMatch(target, local, latest); err != nil {
+			return false, err
+		}
+		if latest.BuildStamp <= local.BuildStamp {
+			fmt.Printf("%s is already up to date (%s)\n", rel, cmdline.HumanVersion(local.BuildStamp))
+			return false, nil
+		}
+		fmt.Printf("%s: local %s -> latest %s\n", rel, cmdline.HumanVersion(local.BuildStamp), cmdline.HumanVersion(latest.BuildStamp))
+		if !yes && !confirm(fmt.Sprintf("overwrite %s with the latest build?", rel)) {
+			fmt.Println("not updated")
+			return false, nil
+		}
 	}
-	fmt.Printf("%s: local %s -> latest %s\n", rel, cmdline.HumanVersion(local.BuildStamp), cmdline.HumanVersion(latest.BuildStamp))
-	if !yes && !confirm(fmt.Sprintf("overwrite %s with the latest build?", rel)) {
-		fmt.Println("not updated")
-		return
-	}
 
-	efiBytes, err := os.ReadFile(path)
-	die(err)
-	backedUp, err := writeUEFIGenerationWithRollback(t.mountpoint, t.arch, efiBytes, path, latest)
-	die(err)
+	backedUp, err := writeUEFIGenerationWithRollback(t.mountpoint, t.arch, a.bytes, a.path, latest)
+	if err != nil {
+		return false, err
+	}
 
 	if backedUp {
 		fmt.Printf("%s updated to %s (previous build kept at %s.previous)\n", rel, cmdline.HumanVersion(latest.BuildStamp), rel)
 	} else {
 		fmt.Printf("%s updated to %s (no local rollback copy - could not preserve the previous build)\n", rel, cmdline.HumanVersion(latest.BuildStamp))
 	}
+	return true, nil
 }
 
 // writeBIOSStagesWithRollback writes stage1 then stage2 to disk (via
@@ -1213,39 +1577,65 @@ func updateUEFI(t *target, workdir string, yes bool, src release.Source) {
 // along with everything it's trying to prove). Both real call sites
 // just wrap this in die(...).
 func writeBIOSStagesWithRollback(disk string, stage1, stage2 []byte) error {
-	stage1Prev, err := biosboot.WriteStage1(disk, stage1)
+	// stage2 FIRST, stage1 LAST: every stage1 since v0.2.0 boots every
+	// stage2 since v0.2.0 that is intact (see biosboot.Stage1Accepts), so
+	// the state after stage2 alone - old stage1, new stage2 - boots, and a
+	// crash or failure at any point leaves a bootable pair. The rollback
+	// undoes in reverse order.
+	stage2Prev, err := writeStage2(disk, stage2)
 	if err != nil {
-		return fmt.Errorf("writing stage1: %w", err)
-	}
-	if err := biosboot.VerifyStage1(disk, stage1); err != nil {
-		rollbackStage1(disk, stage1Prev)
-		return fmt.Errorf("verifying stage1 after write: %w", err)
-	}
-
-	stage2Prev, err := biosboot.WriteStage2(disk, stage2)
-	if err != nil {
-		rollbackStage1(disk, stage1Prev)
 		// F6 (unidoc-alip's PR #5 review): WriteStage2 zeroes its
 		// entire 32KiB extent before writing the new content, so a
 		// write/sync/readback failure AFTER that point returns a
-		// non-nil `stage2Prev` - the exact real pre-write bytes this
-		// function's own doc comment says a caller should restore.
-		// This branch used to drop it, leaving a rolled-back stage1
-		// paired with a zeroed-or-partial stage2 (unbootable) while
-		// stderr still said "restored the previous stage1" - exactly
-		// the mixed-generation state this whole function exists to
-		// prevent. rollbackStage2 is already a no-op on a nil
-		// previous (the earlier, pre-zeroing failure branches), so
-		// this is safe to call unconditionally on every error here.
+		// non-nil `stage2Prev` - the exact real pre-write bytes to
+		// restore. rollbackStage2 is a no-op on a nil previous (the
+		// earlier, pre-zeroing failure branches).
 		rollbackStage2(disk, stage2Prev)
 		return fmt.Errorf("writing stage2: %w", err)
 	}
 	if err := biosboot.VerifyStage2(disk, stage2); err != nil {
-		rollbackStage1(disk, stage1Prev)
 		rollbackStage2(disk, stage2Prev)
 		return fmt.Errorf("verifying stage2 after write: %w", err)
 	}
+
+	stage1Prev, err := writeStage1(disk, stage1)
+	if err != nil {
+		rollbackStage1(disk, stage1Prev)
+		rollbackStage2(disk, stage2Prev)
+		return fmt.Errorf("writing stage1: %w", err)
+	}
+	if err := biosboot.VerifyStage1(disk, stage1); err != nil {
+		rollbackStage1(disk, stage1Prev)
+		rollbackStage2(disk, stage2Prev)
+		return fmt.Errorf("verifying stage1 after write: %w", err)
+	}
 	return nil
+}
+
+// writeStage1/writeStage2 are the biosboot writers, as variables only so
+// a test can observe the disk after every single write (crash points).
+var (
+	writeStage1 = biosboot.WriteStage1
+	writeStage2 = biosboot.WriteStage2
+)
+
+// writeManifestFile writes CHECKSUM/BLKSUM in writePayloadWithRollback - a
+// variable only so a test can make one member's manifest write fail.
+var writeManifestFile = espconfig.WriteFile
+
+// checkStagePair refuses, before anything is written, a stage2 that the
+// stage1 being installed (or any stage1 since v0.2.0) would not jump into:
+// no magic word, or a length/checksum that does not add up. stage1 and
+// stage2 are always written together in one run - there is no
+// stage1-only path - so this is the one way a mismatched pair could reach
+// the disk (e.g. --stage1-file and --stage2-file from different builds or
+// a damaged download). --force overrides it.
+func checkStagePair(stage2 []byte, force bool) error {
+	err := biosboot.CheckStage2(stage2)
+	if err == nil || force {
+		return nil
+	}
+	return fmt.Errorf("%w - refusing to write a boot loader pair that would not start (use --force to write it anyway)", err)
 }
 
 // rollbackStage1/rollbackStage2 - best-effort restore, called only while
@@ -1263,7 +1653,7 @@ func rollbackStage1(disk string, previous []byte) {
 	if previous == nil {
 		return
 	}
-	if _, err := biosboot.WriteStage1(disk, previous); err != nil {
+	if _, err := writeStage1(disk, previous); err != nil {
 		fmt.Fprintf(os.Stderr, "alpine-zfsboot: CRITICAL: restoring the previous stage1 after a failed write ALSO failed: %v - %s's stage1 may now be corrupt, do not reboot this disk without investigating further\n", err, disk)
 		return
 	}
@@ -1274,7 +1664,7 @@ func rollbackStage2(disk string, previous []byte) {
 	if previous == nil {
 		return
 	}
-	if _, err := biosboot.WriteStage2(disk, previous); err != nil {
+	if _, err := writeStage2(disk, previous); err != nil {
 		fmt.Fprintf(os.Stderr, "alpine-zfsboot: CRITICAL: restoring the previous stage2 after a failed write ALSO failed: %v - %s's stage2 may now be corrupt, do not reboot this disk without investigating further\n", err, disk)
 		return
 	}
@@ -1293,7 +1683,7 @@ func rollbackStage2(disk string, previous []byte) {
 // never merely "could not be read", because rollbackPayload acts on
 // nil by DELETING.
 type payloadBackup struct {
-	kernel, initrd, cmdline, metadata []byte
+	kernel, initrd, cmdline, metadata, payloadSum, blkSum []byte
 }
 
 // A full source audit found this function used to swallow EVERY read
@@ -1327,6 +1717,8 @@ func backupPayload(mountpoint string) (payloadBackup, error) {
 		{layout.InitrdFile, &b.initrd},
 		{layout.CmdlineFile, &b.cmdline},
 		{layout.MetadataFile, &b.metadata},
+		{layout.PayloadSumFile, &b.payloadSum},
+		{layout.BlkSumFile, &b.blkSum},
 	} {
 		content, err := os.ReadFile(filepath.Join(mountpoint, f.rel))
 		if err != nil {
@@ -1377,10 +1769,25 @@ func rollbackPayload(mountpoint string, backup payloadBackup) {
 			ok = false
 		}
 	}
+	// CHECKSUM goes first and comes back last, and only when every
+	// other file was restored: a CHECKSUM that does not match the payload
+	// means a boot-time WARNING (or a refused boot in integrity mode
+	// enforce), so a half-restored ESP must be left with no manifest (stage2 then boots unverified, with a notice) rather than
+	// one describing files that are not there.
+	restore(layout.PayloadSumFile, nil)
+	restore(layout.BlkSumFile, nil)
 	restore(layout.KernelFile, backup.kernel)
 	restore(layout.InitrdFile, backup.initrd)
 	restore(layout.CmdlineFile, backup.cmdline)
 	restore(layout.MetadataFile, backup.metadata)
+	// BLKSUM before CHECKSUM: stage2 only uses a BLKSUM that agrees with
+	// CHECKSUM, so the pair must never be CHECKSUM-without-its-BLKSUM.
+	if ok && backup.blkSum != nil {
+		restore(layout.BlkSumFile, backup.blkSum)
+	}
+	if ok && backup.payloadSum != nil {
+		restore(layout.PayloadSumFile, backup.payloadSum)
+	}
 	if ok {
 		fmt.Fprintln(os.Stderr, "alpine-zfsboot: restored the previous boot payload (KERNEL/INITRD/CMDLINE/METADATA) after a failed write")
 	}
@@ -1414,11 +1821,38 @@ func rollbackPayload(mountpoint string, backup payloadBackup) {
 // still end up missing (an installation from before this feature
 // existed; a metadata write that failed BEFORE this atomicity was
 // added) are handled by `verify --repair`, not by this function.
-func writePayloadWithRollback(mountpoint, arch, version, buildStamp string, kernel, initrd, cmdline []byte) error {
+//
+// CHECKSUM (internal/payloadsum - x86_64 only, the one arch with a BIOS
+// stage2 that reads it) is part of the same generation, with one ordering
+// rule on top: the old one is removed BEFORE the new payload is written and
+// the new one is written only AFTER the payload has been verified. A
+// CHECKSUM that does not match the payload means a boot-time WARNING (a
+// refused boot in integrity mode enforce), so a crash at any point may
+// leave no manifest (stage2 then boots without
+// verifying, with a notice) but never a stale one.
+func writePayloadWithRollback(mountpoint, arch, version, buildStamp string, kernel, initrd, cmdline []byte, integrity string) error {
 	backup, err := backupPayload(mountpoint)
 	if err != nil {
 		// Before ANY write - see backupPayload's own comment.
 		return err
+	}
+	var payloadSum, blkSum []byte
+	if arch == "x86_64" {
+		// Computed before anything is written, so a kernel stage2 could not
+		// load anyway (not a bzImage) fails here with nothing touched.
+		if payloadSum, err = payloadsum.Generate(kernel, initrd, integrity); err != nil {
+			return fmt.Errorf("generating %s: %w", layout.PayloadSumFile, err)
+		}
+		if blkSum, err = payloadsum.GenerateBlkSum(kernel, initrd); err != nil {
+			return fmt.Errorf("generating %s: %w", layout.BlkSumFile, err)
+		}
+	}
+	// CHECKSUM first, then BLKSUM: from here on there is no manifest at all
+	// (stage2 boots unverified, with a notice) until both are written again.
+	for _, rel := range []string{layout.PayloadSumFile, layout.BlkSumFile} {
+		if err := os.Remove(filepath.Join(mountpoint, rel)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing the previous %s before writing a new payload: %w", rel, err)
+		}
 	}
 	if err := espconfig.WritePayload(mountpoint, kernel, initrd, cmdline); err != nil {
 		rollbackPayload(mountpoint, backup)
@@ -1431,6 +1865,25 @@ func writePayloadWithRollback(mountpoint, arch, version, buildStamp string, kern
 	if err := writeMetadata(mountpoint, arch, version, buildStamp, kernel, initrd); err != nil {
 		rollbackPayload(mountpoint, backup)
 		return fmt.Errorf("generating/writing metadata manifest: %w", err)
+	}
+	// BLKSUM, then CHECKSUM last: stage2 only looks at a BLKSUM when there
+	// is a CHECKSUM, so a crash in between leaves "no manifest", never a
+	// CHECKSUM with a missing or stale BLKSUM.
+	for _, f := range []struct {
+		rel  string
+		data []byte
+	}{{layout.BlkSumFile, blkSum}, {layout.PayloadSumFile, payloadSum}} {
+		if f.data == nil {
+			continue
+		}
+		if err := writeManifestFile(mountpoint, f.rel, f.data, 0o644); err != nil {
+			rollbackPayload(mountpoint, backup)
+			return fmt.Errorf("writing %s: %w", f.rel, err)
+		}
+		if err := espconfig.VerifyFile(mountpoint, f.rel, f.data); err != nil {
+			rollbackPayload(mountpoint, backup)
+			return fmt.Errorf("verifying %s after write: %w", f.rel, err)
+		}
 	}
 	return nil
 }
@@ -1514,6 +1967,13 @@ func preflightBIOSMetadata(arch string, newCmdline cmdline.Info, kernel, initrd 
 	m, err := deepMetadataFor(arch, newCmdline.Version, newCmdline.BuildStamp, kernel, initrd)
 	if err != nil {
 		return err
+	}
+	// Same "fail before any disk write" reasoning for CHECKSUM, which
+	// writePayloadWithRollback generates from the same kernel/initrd.
+	if arch == "x86_64" {
+		if _, err := payloadsum.Generate(kernel, initrd, payloadsum.ModeWarn); err != nil {
+			return err
+		}
 	}
 	_, err = checkMetadataEncodable(m)
 	return err
@@ -1822,27 +2282,112 @@ func checkBIOSUpToDate(mountpoint, newBuildStamp string) (installedBuildStamp st
 	return localInfo.BuildStamp, newBuildStamp <= localInfo.BuildStamp
 }
 
-func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
-	assets, err := release.ResolveBIOS(src, t.arch, workdir)
-	die(err)
+// biosOpts are the BIOS-only install/update switches.
+type biosOpts struct {
+	force     bool   // write a stage1/stage2 pair even if checkStagePair refuses it
+	integrity string // CHECKSUM's MODE: payloadsum.ModeOff/ModeWarn (default)/ModeEnforce
+	// integritySet: --integrity was given. Without it, update keeps the
+	// mode the installed CHECKSUM already has (set with `integrity`), and
+	// falls back to warn only when there is none.
+	integritySet bool
+	// int13chunk: --int13chunk (1..127 or "default"); "" = not given, so
+	// update keeps whatever the installed CMDLINE has.
+	int13chunk string
+}
+
+// applyInt13Chunk puts the int13chunk setting into the cmdline about to be
+// written: an explicit --int13chunk, else (update) the installed value.
+func applyInt13Chunk(cmdlineTxt []byte, mountpoint string, opts biosOpts) ([]byte, error) {
+	if opts.int13chunk != "" {
+		v, err := parseInt13Chunk(opts.int13chunk)
+		if err != nil {
+			return nil, err
+		}
+		return setCmdlineInt13Chunk(cmdlineTxt, v), nil
+	}
+	if mountpoint != "" {
+		if v := installedInt13Chunk(mountpoint); v != "" {
+			return setCmdlineInt13Chunk(cmdlineTxt, v), nil
+		}
+	}
+	return cmdlineTxt, nil
+}
+
+// updateIntegrityMode is the mode `update` writes: an explicit --integrity,
+// else the installed CHECKSUM's mode (so `alpine-zfsboot integrity off` or
+// `enforce` survives updates), else warn.
+func updateIntegrityMode(mountpoint string, opts biosOpts) string {
+	if opts.integritySet {
+		return opts.integrity
+	}
+	raw, err := os.ReadFile(filepath.Join(mountpoint, layout.PayloadSumFile))
+	if err != nil {
+		return payloadsum.ModeWarn
+	}
+	m, err := payloadsum.Decode(raw)
+	if err != nil {
+		return payloadsum.ModeWarn
+	}
+	return m.Mode
+}
+
+// biosAssets is one resolved BIOS build, read into memory once per run -
+// every ESP/disk of a mirrored boot gets these exact bytes.
+type biosAssets struct {
+	stage1, stage2, kernel, initrd, cmdline []byte
+}
+
+// loadBIOSAssets resolves (downloads or copies) and reads a BIOS build:
+// stage1 trimmed to its boot-code region, stage2 checked against its
+// budget.
+func loadBIOSAssets(src release.BIOSSources, arch, workdir string) (biosAssets, error) {
+	assets, err := release.ResolveBIOS(src, arch, workdir)
+	if err != nil {
+		return biosAssets{}, err
+	}
 	defer assets.RemoveAll()
 
-	stage1, err := os.ReadFile(assets.Stage1)
-	die(err)
-	stage1, err = trimStage1Asset(stage1)
-	die(err)
-	stage2, err := os.ReadFile(assets.Stage2)
-	die(err)
-	kernel, err := os.ReadFile(assets.Kernel)
-	die(err)
-	initrd, err := os.ReadFile(assets.Initrd)
-	die(err)
-	cmdlineTxt, err := os.ReadFile(assets.Cmdline)
-	die(err)
-
-	if len(stage2) > layout.Stage2Bytes {
-		die(fmt.Errorf("stage2 is %d bytes, exceeds the %d-byte budget", len(stage2), layout.Stage2Bytes))
+	var a biosAssets
+	for _, f := range []struct {
+		path string
+		dst  *[]byte
+	}{
+		{assets.Stage1, &a.stage1}, {assets.Stage2, &a.stage2}, {assets.Kernel, &a.kernel},
+		{assets.Initrd, &a.initrd}, {assets.Cmdline, &a.cmdline},
+	} {
+		if *f.dst, err = os.ReadFile(f.path); err != nil {
+			return biosAssets{}, err
+		}
 	}
+	if a.stage1, err = trimStage1Asset(a.stage1); err != nil {
+		return biosAssets{}, err
+	}
+	if len(a.stage2) > layout.Stage2Bytes {
+		return biosAssets{}, fmt.Errorf("stage2 is %d bytes, exceeds the %d-byte budget", len(a.stage2), layout.Stage2Bytes)
+	}
+	return a, nil
+}
+
+// memberOpts adapt one update/install write to its ESP in a mirrored boot
+// (all zero for a single ESP: exactly the behaviour before mirrors).
+type memberOpts struct {
+	// seed: a new member (--add-esp, esp add, or listed but never
+	// installed) - no "is alpine-zfsboot already here" or "is it newer"
+	// check; the operator named this ESP explicitly.
+	seed bool
+	// editCmdline adjusts the CMDLINE for this ESP (its own
+	// alpine-zfsboot.esp-self=, the esp-uuids list) - see mirror.go.
+	editCmdline func([]byte) ([]byte, error)
+	// integrityFrom: read the integrity mode to keep from this ESP's
+	// mountpoint instead of the target's own (a new member has none yet).
+	integrityFrom string
+}
+
+// updateBIOSTarget updates one disk + ESP (the former updateBIOS,
+// returning errors instead of exiting, so a mirrored boot can go on to its
+// other ESPs). wrote reports whether anything on the disk or ESP changed.
+func updateBIOSTarget(t *target, a biosAssets, yes bool, opts biosOpts, mo memberOpts) (wrote bool, err error) {
+	stage1, stage2, kernel, initrd, cmdlineTxt := a.stage1, a.stage2, a.kernel, a.initrd, a.cmdline
 
 	// Full non-mutating preflight BEFORE the first write, not just before
 	// WriteStage2's own call to it (which is still there too, as
@@ -1854,11 +2399,18 @@ func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 	// The whole point of failing before mutating is failing before ANY
 	// mutation, not just before the specific write that happens to be
 	// guarded.
+	if err := biosboot.CheckSectorSize(t.disk); err != nil {
+		return false, fmt.Errorf("refusing to update: %w", err)
+	}
 	if err := bootenv.CheckStage2ExtentFree(t.disk); err != nil {
-		die(fmt.Errorf("refusing to update: %w", err))
+		return false, fmt.Errorf("refusing to update: %w", err)
 	}
 
-	die(checkUpdateEligible(t.disk))
+	if !mo.seed {
+		if err := checkUpdateEligible(t.disk); err != nil {
+			return false, err
+		}
+	}
 
 	newCmdline := cmdline.ParseText(cmdlineTxt)
 
@@ -1881,9 +2433,26 @@ func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 	// installation from before this project recorded one) - treating
 	// that as a hard refusal would regress every such installation's
 	// own first update under this fix, not improve its safety.
-	if installedBuildStamp, upToDate := checkBIOSUpToDate(t.mountpoint, newCmdline.BuildStamp); upToDate {
+	if installedBuildStamp, upToDate := checkBIOSUpToDate(t.mountpoint, newCmdline.BuildStamp); upToDate && !mo.seed {
 		fmt.Printf("%s is already up to date (%s)\n", t.disk, cmdline.HumanVersion(installedBuildStamp))
-		return
+		if opts.integritySet {
+			if err := setIntegrityMode(t, opts.integrity); err != nil {
+				return false, err
+			}
+			fmt.Printf("%s: integrity mode %s (%s)\n", layout.PayloadSumFile, opts.integrity, integrityModeHelp(opts.integrity))
+		}
+		if opts.int13chunk != "" {
+			v, err := parseInt13Chunk(opts.int13chunk)
+			if err != nil {
+				return false, err
+			}
+			if err := setInt13Chunk(t.mountpoint, v); err != nil {
+				return false, err
+			}
+			raw, _ := os.ReadFile(filepath.Join(t.mountpoint, layout.CmdlineFile))
+			fmt.Printf("%s: INT13 chunk %s\n", layout.CmdlineFile, int13ChunkStatus(raw, nil))
+		}
+		return false, nil
 	}
 
 	// F8 (unidoc-alip's PR #5 follow-up review): preflighted here,
@@ -1893,20 +2462,44 @@ func updateBIOS(t *target, workdir string, yes bool, src release.BIOSSources) {
 	// be discovered only after stage1/stage2 already have the new
 	// build's bytes on disk).
 	if err := preflightBIOSMetadata(t.arch, newCmdline, kernel, initrd); err != nil {
-		die(fmt.Errorf("refusing to update: %w", err))
+		return false, fmt.Errorf("refusing to update: %w", err)
+	}
+	if err := checkStagePair(stage2, opts.force); err != nil {
+		return false, fmt.Errorf("refusing to update: %w", err)
+	}
+	if !payloadsum.ValidMode(opts.integrity) {
+		return false, fmt.Errorf("refusing to update: --integrity=%q is not off, warn or enforce", opts.integrity)
+	}
+	cmdlineTxt, err = applyInt13Chunk(cmdlineTxt, t.mountpoint, opts)
+	if err != nil {
+		return false, fmt.Errorf("refusing to update: %w", err)
+	}
+	if mo.editCmdline != nil {
+		if cmdlineTxt, err = mo.editCmdline(cmdlineTxt); err != nil {
+			return false, fmt.Errorf("refusing to update: %w", err)
+		}
+	}
+	integrityFrom := t.mountpoint
+	if mo.integrityFrom != "" {
+		integrityFrom = mo.integrityFrom
 	}
 
 	if !yes && !confirm(fmt.Sprintf("overwrite %s's stage1/stage2 and %s/{KERNEL,INITRD,CMDLINE} with this build?", t.disk, layout.ESPDir)) {
 		fmt.Println("not updated")
-		return
+		return false, nil
 	}
 
-	die(writeBIOSStagesWithRollback(t.disk, stage1, stage2))
+	if err := writeBIOSStagesWithRollback(t.disk, stage1, stage2); err != nil {
+		return false, err
+	}
 
-	die(writePayloadWithRollback(t.mountpoint, t.arch, newCmdline.Version, newCmdline.BuildStamp, kernel, initrd, cmdlineTxt))
+	if err := writePayloadWithRollback(t.mountpoint, t.arch, newCmdline.Version, newCmdline.BuildStamp, kernel, initrd, cmdlineTxt, updateIntegrityMode(integrityFrom, opts)); err != nil {
+		return true, err
+	}
 
 	fmt.Printf("%s updated: stage1 (%d bytes), stage2 (%d bytes), %s/{KERNEL,INITRD,CMDLINE,METADATA} - every write verified byte-for-byte.\n",
 		t.disk, len(stage1), len(stage2), layout.ESPDir)
+	return true, nil
 }
 
 // --- install -----------------------------------------------------------
@@ -1919,6 +2512,9 @@ func newInstallCmd() *cobra.Command {
 	var stage1File, stage1URL, stage2File, stage2URL string
 	var kernelFile, kernelURL, initrdFile, initrdURL, cmdlineFile, cmdlineURL string
 	var sshKey, net, ipv4, ipv4Address, ipv4Gateway, ipv6, ipv6Address, ipv6Gateway, sshListen, sshPort, sshAllow, console string
+	var netMAC string
+	var opts biosOpts
+	var ho hostOpts
 
 	cmd := &cobra.Command{
 		Use:   "install <disk>",
@@ -1935,7 +2531,16 @@ live /sys/firmware/efi), install runs against a not-yet-bootable target
 that has no running kernel of its own yet - "does --root's own /sys say
 UEFI" is not a meaningful question to ask of a directory tree.
 alpine-installer already knows definitively which firmware the target
-should use (its own USE_UEFI) and must pass it explicitly.`,
+should use (its own USE_UEFI) and must pass it explicitly.
+
+Mirrored boot (one ESP per disk of a ZFS mirror, see README "Mirrored
+boot"): the ESP mounted at --root/boot/efi is always written; so are the
+other ESPs of this host (same MEMBER identity), every ESP listed with
+--esp-uuids / ALPINE_ZFSBOOT_ESP_UUIDS, and every ESP named with --add-esp.
+BIOS: stage1/stage2 go onto the disk of each of those ESPs. Every ESP gets
+the same config, authorized_keys and rescue host key.
+
+Exit status: 0, or ` + exitCodesHelp,
 		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			disk := args[0]
@@ -1967,36 +2572,41 @@ should use (its own USE_UEFI) and must pass it explicitly.`,
 			}
 			die(bootenv.VerifyESPMounted(mountpoint, diskArg))
 			die(espconfig.ValidateConsole(console))
-
-			workdir, err := os.MkdirTemp("", "alpine-zfsboot-install-*")
+			// --net-mac / ALPINE_ZFSBOOT_NET_MAC: normalized, malformed refused.
+			mac, err := espconfig.ValidateNetMAC(flagOrEnv(netMAC, envNetMAC))
 			die(err)
-			defer os.RemoveAll(workdir)
 
 			cfg := espconfig.Config{
 				Net: net, IPv4: ipv4, IPv4Address: ipv4Address, IPv4Gateway: ipv4Gateway,
 				IPv6: ipv6, IPv6Address: ipv6Address, IPv6Gateway: ipv6Gateway,
 				SSHListen: sshListen, SSHPort: sshPort, SSHAllow: sshAllow,
-				Console: console,
+				Console: console, NetMAC: mac,
 			}
 
-			if uefi {
-				installUEFI(arch, mountpoint, workdir, yes, release.Source{File: efiFile, URL: efiURL}, cfg, sshKey)
-				return
-			}
-			installBIOS(disk, arch, mountpoint, workdir, yes, release.BIOSSources{
-				Stage1:  release.Source{File: stage1File, URL: stage1URL},
-				Stage2:  release.Source{File: stage2File, URL: stage2URL},
-				Kernel:  release.Source{File: kernelFile, URL: kernelURL},
-				Initrd:  release.Source{File: initrdFile, URL: initrdURL},
-				Cmdline: release.Source{File: cmdlineFile, URL: cmdlineURL},
-			}, cfg, sshKey)
+			os.Exit(runInstall(installRun{
+				disk: disk, arch: arch, uefi: uefi, mountpoint: mountpoint, yes: yes,
+				efi: release.Source{File: efiFile, URL: efiURL},
+				bios: release.BIOSSources{
+					Stage1:  release.Source{File: stage1File, URL: stage1URL},
+					Stage2:  release.Source{File: stage2File, URL: stage2URL},
+					Kernel:  release.Source{File: kernelFile, URL: kernelURL},
+					Initrd:  release.Source{File: initrdFile, URL: initrdURL},
+					Cmdline: release.Source{File: cmdlineFile, URL: cmdlineURL},
+				},
+				cfg: cfg, sshKey: sshKey, opts: opts, ho: ho,
+			}))
 		},
 	}
+	addHostFlags(cmd, &ho, true)
+	cmd.Flags().StringVar(&netMAC, "net-mac", "", "alpine-zfsboot.net.mac= persisted: the MAC address (aa:bb:cc:dd:ee:ff) of the network card the rescue network uses instead of eth0 (same as ALPINE_ZFSBOOT_NET_MAC). Not found at boot: rescue SSH does not start - never a fallback to eth0")
 	cmd.Flags().StringVar(&root, "root", "", "root of the target install (e.g. /mnt/alpine) - required")
 	cmd.MarkFlagRequired("root")
 	cmd.Flags().StringVar(&firmware, "firmware", "", "\"uefi\" or \"bios\" - required, never auto-detected (see this command's own --help text for why)")
 	cmd.MarkFlagRequired("firmware")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the overwrite confirmation prompt")
+	cmd.Flags().BoolVar(&opts.force, "force", false, "BIOS: write stage1/stage2 even if the stage2 would not pass stage1's own check (no magic word, bad length/checksum)")
+	cmd.Flags().StringVar(&opts.int13chunk, "int13chunk", "", "BIOS: the largest BIOS disk read (512-byte sectors, 1..127, or \"default\") the boot loader issues - written as alpine-zfsboot.int13chunk= into EFI/ALPINE/CMDLINE. update keeps the installed value when not given. Change later with 'alpine-zfsboot int13chunk'")
+	cmd.Flags().StringVar(&opts.integrity, "integrity", payloadsum.ModeWarn, "BIOS: the BIOS loader's check of the loaded kernel/initrd against EFI/ALPINE/CHECKSUM: warn (hash; on a mismatch show both digests and boot anyway), off (no hashing), enforce (refuse to boot on a mismatch - for diagnosing a failing host only, when you have another way to boot it). Change later with 'alpine-zfsboot integrity'")
 	cmd.Flags().StringVar(&efiFile, "efi-file", "", "UEFI: install this local .EFI file instead of fetching the latest release")
 	cmd.Flags().StringVar(&efiURL, "efi-url", "", "UEFI: fetch the .EFI from this URL instead of the latest release (must be minisign-signed: <url>.minisig must exist and verify)")
 	cmd.Flags().StringVar(&stage1File, "stage1-file", "", "BIOS: local stage1.bin instead of the latest release")
@@ -2024,87 +2634,78 @@ should use (its own USE_UEFI) and must pass it explicitly.`,
 	return cmd
 }
 
-func installUEFI(arch, mountpoint, workdir string, yes bool, src release.Source, cfg espconfig.Config, sshKey string) {
-	path, err := release.ResolveEFI(src, arch, workdir)
-	die(err)
-	efiBytes, err := os.ReadFile(path)
-	die(err)
-	info, err := cmdline.Read(path)
-	die(err)
-
-	if !yes && !confirm(fmt.Sprintf("install this UEFI build onto %s?", mountpoint)) {
-		fmt.Println("not installed")
-		return
+// writeUEFIInstall installs a resolved UEFI build onto one mounted ESP
+// (loader + metadata as one generation) plus its config.
+func writeUEFIInstall(arch, mountpoint string, a uefiAsset, cfg espconfig.Config, sshKey string, hostKey []byte) error {
+	if _, err := writeUEFIGenerationWithRollback(mountpoint, arch, a.bytes, a.path, a.info); err != nil {
+		return err
 	}
-
-	_, err = writeUEFIGenerationWithRollback(mountpoint, arch, efiBytes, path, info)
-	die(err)
-
-	writeConfig(mountpoint, cfg, sshKey)
+	if err := writeConfig(mountpoint, cfg, sshKey, hostKey); err != nil {
+		return err
+	}
 	fmt.Printf("UEFI loader installed at %s - verified byte-for-byte.\n", mountpoint)
+	return nil
 }
 
-func installBIOS(disk, arch, mountpoint, workdir string, yes bool, src release.BIOSSources, cfg espconfig.Config, sshKey string) {
-	assets, err := release.ResolveBIOS(src, arch, workdir)
-	die(err)
-	defer assets.RemoveAll()
-
-	stage1, err := os.ReadFile(assets.Stage1)
-	die(err)
-	stage1, err = trimStage1Asset(stage1)
-	die(err)
-	stage2, err := os.ReadFile(assets.Stage2)
-	die(err)
-	kernel, err := os.ReadFile(assets.Kernel)
-	die(err)
-	initrd, err := os.ReadFile(assets.Initrd)
-	die(err)
-	cmdlineTxt, err := os.ReadFile(assets.Cmdline)
-	die(err)
-
-	if len(stage2) > layout.Stage2Bytes {
-		die(fmt.Errorf("stage2 is %d bytes, exceeds the %d-byte budget", len(stage2), layout.Stage2Bytes))
-	}
-
-	// Same full non-mutating preflight as updateBIOS, and for the same
-	// reason - see that function's own comment on this exact call.
-	if err := bootenv.CheckStage2ExtentFree(disk); err != nil {
-		die(fmt.Errorf("refusing to install: %w", err))
-	}
-
+// prepareBIOSInstall runs install's checks on the build itself - before
+// any disk is touched (the per-disk CheckStage2ExtentFree runs separately,
+// for every disk, also before any write). Returns the build's cmdline
+// identity and the CMDLINE to write (with --int13chunk applied).
+func prepareBIOSInstall(arch string, a biosAssets, opts biosOpts) (cmdline.Info, []byte, error) {
 	// F8 (unidoc-alip's PR #5 follow-up review): same preflight, same
 	// reasoning, as updateBIOS's own identical call - see
 	// preflightBIOSMetadata's own comment.
-	newCmdline := cmdline.ParseText(cmdlineTxt)
-	if err := preflightBIOSMetadata(arch, newCmdline, kernel, initrd); err != nil {
-		die(fmt.Errorf("refusing to install: %w", err))
+	newCmdline := cmdline.ParseText(a.cmdline)
+	if err := preflightBIOSMetadata(arch, newCmdline, a.kernel, a.initrd); err != nil {
+		return cmdline.Info{}, nil, fmt.Errorf("refusing to install: %w", err)
 	}
-
-	if !yes && !confirm(fmt.Sprintf("install stage1/stage2 onto %s and the FAT payload onto %s?", disk, mountpoint)) {
-		fmt.Println("not installed")
-		return
+	if err := checkStagePair(a.stage2, opts.force); err != nil {
+		return cmdline.Info{}, nil, fmt.Errorf("refusing to install: %w", err)
 	}
+	if !payloadsum.ValidMode(opts.integrity) {
+		return cmdline.Info{}, nil, fmt.Errorf("refusing to install: --integrity=%q is not off, warn or enforce", opts.integrity)
+	}
+	cmdlineTxt, err := applyInt13Chunk(a.cmdline, "", opts)
+	if err != nil {
+		return cmdline.Info{}, nil, fmt.Errorf("refusing to install: %w", err)
+	}
+	return newCmdline, cmdlineTxt, nil
+}
 
-	die(writeBIOSStagesWithRollback(disk, stage1, stage2))
-
-	die(writePayloadWithRollback(mountpoint, arch, newCmdline.Version, newCmdline.BuildStamp, kernel, initrd, cmdlineTxt))
-
-	writeConfig(mountpoint, cfg, sshKey)
+// writeBIOSInstall writes one disk's stage1/stage2 and its ESP's payload
+// and config (the write half of the former installBIOS).
+func writeBIOSInstall(disk, arch, mountpoint string, a biosAssets, info cmdline.Info, cmdlineTxt []byte, opts biosOpts, cfg espconfig.Config, sshKey string, hostKey []byte) error {
+	if err := writeBIOSStagesWithRollback(disk, a.stage1, a.stage2); err != nil {
+		return err
+	}
+	if err := writePayloadWithRollback(mountpoint, arch, info.Version, info.BuildStamp, a.kernel, a.initrd, cmdlineTxt, opts.integrity); err != nil {
+		return err
+	}
+	if err := writeConfig(mountpoint, cfg, sshKey, hostKey); err != nil {
+		return err
+	}
 	fmt.Printf("%s: stage1 (%d bytes), stage2 (%d bytes) installed; %s/{KERNEL,INITRD,CMDLINE,METADATA} installed at %s - every write verified byte-for-byte.\n",
-		disk, len(stage1), len(stage2), layout.ESPDir, mountpoint)
+		disk, len(a.stage1), len(a.stage2), layout.ESPDir, mountpoint)
+	return nil
 }
 
 // writeConfig writes EFI/ALPINE/config plus, when sshKey is set, the
-// rescue-SSH authorized_keys and a freshly-generated host key -
-// matches alpine-install-zfs.sh's own write_alpine_zfsboot_esp_config()
+// rescue-SSH authorized_keys and the host key - matches
+// alpine-install-zfs.sh's own write_alpine_zfsboot_esp_config()
 // field-for-field (same env-var-derived inputs, same "only write a
 // key line when sshKey itself is set" gate), now transactional (see
 // internal/espconfig's own doc comment) where the original was not.
-func writeConfig(mountpoint string, cfg espconfig.Config, sshKey string) {
-	die(espconfig.WriteConfig(mountpoint, cfg))
-	if sshKey == "" {
-		return
+// hostKey is generated once per install run by the caller, so every ESP
+// of a mirrored boot gets the SAME rescue SSH host identity.
+func writeConfig(mountpoint string, cfg espconfig.Config, sshKey string, hostKey []byte) error {
+	if err := espconfig.WriteConfig(mountpoint, cfg); err != nil {
+		return err
 	}
-	die(espconfig.WriteAuthorizedKeys(mountpoint, sshKey))
-	die(espconfig.GenerateHostKey(mountpoint))
+	if sshKey == "" {
+		return nil
+	}
+	if err := espconfig.WriteAuthorizedKeys(mountpoint, sshKey); err != nil {
+		return err
+	}
+	return espconfig.WriteHostKey(mountpoint, hostKey)
 }

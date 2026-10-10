@@ -92,14 +92,67 @@ POOL = os.environ.get("ALPINE_ZFSBOOT_POOL", "zroot")
 BOOTFS = os.environ.get("ALPINE_ZFSBOOT_BOOTFS", f"{POOL}/ROOT/alpine")
 # The ONE place this file names the rescue network interface - every
 # other use below references this constant rather than its own "eth0"
-# literal. rescue-ssh.sh/net-config.sh hardcode the identical interface
-# name on the shell side (`net_config eth0`) - there is currently no
+# literal - the DEFAULT; with alpine-zfsboot.net.mac= set, rescue_iface()
+# below resolves the real one. rescue-ssh.sh/net-config.sh use the identical
+# default on the shell side (net_resolve_iface) - there is currently no
 # runtime-shared source of truth across the shell/Python boundary for
 # this (and introducing one would mean touching the frozen networking
 # architecture), so this is the practical middle ground: one named
 # constant here instead of several independent "eth0" literals that
 # could quietly drift apart from each other.
 RESCUE_IFACE = "eth0"
+# alpine-zfsboot.net.mac= (exported by /init as ALPINE_ZFSBOOT_NET_MAC):
+# when set, the rescue network is the physical card with this MAC, never
+# eth0 - see rescue_iface() and net-config.sh's net_resolve_iface (the
+# same rules: case-insensitive, loopback and virtual interfaces ignored).
+RESCUE_NET_MAC = os.environ.get("ALPINE_ZFSBOOT_NET_MAC", "").strip()
+SYS_CLASS_NET = os.environ.get("STUB_ROOT", "") + "/sys/class/net"
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def rescue_iface():
+    """(interface name, None), or (None, error text) when
+    alpine-zfsboot.net.mac= is set but names no single physical card -
+    never a silent fallback to eth0 (the configured value is authoritative,
+    like alpine-zfsboot.console=). Re-resolved on every call: a late
+    driver can bring the card up while the menu is open.
+    """
+    if not RESCUE_NET_MAC:
+        return RESCUE_IFACE, None
+    raw = RESCUE_NET_MAC
+    norm = raw.lower()
+    if "-" in norm and ":" not in norm:
+        norm = norm.replace("-", ":")
+    if not _MAC_RE.match(norm) or norm == "00:00:00:00:00:00" or int(norm[:2], 16) & 1:
+        return None, f"alpine-zfsboot.net.mac={raw} is not a network card's MAC address"
+    matches, seen = [], []
+    try:
+        names = sorted(os.listdir(SYS_CLASS_NET))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(SYS_CLASS_NET, name)
+        try:
+            with open(os.path.join(path, "address")) as f:
+                addr = f.read().strip().lower()
+        except OSError:
+            continue
+        if name == "lo" or "/virtual/" in (os.readlink(path) if os.path.islink(path) else ""):
+            continue
+        try:
+            with open(os.path.join(path, "type")) as f:
+                if f.read().strip() == "772":
+                    continue
+        except OSError:
+            pass
+        seen.append(f"{name}={addr}")
+        if addr == norm:
+            matches.append(name)
+    if len(matches) == 1:
+        return matches[0], None
+    if matches:
+        return None, f"MAC {norm} is on more than one card ({', '.join(matches)})"
+    return None, f"no network card has MAC {norm} (alpine-zfsboot.net.mac; found: {' '.join(seen) or 'none'})"
 # Set by /init when `zpool import`/the bootfs lookup itself failed -
 # see its own header comment there. A real, reported usability
 # problem otherwise: /init used to `die` straight to a bare bash
@@ -710,8 +763,11 @@ def _network_status():
     whole point of showing this at all is that it stays honest about
     whatever the real state is right now.
     """
+    iface, _err = rescue_iface()
+    if iface is None:
+        return None
     try:
-        out = subprocess.run(["ifconfig", RESCUE_IFACE], capture_output=True, text=True).stdout
+        out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
     except Exception:
         return None
     m = re.search(r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)", out)
@@ -730,8 +786,11 @@ def _network_addresses():
     under-report a machine that is, right now, perfectly reachable over
     rescue SSH.
     """
+    iface, _err = rescue_iface()
+    if iface is None:
+        return []
     try:
-        out = subprocess.run(["ifconfig", RESCUE_IFACE], capture_output=True, text=True).stdout
+        out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
     except Exception:
         return []
     v4 = re.findall(r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)", out)
@@ -801,23 +860,31 @@ def network_menu():
     this menu waiting for an answer, so this reports success or
     failure directly rather than leaving it to be discovered later.
     """
+    iface, err = rescue_iface()
+    if iface is None:
+        # The card may simply have no driver loaded yet.
+        _probe_network_drivers()
+        iface, err = rescue_iface()
+    if iface is None:
+        dialog_msgbox("Network", f"{err}\n\nNot falling back to eth0. Fix alpine-zfsboot.net.mac in EFI/ALPINE/config, or override it for one boot at the boot screen (press TAB).")
+        return
     ip = _network_status()
     if ip:
-        dialog_msgbox("Network", f"{RESCUE_IFACE} is up: {ip}")
+        dialog_msgbox("Network", f"{iface} is up: {ip}")
         return
-    if not dialog_yesno("Network", f"{RESCUE_IFACE} has no address yet.\n\nBring it up via DHCP now?", default_no=False):
+    if not dialog_yesno("Network", f"{iface} has no address yet.\n\nBring it up via DHCP now?", default_no=False):
         return
     _probe_network_drivers()
-    subprocess.run(["ifconfig", RESCUE_IFACE, "up"])
+    subprocess.run(["ifconfig", iface, "up"])
     try:
-        subprocess.run(["udhcpc", "-i", RESCUE_IFACE, "-n", "-q"], timeout=15)
+        subprocess.run(["udhcpc", "-i", iface, "-n", "-q"], timeout=15)
     except subprocess.TimeoutExpired:
         pass
     ip = _network_status()
     if ip:
-        dialog_msgbox("Network", f"{RESCUE_IFACE} is up: {ip}")
+        dialog_msgbox("Network", f"{iface} is up: {ip}")
     else:
-        dialog_msgbox("Network", f"DHCP did not complete - {RESCUE_IFACE} still has no address.")
+        dialog_msgbox("Network", f"DHCP did not complete - {iface} still has no address.")
 
 
 class DialogUnavailable(Exception):
@@ -1543,7 +1610,11 @@ def _rescue_status_text():
     lines.append(f"Prev boot:       {prev_boot_line}")
     lines.append(f"Rescue SSH:      {'running' if _rescue_ssh_running() else 'not running'}")
     addrs = _network_addresses()
-    lines.append(f"Network ({RESCUE_IFACE}):  {', '.join(addrs) if addrs else 'no address configured'}")
+    iface, err = rescue_iface()
+    if iface is None:
+        lines.append(f"Network:         ERROR - {err}")
+    else:
+        lines.append(f"Network ({iface}):  {', '.join(addrs) if addrs else 'no address configured'}")
     return "\n".join(lines)
 
 

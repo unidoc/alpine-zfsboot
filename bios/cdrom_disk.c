@@ -195,11 +195,12 @@
  * buffer: the one 64KB-aligned physical address reachable at all from
  * this segment (offset range [0,0x10000) only, since nothing here
  * exceeds that) is physical 0x10000, which is segment offset
- * 0x10000-0x7c00 = 0x8400. g_native_buf sits at a fixed offset - 0x9ae0
- * today (re-verified via `nm` alongside the table above; grew from an
- * earlier-documented 0x9660 once fat.c's own g_fat_table_cache2 was
- * added ahead of it in link order - see that comment above), with
- * FAT_IO_BATCH_SECTORS=36, independent of NATIVE_BATCH itself -
+ * 0x10000-0x7c00 = 0x8400. g_native_buf sits at a fixed offset - 0xa800
+ * with Alpine gcc 15.2 since NATIVE_BATCH went from 9 to 4 and the ISO
+ * FAT batch from 36 to 16 sectors to make room for the per-block payload
+ * checks (it was 0x9ae0 before; the Makefile's check-dma-bounds now checks
+ * this on every build instead of leaving it to inspection) -
+ * independent of NATIVE_BATCH itself -
  * everything ahead of it in link order is unaffected by this
  * constant, only BY this constant's own size is what comes AFTER it
  * (nothing, it's last) - already past that point for every value in
@@ -211,10 +212,30 @@
  * file's object, ever changed enough to move g_native_buf's start
  * below offset 0x8400.
  */
-#define NATIVE_BATCH 9
+#define NATIVE_BATCH 4
 #define NATIVE_BATCH_BYTES (NATIVE_BATCH * NATIVE_SECTOR_SIZE)
 
 static uint8_t g_native_buf[NATIVE_BATCH_BYTES];
+
+/*
+ * alpine-zfsboot.int13chunk=N (512-byte sectors, see disk.h) on the ISO
+ * path: this file reads 2048-byte CD sectors, at most NATIVE_BATCH of them
+ * per call, so the cap becomes N/4 native sectors (at least 1, at most
+ * NATIVE_BATCH - the ISO stage never transfers more than that anyway).
+ */
+static uint16_t g_native_cap = NATIVE_BATCH;
+
+void disk_set_chunk(uint16_t sectors)
+{
+	if (sectors < 1 || sectors > DISK_CHUNK_LIMIT)
+		return;
+	g_native_cap = (uint16_t)(sectors / 4);
+	if (g_native_cap < 1)
+		g_native_cap = 1;
+	if (g_native_cap > NATIVE_BATCH)
+		g_native_cap = NATIVE_BATCH;
+}
+
 static uint8_t g_drive_number;
 static int g_use_int13;
 static int g_atapi_probed;
@@ -440,7 +461,62 @@ void disk_init(uint8_t drive_number)
  * full backend-selection story and NATIVE_BATCH's own comment for why
  * batching like this matters at all.
  */
+#ifdef DISK_FI_MODE
+/*
+ * Test builds only, the ISO counterpart of disk.c's DISK_FI_* (see there):
+ * after a read that worked, damage one 512-byte unit of what arrived -
+ * DISK_FI_ABOVE=N: every read of more than N 512-byte units; DISK_FI_LBA=X
+ * (in 512-byte units), DISK_FI_TIMES=T: reads covering X, T times (255 =
+ * always). DISK_FI_MODE 1 flips a bit, anything else zeroes the unit.
+ */
+#ifndef DISK_FI_TIMES
+#define DISK_FI_TIMES 255
+#endif
+static uint8_t g_fi_hits;
+
+static void fi_damage(uint32_t native_lba, uint32_t native_count)
+{
+	uint32_t first = native_lba * UNITS_PER_NATIVE, units = native_count * UNITS_PER_NATIVE;
+	int t = -1;
+	uint8_t *p;
+	unsigned i;
+
+#ifdef DISK_FI_ABOVE
+	if (units > DISK_FI_ABOVE)
+		t = (int)(units / 2);
+#endif
+#ifdef DISK_FI_LBA
+	if ((uint32_t)DISK_FI_LBA >= first && (uint32_t)DISK_FI_LBA < first + units &&
+	    (DISK_FI_TIMES == 255 || g_fi_hits < DISK_FI_TIMES)) {
+		g_fi_hits++;
+		t = (int)((uint32_t)DISK_FI_LBA - first);
+	}
+#endif
+	if (t < 0)
+		return;
+	p = g_native_buf + (uint32_t)t * DISK_SECTOR_SIZE;
+	if (DISK_FI_MODE == 1)
+		p[123] ^= 0x10;
+	else
+		for (i = 0; i < DISK_SECTOR_SIZE; i++)
+			p[i] = 0;
+}
+#endif
+
+static int native_read_batch_raw(uint32_t native_lba, uint32_t native_count);
+
 static int native_read_batch(uint32_t native_lba, uint32_t native_count)
+{
+	int r = native_read_batch_raw(native_lba, native_count);
+
+#ifdef DISK_FI_MODE
+	if (r == 0)
+		fi_damage(native_lba, native_count);
+#endif
+	return r;
+}
+
+static int native_read_batch_raw(uint32_t native_lba, uint32_t native_count)
 {
 	int attempt;
 
@@ -499,8 +575,8 @@ int disk_read_lba(uint64_t lba, uint16_t count, void *buf)
 		uint32_t i;
 		const uint8_t *src;
 
-		if (native_count > NATIVE_BATCH)
-			native_count = NATIVE_BATCH;
+		if (native_count > g_native_cap)
+			native_count = g_native_cap;
 
 		if (native_read_batch((uint32_t)native_lba, native_count) != 0)
 			return -1;
@@ -518,4 +594,34 @@ int disk_read_lba(uint64_t lba, uint16_t count, void *buf)
 	}
 
 	return 0;
+}
+
+/* The cap in 512-byte units, like the disk build's (disk.h). */
+uint16_t disk_get_chunk(void)
+{
+	return (uint16_t)(g_native_cap * 4);
+}
+
+/* Which backend serves the reads now (for the boot summary). */
+int disk_cd_atapi(void)
+{
+	return !g_use_int13;
+}
+
+/* Before a re-read: INT 13h AH=00h for the INT 13h backend; the ATAPI
+ * backend has no reset step of its own (atapi_read_native() re-issues the
+ * whole command each time). */
+void disk_reset(void)
+{
+	if (g_use_int13) {
+		uint8_t drive = g_drive_number;
+
+		__asm__ __volatile__(
+			"xorb %%ah, %%ah\n\t"
+			"int $0x13\n\t"
+			: "+d"(drive)
+			:
+			: "eax", "ebx", "ecx", "esi", "edi", "ebp", "cc", "memory"
+		);
+	}
 }

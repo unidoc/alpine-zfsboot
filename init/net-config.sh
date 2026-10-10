@@ -45,6 +45,8 @@
 #   ALPINE_ZFSBOOT_IPV6           auto|dhcp|static|off
 #   ALPINE_ZFSBOOT_IPV6_ADDRESS   CIDR, e.g. 2001:db8::5/64 - required if IPV6=static
 #   ALPINE_ZFSBOOT_IPV6_GATEWAY   plain address - optional even under static
+#   ALPINE_ZFSBOOT_NET_MAC        aa:bb:cc:dd:ee:ff - the card to use instead
+#                                  of eth0 (net_resolve_iface, below)
 #
 # "auto" for IPv6 means kernel-native SLAAC (router-advertisement
 # autoconfig) - no daemon needed, just an up'd interface with the
@@ -103,6 +105,79 @@ wait_for_global_ipv6() {
         sleep "$poll_interval"
         waited=$((waited + 1))
     done
+    return 1
+}
+
+# net_resolve_iface - prints the rescue network interface on stdout:
+# eth0 (the default, unchanged), or - when alpine-zfsboot.net.mac=
+# (ALPINE_ZFSBOOT_NET_MAC) is set - the one physical network card with
+# that MAC address, found in ${ROOTFS}/sys/class/net/*/address
+# (case-insensitive; the loopback device and virtual interfaces -
+# bridges, bonds, VLANs, veth: their sysfs link points into
+# /devices/virtual/ and they copy or invent a MAC - are ignored).
+#
+# The card's driver may still be probing when this runs (a late USB NIC,
+# a slow PCI driver): it waits up to NET_MAC_WAIT seconds (default 15),
+# polling every NET_CONFIG_POLL_INTERVAL. A configured MAC that is
+# malformed, matches no card, or matches two cards is a configuration
+# failure: a message, and return 1 - NEVER a silent fallback to eth0
+# (the configured value is authoritative, like alpine-zfsboot.console=).
+# Callers treat that like a failed network bring-up (rescue-ssh.sh: no
+# dropbear, the usual rescue/die path). Without the key, /sys is never
+# even looked at. Messages go to stderr (stdout is the answer).
+# internal/netmac (Go, `alpine-zfsboot status`) applies the same rules.
+net_resolve_iface() {
+    mac="${ALPINE_ZFSBOOT_NET_MAC:-}"
+    if [ -z "$mac" ]; then
+        echo eth0
+        return 0
+    fi
+    hex='[0-9a-fA-F][0-9a-fA-F]'
+    case "$mac" in
+        $hex:$hex:$hex:$hex:$hex:$hex|$hex-$hex-$hex-$hex-$hex-$hex) ;;
+        *)
+            net_config_msg "configuration error: alpine-zfsboot.net.mac=$mac is not a MAC address (want aa:bb:cc:dd:ee:ff) - not falling back to eth0" >&2
+            return 1
+            ;;
+    esac
+    want="$(printf '%s' "$mac" | tr 'A-F' 'a-f' | tr '-' ':')"
+    first="${want%%:*}"
+    if [ "$want" = "00:00:00:00:00:00" ] || [ $((0x$first & 1)) -eq 1 ]; then
+        net_config_msg "configuration error: alpine-zfsboot.net.mac=$mac is a zero/multicast address, not a network card's - not falling back to eth0" >&2
+        return 1
+    fi
+    sys="${ROOTFS:-}/sys/class/net"
+    timeout="${NET_MAC_WAIT:-15}"
+    poll_interval="${NET_CONFIG_POLL_INTERVAL:-1}"
+    waited=0
+    while :; do
+        matches="" seen=""
+        for p in "$sys"/*; do
+            [ -r "$p/address" ] || continue
+            name="${p##*/}"
+            [ "$name" = lo ] && continue
+            [ "$(cat "$p/type" 2>/dev/null)" = 772 ] && continue
+            case "$(readlink "$p" 2>/dev/null)" in */virtual/*) continue ;; esac
+            addr="$(tr 'A-F' 'a-f' < "$p/address" 2>/dev/null)"
+            seen="$seen $name=$addr"
+            [ "$addr" = "$want" ] && matches="$matches $name"
+        done
+        set -- $matches
+        if [ $# -eq 1 ]; then
+            net_config_msg "rescue network: $1 is the card with MAC $want (alpine-zfsboot.net.mac)" >&2
+            echo "$1"
+            return 0
+        fi
+        if [ $# -gt 1 ]; then
+            net_config_msg "configuration error: MAC $want (alpine-zfsboot.net.mac) is on more than one card:$matches - refusing to guess" >&2
+            return 1
+        fi
+        [ "$waited" -ge "$timeout" ] && break
+        [ "$waited" -eq 0 ] && net_config_msg "waiting up to ${timeout}s for the card with MAC $want (alpine-zfsboot.net.mac) - its driver may still be loading" >&2
+        sleep "$poll_interval"
+        waited=$((waited + 1))
+    done
+    net_config_msg "configuration error: no network card has MAC $want (alpine-zfsboot.net.mac, waited ${timeout}s; found:${seen:- none}) - NOT falling back to eth0. Fix it in EFI/ALPINE/config or override it for one boot (TAB at the boot screen)" >&2
     return 1
 }
 

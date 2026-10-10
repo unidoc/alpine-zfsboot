@@ -15,7 +15,9 @@
  * disk's own valid signature.
  *
  * Its ENTIRE job: read a fixed number of sectors starting at LBA 34
- * into memory at STAGE2_SEGMENT:0, and jump there. Deliberately NO
+ * into memory at STAGE2_SEGMENT:0 (in STAGE2_CHUNK_SECTORS pieces, see
+ * below), check that what arrived is a whole stage2 image, and jump
+ * there. Deliberately NO
  * GPT/MBR parsing here at all - that needs real code (see stage2's own
  * gpt.c/mbr.c), and this sector has nowhere near the room for it;
  * stage2, loaded via the one fixed-LBA read below, has vastly more of
@@ -81,6 +83,41 @@
 	 */
 	.set STAGE2_READ_RETRIES, 10
 
+	/*
+	 * stage2 is read in pieces of STAGE2_CHUNK_SECTORS, not with one
+	 * 64-sector INT 13h AH=42h request. A physical BIOS host failed
+	 * loading the kernel with large transfers (root cause unknown; one
+	 * hypothesis is that some BIOS/controller combinations mishandle
+	 * large AH=42h transfers), and stage2's own reads (disk_policy.c)
+	 * can shrink their transfer size on failure - stage1 has no room for
+	 * that, so it simply never asks for more than this. 16 sectors (8
+	 * KiB) is a size every BIOS implementation is expected to accept.
+	 * Each piece gets its own STAGE2_READ_RETRIES attempts.
+	 */
+	.set STAGE2_CHUNK_SECTORS, 16
+	.if STAGE2_SECTORS % STAGE2_CHUNK_SECTORS
+	.error "STAGE2_SECTORS must be a multiple of STAGE2_CHUNK_SECTORS"
+	.endif
+
+	/*
+	 * After the read, stage2's header (see stage2_entry.S) is checked
+	 * beyond the magic word - but only when the word at offset 4 is
+	 * STAGE2_SUM_MARKER. Then the word at offset 6 is the image length in
+	 * 16-bit words and the word at offset 8 is set by the build (bios/
+	 * Makefile, stage2.bin) so that the 16-bit sum of all those words
+	 * is zero. A carry-clear read that delivered wrong bytes anywhere in
+	 * the image - not only in its first sector - is then caught with
+	 * high probability (all but 1 in 65536 random corruptions) and
+	 * halts with '!' instead of being executed. Without the marker (a
+	 * stage2 built before it existed, e.g. v0.4.x) only the magic word is
+	 * checked, exactly as the previous stage1 did: a new stage1 must keep
+	 * booting an old stage2 (a half-finished update, a mirror where only
+	 * one disk's MBR was rewritten so far).
+	 */
+	.set STAGE2_SUM_MARKER, 0x5331
+	.set STAGE2_LEN_OFFSET, 6
+	.set STAGE2_MAX_WORDS, (STAGE2_SECTORS * 512 / 2)
+
 _start:
 	cli
 	xorw %ax, %ax
@@ -104,7 +141,9 @@ _start:
 	 * up at the LOWEST address - exactly where the packet's own
 	 * "size" byte, its first field, belongs) - avoids needing any
 	 * separate, statically-addressed buffer for a structure this
-	 * short-lived.
+	 * short-lived. Only the size byte and the upper LBA words keep the
+	 * values pushed here; num_blocks, the buffer segment and the low
+	 * LBA word are rewritten before every attempt (see read_retry).
 	 */
 	pushw $0                  /* start_lba bits 63:48 */
 	pushw $0                  /* start_lba bits 47:32 */
@@ -112,17 +151,25 @@ _start:
 	pushw $STAGE2_LBA         /* start_lba bits 15:0 */
 	pushw $STAGE2_SEGMENT     /* buffer_segment */
 	pushw $0                  /* buffer_offset */
-	pushw $STAGE2_SECTORS     /* num_blocks */
+	pushw $STAGE2_CHUNK_SECTORS /* num_blocks */
 	pushw $0x0010             /* low byte 0x10 = size, high byte 0x00 = reserved */
 	movw %sp, %si
 
 	/*
+	 * %di: the index of the first sector of the current chunk, relative
+	 * to STAGE2_LBA (0, 16, 32, 48). The DAP's LBA and buffer segment
+	 * are recomputed from it before every attempt rather than advanced
+	 * in place, so nothing a BIOS might leave behind in the packet after
+	 * a call carries over into the next one.
+	 */
+	xorw %di, %di
+
+next_chunk:
+	/*
 	 * %bl: retry counter - a register, not %dl/%dh (the BIOS drive
 	 * number, which must stay untouched all the way through to the far
 	 * jump below) and not %si (points at the DAP for the whole retry
-	 * loop - see below for why its num_blocks field is NOT simply
-	 * reused unmodified across every retry, despite an earlier version
-	 * of this comment claiming it was).
+	 * loop). Reset for every chunk: each piece gets the full budget.
 	 */
 	movb $STAGE2_READ_RETRIES, %bl
 
@@ -131,26 +178,23 @@ read_retry:
 	 * A follow-up review found a real gap in the ORIGINAL version of
 	 * this loop: INT 13h/AH=42h's own documented behavior leaves
 	 * whether a BIOS updates the DAP's own num_blocks field
-	 * implementation-defined (see disk.c's own disk_read_lba() and
+	 * implementation-defined (see disk.c's own disk_int13_read() and
 	 * cdrom_disk.c's own int13_read_native() - the two other real DAP
-	 * call sites in this tree, both hardened against exactly this
-	 * earlier this same session) - on a BIOS that DOES update it, a
+	 * call sites in this tree) - on a BIOS that DOES update it, a
 	 * failed OR short attempt can leave this packet's own num_blocks
-	 * holding fewer sectors than STAGE2_SECTORS. The original loop
-	 * built this DAP ONCE and reused it verbatim across every retry -
-	 * a corrupted count left behind by a failed attempt would then be
-	 * silently RE-ISSUED on the next retry, requesting fewer sectors
-	 * than the real stage2 image needs; if THAT attempt then reports
-	 * success (CF=0), execution would fall straight through to the
-	 * magic-word check below and far-jump into a genuinely TRUNCATED
-	 * stage2 image - the magic word lives in stage2's own first
-	 * sector, so it would still read back correctly even though the
-	 * tail of stage2 was never actually loaded into memory at all.
-	 * Resetting num_blocks to the real, full STAGE2_SECTORS at the top
-	 * of every single attempt (not just the first) closes this: no
-	 * attempt can ever inherit a reduced count from a previous one.
+	 * holding fewer sectors than asked for, and re-issuing that packet
+	 * verbatim would request (and on CF=0 accept) a truncated piece.
+	 * num_blocks, the low LBA word and the buffer segment are therefore
+	 * all rewritten at the top of every single attempt: no attempt can
+	 * inherit anything from a previous one.
 	 */
-	movw $STAGE2_SECTORS, 2(%si)
+	movw $STAGE2_CHUNK_SECTORS, 2(%si)
+	leaw STAGE2_LBA(%di), %ax
+	movw %ax, 8(%si)
+	movw %di, %ax
+	shlw $5, %ax              /* sectors * 512 / 16 = paragraphs */
+	addw $STAGE2_SEGMENT, %ax
+	movw %ax, 6(%si)
 	movb $0x42, %ah
 	int $0x13
 	jc read_attempt_failed
@@ -165,28 +209,50 @@ read_retry:
 	 * condition (the same real-hardware reasoning STAGE2_READ_RETRIES
 	 * itself already exists for) can plausibly produce too.
 	 */
-	cmpw $STAGE2_SECTORS, 2(%si)
-	je read_ok
+	cmpw $STAGE2_CHUNK_SECTORS, 2(%si)
+	je chunk_ok
 read_attempt_failed:
 	decb %bl
 	jnz read_retry
 	jmp read_failed
 
-read_ok:
+chunk_ok:
+	addw $STAGE2_CHUNK_SECTORS, %di
+	cmpw $STAGE2_SECTORS, %di
+	jb next_chunk
+
 	/*
-	 * STAGE2_MAGIC check, at STAGE2_SEGMENT:2 - see stage2_entry.S's
-	 * own comment for what's actually placed there and why. %ds is
-	 * saved/restored around this rather than left pointed at
-	 * STAGE2_SEGMENT - nothing past this point may assume %ds is
-	 * anything other than 0 (stage2_entry.S's own invariants start
-	 * fresh from its own far jump, but this code hasn't jumped yet).
+	 * Validate before jumping: the magic word at STAGE2_SEGMENT:2 (see
+	 * stage2_entry.S); then, if the marker at offset 4 says the stage2
+	 * carries them, the length word at offset 6 (nonzero, and no larger
+	 * than what was read) and the 16-bit sum of that many words starting
+	 * at offset 0, which the build made zero (see STAGE2_LEN_OFFSET
+	 * above). %ds points at stage2 only for the
+	 * duration of this check and is restored to 0 before the far jump -
+	 * stage2_entry.S sets up its own segments either way.
 	 */
-	pushw %ds
 	movw $STAGE2_SEGMENT, %ax
 	movw %ax, %ds
 	cmpw $STAGE2_MAGIC, 2
-	popw %ds
 	jne read_failed
+	cmpw $STAGE2_SUM_MARKER, 4
+	jne stage2_ok             /* an older stage2: magic word only */
+	movw STAGE2_LEN_OFFSET, %cx
+	jcxz read_failed
+	cmpw $STAGE2_MAX_WORDS, %cx
+	ja read_failed
+	xorw %si, %si
+	xorw %bx, %bx
+	cld
+sum_loop:
+	lodsw
+	addw %ax, %bx
+	loop sum_loop
+	testw %bx, %bx
+	jnz read_failed
+stage2_ok:
+	xorw %ax, %ax
+	movw %ax, %ds
 
 	/* Far jump into stage2_entry - %dl (drive number) still intact. */
 	ljmp $STAGE2_SEGMENT, $0
@@ -204,5 +270,11 @@ read_failed:
 	hlt
 	jmp 1b
 
+	/*
+	 * Fails the assembly if the code above ever grows past the 440
+	 * bytes an installer writes (layout.Stage1Bytes; bytes 440-509 are
+	 * the disk's own ID and partition table, never stage1's).
+	 */
+	.org 440
 	.org 510
 	.word 0xaa55

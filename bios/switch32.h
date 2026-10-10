@@ -33,6 +33,13 @@
 void unreal_copy(uint32_t dst, const void *src, uint32_t len);
 
 /*
+ * The reverse direction: len bytes from the 32-bit physical address src
+ * (anywhere in the low 4GB, A20 enabled) to dst, a plain real-mode-
+ * addressable pointer in this stage's own segment.
+ */
+void unreal_read(void *dst, uint32_t src, uint32_t len);
+
+/*
  * Enables the A20 gate - must be called at least once before ANY copy
  * to a physical address >= 1MB (unreal_copy()'s whole reason for
  * existing), or such a copy silently wraps back down to address 0
