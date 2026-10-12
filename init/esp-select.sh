@@ -28,14 +28,26 @@
 #      in 1 - from this installation's own ESP only, never from an
 #      arbitrary one (a foreign stick's config could list itself).
 #      Two installations and nothing to choose: refuse.
+#      Exception: when the only marker group present has no LABEL=EFI ESP
+#      and an unmarked LABEL=EFI ESP with alpine-zfsboot files exists (the
+#      host's own, e.g. after an interrupted update, next to a foreign
+#      rescue stick), the group is ignored (with a message) and 4 applies.
 #   4. No marker anywhere (every install before 0.5.0): exactly the old
 #      rule - one qualifying LABEL=EFI ESP; several: refuse, naming them
-#      and the ways out (esp adopt, alpine-zfsboot.esp-uuids=).
+#      and the ways out (esp adopt, alpine-zfsboot.esp-uuids=). A damaged
+#      (unreadable) MEMBER marker on the ONLY qualifying LABEL=EFI ESP
+#      does not take it out: it is used as a legacy ESP, with a warning.
 #
 # In 1 and 3 the chosen ESP must carry the old markers too (a boot binary
 # or KERNEL, and config/authorized_keys/host key) and, when it has an
-# EFI/ALPINE/CHECKSUM, its KERNEL/INITRD must match it - otherwise the next
-# best member is used, with a warning. A FAT UUID on two devices (a dd
+# EFI/ALPINE/CHECKSUM, its KERNEL/INITRD must have the sizes it records -
+# otherwise the next best member is used, with a warning. When NO
+# candidate passes, the best-ranked one is used anyway, with a warning:
+# CHECKSUM covers only KERNEL+INITRD, not the config/keys read here, and
+# a host with a damaged payload is the one that needs rescue SSH most.
+# Only sizes are checked: /init must not read 40+ MiB on every boot (on a
+# disk throwing read retries that is unbounded); the content hash is
+# checked by stage2 and 'alpine-zfsboot verify'. A FAT UUID on two devices (a dd
 # clone, an md member) anywhere in the candidate set: refuse.
 #
 # A marker counts only when it decodes and its ESP_UUID is the ESP's own
@@ -118,6 +130,7 @@ _esp_read_member() {
 # _esp_scan - mounts every vfat volume blkid reports, read-only, one at a
 # time, and records one line per volume in $ESP_SCAN:
 #   dev uuid label alpine qual mstate id gen members cfglist
+# (alpine is "-" for a volume that could not be mounted at all)
 # mstate: none | valid | copied | bad. "-" for empty fields.
 _esp_scan() {
     mkdir -p "$ESP_MNT"
@@ -135,7 +148,7 @@ _esp_scan() {
         esac
         _uuid="$(_esp_norm_uuid "$_uuid")" || continue
         mount -t vfat -o ro "$_dev" "$ESP_MNT" 2>/dev/null || {
-            printf '%s %s %s 0 0 none - - - -\n' "$_dev" "$_uuid" "${_label:--}" >> "$ESP_SCAN"
+            printf '%s %s %s - 0 none - - - -\n' "$_dev" "$_uuid" "${_label:--}" >> "$ESP_SCAN"
             continue
         }
         _alp=0; [ -d "$ESP_MNT/EFI/ALPINE" ] && _alp=1
@@ -178,29 +191,48 @@ _esp_devs() {
     awk -v u="$1" '$2==u {printf "%s%s", s, $1; s=", "}' "$ESP_SCAN"
 }
 
-# _esp_payload_ok UUID - mounts it and checks KERNEL/INITRD against its
-# CHECKSUM (format 1 only; another format, a missing file or no sha256sum
-# counts as "nothing to check", never as a mismatch).
+# _esp_payload_ok UUID - mounts it and checks the SIZES of KERNEL/INITRD
+# against its CHECKSUM (format 1 only; another format or a missing
+# CHECKSUM counts as "nothing to check", never as a mismatch). Sizes
+# only, deliberately: hashing the whole payload here would read 40+ MiB
+# on every boot (unbounded time on a disk with read retries); the
+# content hash is checked by stage2 and 'alpine-zfsboot verify'. This
+# still catches a truncated or half-written payload.
 _esp_payload_ok() {
     _pu="$1"
     _dev="$(_esp_field "$1" 1)"
     mount -t vfat -o ro "$_dev" "$ESP_MNT" 2>/dev/null || return 1
     _ok=0
     _sum="$ESP_MNT/EFI/ALPINE/CHECKSUM"
-    if [ -r "$_sum" ] && [ "$(head -n 1 "$_sum" | tr -d '\r')" = "$ESP_SUM_HEADER" ] && command -v sha256sum >/dev/null 2>&1; then
+    if [ -r "$_sum" ] && [ "$(head -n 1 "$_sum" | tr -d '\r')" = "$ESP_SUM_HEADER" ]; then
         for _what in KERNEL INITRD; do
             set -- $(sed -n "s/^$_what //p" "$_sum" | tr -d '\r')
             [ $# -eq 3 ] || continue
             _f="$ESP_MNT/EFI/ALPINE/$_what"
-            if [ ! -r "$_f" ] || [ "$(wc -c < "$_f" | tr -d ' ')" != "$1" ] || \
-               [ "$(tail -c +$(($2 + 1)) "$_f" | sha256sum | cut -d' ' -f1)" != "$3" ]; then
-                msg "WARNING: ESP $_pu payload check: $_what on $_dev does not match its CHECKSUM"
+            if [ ! -r "$_f" ] || [ "$(wc -c < "$_f" | tr -d ' ')" != "$1" ]; then
+                msg "WARNING: ESP $_pu payload check: $_what on $_dev is missing or does not have the size its CHECKSUM records"
                 _ok=1
             fi
         done
     fi
     umount "$ESP_MNT" 2>/dev/null
     return "$_ok"
+}
+
+# _esp_report_unmounted - one line for every ESP that failed to mount and
+# matters here: LABEL=EFI, or named by the command-line list, a MEMBERS=
+# line or a config list of any scanned ESP. An unmountable newest member
+# must not vanish silently from the boot log.
+_esp_report_unmounted() {
+    awk -v cl="$(printf '%s' "${ESP_SELECT_CMDLINE_LIST:-}" | tr 'a-f' 'A-F')" '
+        BEGIN { n = split(cl, a, ","); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+        { rows[NR] = $0 }
+        $4 != "-" { for (k = 9; k <= 10; k++) { m = split($k, b, ","); for (i = 1; i <= m; i++) want[b[i]] = 1 } }
+        END { for (r = 1; r <= NR; r++) { split(rows[r], f, " ")
+                if (f[4] == "-" && (f[3] == "EFI" || (f[2] in want))) print f[2], f[1], f[3] } }' "$ESP_SCAN" | \
+    while read -r _u _d _lb; do
+        msg "WARNING: ESP $_u ($_d, label $_lb) could not be mounted (corrupt filesystem or a failing disk?) - not usable"
+    done
 }
 
 _esp_choose() {
@@ -231,6 +263,16 @@ _esp_warn_set() {
     done
 }
 
+# _esp_fallback UUID WHY ID EXPECTED_UUIDS - no candidate passed its payload
+# check: take the best-ranked one anyway, loudly. CHECKSUM covers only
+# KERNEL+INITRD, not the config/keys chosen here, and a damaged host is
+# where rescue SSH matters most.
+_esp_fallback() {
+    msg "WARNING: no candidate passed its payload check - using the best-ranked ESP $1 ($(_esp_field "$1" 1)) anyway: its KERNEL/INITRD do not match its CHECKSUM, but CHECKSUM does not cover the config and keys taken from it; applying its config"
+    _esp_choose "$1" "$2 (payload check failed)"
+    _esp_warn_set "$3" "$1" "$4"
+}
+
 # _esp_select_list "A B" SOURCE ID - list mode (rules 1, and 3's config list).
 _esp_select_list() {
     _list="$1"
@@ -253,6 +295,7 @@ _esp_select_list() {
     awk '$4=="1" {print $2, $1}' "$ESP_SCAN" | while read -r _u _d; do
         case " $_list " in *" $_u "*) ;; *) msg "ignoring ESP $_u ($_d): not in alpine-zfsboot.esp-uuids ($2)" ;; esac
     done
+    _fb=""
     for _u in $(_esp_order_list "$_list"); do
         _d="$(_esp_field "$_u" 1)"
         if [ "$(_esp_field "$_u" 6)" = valid ] && [ -n "$_lid" ] && [ "$(_esp_field "$_u" 7)" != "$_lid" ]; then
@@ -265,12 +308,17 @@ _esp_select_list() {
         fi
         if ! _esp_payload_ok "$_u"; then
             msg "WARNING: listed ESP $_u ($_d) failed its payload check - trying the next one"
+            [ -n "$_fb" ] || _fb="$_u"
             continue
         fi
         _esp_choose "$_u" "listed in alpine-zfsboot.esp-uuids from $2"
         _esp_warn_set "$_lid" "$_u" "$_list"
         return 0
     done
+    if [ -n "$_fb" ]; then
+        _esp_fallback "$_fb" "listed in alpine-zfsboot.esp-uuids from $2" "$_lid" "$_list"
+        return 0
+    fi
     msg "WARNING: none of the ESPs listed in alpine-zfsboot.esp-uuids ($2: $(echo $_list | tr ' ' ',')) is present and usable - applying NO ESP config (defaults/cmdline only, rescue SSH unconfigured)"
     return 1
 }
@@ -291,6 +339,7 @@ _esp_order_list() {
 esp_select() {
     ESP_SELECTED_DEV="" ESP_SELECTED_UUID="" ESP_SELECTED_INSTALL_ID="" ESP_SELECTED_REASON=""
     _esp_scan
+    _esp_report_unmounted
 
     # 1. explicit list on the command line
     if [ -n "${ESP_SELECT_CMDLINE_LIST:-}" ]; then
@@ -343,6 +392,18 @@ esp_select() {
             return 1
         fi
         _gid="$_ids"
+        # The only marker group present has no LABEL=EFI ESP, but an
+        # unmarked LABEL=EFI ESP holds alpine-zfsboot files: that is the
+        # host's own (legacy, or an update interrupted before MEMBER was
+        # written), the group a foreign disk or rescue stick. The host
+        # ESP wins (rule 4), as before markers existed.
+        if [ -z "$(awk -v id="$_gid" '$6=="valid" && $7==id && $3=="EFI" {print $2}' "$ESP_SCAN")" ] && \
+           [ -n "$(awk '$3=="EFI" && $5=="1" && $6=="none" {print $2}' "$ESP_SCAN")" ]; then
+            for _u in $(awk -v id="$_gid" '$6=="valid" && $7==id {print $2}' "$ESP_SCAN"); do
+                msg "ignoring ESP $_u ($(_esp_field "$_u" 1)): it belongs to installation $_gid, which has no LABEL=EFI ESP here, while an unmarked LABEL=EFI ESP with alpine-zfsboot files is present - that one is this host's"
+            done
+            _gid=""
+        fi
     fi
     if [ -n "$_gid" ]; then
         _cands="$(awk -v id="$_gid" '$6=="valid" && $7==id {print $8, $2}' "$ESP_SCAN" | sort -k1,1nr -k2,2 | awk '{print $2}')"
@@ -368,6 +429,7 @@ esp_select() {
             msg "WARNING: alpine-zfsboot.esp-uuids=$_cl in the config of ESP $_best is malformed - ignored, using the MEMBER markers"
         fi
         _exp="$(_esp_field "$_best" 9 | tr ',' ' ' | sed 's/^-$//')"
+        _fb=""
         for _u in $_cands; do
             _d="$(_esp_field "$_u" 1)"
             if [ "$(_esp_field "$_u" 5)" != 1 ]; then
@@ -376,12 +438,17 @@ esp_select() {
             fi
             if ! _esp_payload_ok "$_u"; then
                 msg "WARNING: ESP $_u ($_d) failed its payload check - trying the next member"
+                [ -n "$_fb" ] || _fb="$_u"
                 continue
             fi
             _esp_choose "$_u" "member of installation $_gid, generation $(_esp_field "$_u" 8)"
             _esp_warn_set "$_gid" "$_u" "$_exp"
             return 0
         done
+        if [ -n "$_fb" ]; then
+            _esp_fallback "$_fb" "member of installation $_gid, generation $(_esp_field "$_fb" 8)" "$_gid" "$_exp"
+            return 0
+        fi
         msg "WARNING: no member of installation $_gid is usable - applying NO ESP config (defaults/cmdline only, rescue SSH unconfigured)"
         return 1
     fi
@@ -389,6 +456,17 @@ esp_select() {
     # 4. no markers anywhere: the pre-0.5.0 rule, unchanged
     _leg="$(awk '$3=="EFI" && $5=="1" && $6=="none" {print $2}' "$ESP_SCAN" | sort)"
     _n="$(printf '%s' "$_leg" | grep -c .)"
+    if [ "$_n" -eq 0 ]; then
+        # a damaged MEMBER marker on the ONLY qualifying LABEL=EFI ESP:
+        # it is still the host's one ESP - legacy use, as before markers
+        _leg="$(awk '$3=="EFI" && $5=="1" && $6=="bad" {print $2}' "$ESP_SCAN" | sort)"
+        if [ "$(printf '%s' "$_leg" | grep -c .)" -eq 1 ]; then
+            msg "WARNING: ESP $_leg ($(_esp_field "$_leg" 1)) is the only alpine-zfsboot LABEL=EFI ESP but its MEMBER marker is unreadable - using it as a legacy ESP; run 'alpine-zfsboot verify'"
+            _n=1
+        else
+            _leg=""
+        fi
+    fi
     if [ "$_n" -eq 0 ]; then
         msg "no alpine-zfsboot ESP found (checked every LABEL=EFI device) - defaults/cmdline only, rescue SSH unconfigured"
         return 1

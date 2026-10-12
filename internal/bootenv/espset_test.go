@@ -2,6 +2,7 @@ package bootenv
 
 import (
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,6 +85,7 @@ func copiedFrom(uuid string) func(*ESPInfo) {
 
 func configList(l string) func(*ESPInfo) { return func(e *ESPInfo) { e.ConfigList = l } }
 func label(l string) func(*ESPInfo)      { return func(e *ESPInfo) { e.Label = l } }
+func badMarker(e *ESPInfo)               { e.MemberErr = errors.New("MEMBER: checksum mismatch") }
 func bare(e *ESPInfo)                    { e.AlpineDir, e.Qualifies = false, false }
 
 func uuidsOf(h HostSet) string { return strings.Join(h.UUIDs(), ",") }
@@ -140,6 +142,28 @@ func TestSelectHost(t *testing.T) {
 		{name: "legacy ESP beside members: ignored with adopt hint",
 			infos: []ESPInfo{esp("/dev/sda1", "AAAA-0001", member(idA, 1)), esp("/dev/sdb1", "BBBB-0001")},
 			mode:  ModeMember, members: "AAAA-0001", ignored: 1},
+		{name: "F4: unmarked LABEL=EFI host ESP beats a lone marker group with no LABEL=EFI ESP (stick); the group is reported ignored",
+			infos: []ESPInfo{esp("/dev/sda1", "AAAA-0001"), esp("/dev/sdc1", "CCCC-0001", member(idB, 9, "CCCC-0001"), label("RESCUE"))},
+			mode:  ModeLegacy, members: "AAAA-0001", ignored: 1},
+		{name: "F4: the lone marker group has a LABEL=EFI ESP: it still wins over the unmarked one",
+			infos: []ESPInfo{esp("/dev/sda1", "AAAA-0001"), esp("/dev/sdc1", "CCCC-0001", member(idB, 9, "CCCC-0001"))},
+			mode:  ModeMember, members: "CCCC-0001", ignored: 1},
+		{name: "F4: two marker groups (one without LABEL=EFI) still refuse",
+			infos:  []ESPInfo{esp("/dev/sda1", "AAAA-0001"), esp("/dev/sdc1", "CCCC-0001", member(idB, 9), label("RESCUE")), esp("/dev/sdd1", "DDDD-0001", member(idA, 9), label("RESCUE"))},
+			errSub: "more than one alpine-zfsboot installation"},
+		{name: "F4: the primary is marked: its group wins, nothing legacy",
+			infos: []ESPInfo{esp("/dev/sda1", "AAAA-0001"), esp("/dev/sdc1", "CCCC-0001", member(idB, 9, "CCCC-0001"), label("RESCUE"))},
+			opts:  SelectOpts{PrimaryUUID: "CCCC-0001"},
+			mode:  ModeMember, members: "CCCC-0001", ignored: 1},
+		{name: "F3: an unreadable MEMBER on the only qualifying LABEL=EFI ESP is a legacy ESP",
+			infos: []ESPInfo{esp("/dev/sda1", "AAAA-0001", badMarker)},
+			mode:  ModeLegacy, members: "AAAA-0001"},
+		{name: "F3: an unreadable MEMBER beside another qualifying ESP is still not a candidate",
+			infos: []ESPInfo{esp("/dev/sda1", "AAAA-0001", badMarker), esp("/dev/sdb1", "BBBB-0001")},
+			mode:  ModeLegacy, members: "BBBB-0001", ignored: 1},
+		{name: "F3: two unreadable-MEMBER ESPs and nothing else: no usable ESP",
+			infos:  []ESPInfo{esp("/dev/sda1", "AAAA-0001", badMarker), esp("/dev/sdb1", "BBBB-0001", badMarker)},
+			errSub: "no alpine-zfsboot ESP found"},
 		{name: "copied marker is not a member",
 			infos: []ESPInfo{esp("/dev/sda1", "AAAA-0001", member(idA, 3)), esp("/dev/sdb1", "BBBB-0001", copiedFrom("AAAA-0001"))},
 			mode:  ModeMember, members: "AAAA-0001", ignored: 1},

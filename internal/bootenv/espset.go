@@ -335,6 +335,34 @@ func SelectHost(infos []ESPInfo, opts SelectOpts) (HostSet, error) {
 		return selectLegacy(infos, counts, ignored)
 	}
 
+	// An unmarked LABEL=EFI ESP with alpine-zfsboot files is the host's
+	// (legacy behaviour) when the only marker group present has no
+	// LABEL=EFI ESP - a foreign stick or moved disk must not outrank it.
+	if len(groups) == 1 {
+		primaryMarked := false
+		if p, ok := infoByUUID(infos, opts.PrimaryUUID); ok && opts.PrimaryUUID != "" && p.ValidMember() {
+			primaryMarked = true
+		}
+		var foreign []ESPInfo
+		hasEFI := false
+		for _, g := range groups {
+			for _, i := range g {
+				foreign = append(foreign, i)
+				hasEFI = hasEFI || i.Label == layout.FATVolumeLabel
+			}
+		}
+		unmarked := false
+		for _, i := range infos {
+			unmarked = unmarked || (i.Label == layout.FATVolumeLabel && i.Qualifies && i.Member == nil && i.MemberErr == nil)
+		}
+		if !primaryMarked && !hasEFI && unmarked {
+			for _, i := range foreign {
+				ignored = append(ignored, Ignored{i, fmt.Sprintf("ignored: belongs to another installation (install id %s) and no ESP of that group is labeled %q, while an unmarked %q ESP with alpine-zfsboot files exists", i.Member.InstallID, layout.FATVolumeLabel, layout.FATVolumeLabel)})
+			}
+			return selectLegacy(infos, counts, ignored)
+		}
+	}
+
 	var id string
 	if p, ok := infoByUUID(infos, opts.PrimaryUUID); ok && opts.PrimaryUUID != "" && p.ValidMember() {
 		if len(counts[p.UUID]) > 1 {
@@ -416,13 +444,29 @@ func SelectHost(infos []ESPInfo, opts SelectOpts) (HostSet, error) {
 }
 
 func selectLegacy(infos []ESPInfo, counts map[string][]string, ignored []Ignored) (HostSet, error) {
-	var qual []ESPInfo
+	var qual, bad []ESPInfo
 	for _, i := range infos {
-		// A copied or unreadable marker is "not a member" - and never a
-		// legacy candidate either (init/esp-select.sh: the same rule).
-		if i.Label == layout.FATVolumeLabel && i.Qualifies && i.Member == nil && i.MemberErr == nil {
-			qual = append(qual, i)
+		// A copied marker is "not a member" - and never a legacy candidate
+		// either (init/esp-select.sh: the same rule). An unreadable one
+		// counts as no marker only when this is the one qualifying ESP.
+		if i.Label == layout.FATVolumeLabel && i.Qualifies && i.Member == nil {
+			if i.MemberErr == nil {
+				qual = append(qual, i)
+			} else {
+				bad = append(bad, i)
+			}
 		}
+	}
+	if len(qual) == 0 && len(bad) == 1 {
+		qual = bad
+		// no longer "ignored": usable as a legacy ESP
+		var rest []Ignored
+		for _, ig := range ignored {
+			if ig.UUID != bad[0].UUID {
+				rest = append(rest, ig)
+			}
+		}
+		ignored = rest
 	}
 	switch len(qual) {
 	case 0:

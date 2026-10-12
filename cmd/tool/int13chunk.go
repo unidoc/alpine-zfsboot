@@ -107,6 +107,9 @@ func setInt13Chunk(mountpoint, value string) error {
 	if bytes.Equal(out, raw) {
 		return nil
 	}
+	if err := checkCmdlineLength(out); err != nil {
+		return err
+	}
 	return espconfig.WriteFile(mountpoint, layout.CmdlineFile, out, 0o644)
 }
 
@@ -145,7 +148,8 @@ On a read failure stage2 still halves the size, starting from N.
 
 Takes effect at the next boot; nothing else in CMDLINE changes, and
 nothing reboots. Use it to A/B a machine that fails to boot in BIOS mode,
-e.g. 8 against 64.`, layout.Int13ChunkKey, layout.Int13ChunkDefault),
+e.g. 8 against 32 (stage2 never issues more than %d sectors at a time; a
+64-sector A/B needs a v0.4.x stage2).`, layout.Int13ChunkKey, layout.Int13ChunkDefault, int13FATBatch),
 		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			value, err := parseInt13Chunk(args[0])

@@ -299,6 +299,12 @@ func runESPAdd(root, firmware string, o hostOpts, arg string, yes bool) int {
 		}
 	}
 	failed := false
+	// A set named by an esp-uuids list (config, BIOS CMDLINE) must name the
+	// new ESP too, or the next run ignores it ("not in the list").
+	if err := h.addToLists(ok, []string{m.info.UUID}); err != nil {
+		printErr(err)
+		failed = true
+	}
 	for x, err := range h.finalizeMembers(ok, gen, poolOf(src.target)) {
 		printErr(fmt.Errorf("%s: %w", x.label(), err))
 		failed = true
@@ -443,6 +449,73 @@ func runESPRemove(root, firmware string, o hostOpts, arg string, yes bool) int {
 	return h.exitCode(false)
 }
 
+// addUUID appends uuid to a comma-separated list unless it is there.
+func addUUID(list, uuid string) string {
+	if list == "" {
+		return uuid
+	}
+	for _, u := range strings.Split(list, ",") {
+		if strings.EqualFold(strings.TrimSpace(u), uuid) {
+			return list
+		}
+	}
+	return list + "," + uuid
+}
+
+// addToLists is runESPRemove's dropUUID counterpart: it appends uuids to the
+// esp-uuids list every member in ms records (EFI/ALPINE/config and, BIOS,
+// CMDLINE). With an explicit list (--esp-uuids, the environment) that list
+// is extended and recorded instead, as update does.
+func (h *host) addToLists(ms []*member, uuids []string) error {
+	for _, u := range uuids {
+		if h.explicitList != nil {
+			h.explicitList = strings.Split(addUUID(strings.Join(h.explicitList, ","), u), ",")
+		}
+	}
+	grow := func(cur string) string {
+		if h.explicitList != nil {
+			return strings.Join(h.explicitList, ",")
+		}
+		if cur == "" {
+			return ""
+		}
+		for _, u := range uuids {
+			cur = addUUID(cur, u)
+		}
+		return cur
+	}
+	for _, m := range ms {
+		if m.target == nil || m.foreign {
+			continue // never write to another installation's ESP
+		}
+		raw, _ := os.ReadFile(filepath.Join(m.mountpoint, layout.ConfigFile))
+		v, _ := espconfig.ConfigValue(raw, layout.ESPUUIDsKey)
+		if nl := grow(v); nl != v {
+			if err := espconfig.SetConfigKey(m.mountpoint, layout.ESPUUIDsKey, nl); err != nil {
+				return fmt.Errorf("%s: %w", m.label(), err)
+			}
+		}
+		if h.uefi {
+			continue
+		}
+		c, err := os.ReadFile(filepath.Join(m.mountpoint, layout.CmdlineFile))
+		if err != nil {
+			continue
+		}
+		v = cmdlineValue(string(c), layout.ESPUUIDsKey)
+		if nl := grow(v); nl != v {
+			nc := setCmdlineWord(c, layout.ESPUUIDsKey, nl)
+			if err := checkCmdlineLength(nc); err != nil {
+				return fmt.Errorf("%s: %w", m.label(), err)
+			}
+			if err := espconfig.WriteFile(m.mountpoint, layout.CmdlineFile, nc, 0o644); err != nil {
+				return fmt.Errorf("%s: %w", m.label(), err)
+			}
+		}
+	}
+	return nil
+}
+
 func dropUUID(list, uuid string) string {
 	var out []string
 	for _, u := range strings.Split(list, ",") {
@@ -582,9 +655,33 @@ func runESPAdopt(args []string, yes, forceAdopt bool) int {
 			ok = append(ok, m)
 		}
 	}
-	for m, err := range h.finalizeMembers(ok, gen, "") {
-		printErr(fmt.Errorf("%s: %w", m.label(), err))
+	// An adopted ESP may be stale (hand-copied): it gets the set's current
+	// generation, the members that were already there one more, so it can
+	// never tie with them for bestSource ('update' then brings it in line).
+	var adopted, existing []*member
+	for _, m := range ok {
+		if m.added {
+			adopted = append(adopted, m)
+		} else {
+			existing = append(existing, m)
+		}
+	}
+	var adoptedUUIDs []string
+	for _, m := range adopted {
+		adoptedUUIDs = append(adoptedUUIDs, m.info.UUID)
+	}
+	if err := h.addToLists(ok, adoptedUUIDs); err != nil {
+		printErr(err)
 		failed = true
+	}
+	for _, grp := range []struct {
+		ms  []*member
+		gen uint64
+	}{{adopted, gen}, {existing, gen + 1}} {
+		for m, err := range h.finalizeMembers(grp.ms, grp.gen, "") {
+			printErr(fmt.Errorf("%s: %w", m.label(), err))
+			failed = true
+		}
 	}
 	if failed {
 		return exitFailure

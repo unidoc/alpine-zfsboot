@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""fat_lba.py IMAGE PATH OFFSET - prints the 512-byte LBA (from the start of
+"""fat_lba.py IMAGE PATH OFFSET [fat] - prints the 512-byte LBA (from the start of
 IMAGE) holding byte OFFSET of PATH (e.g. EFI/ALPINE/KERNEL) on the image's
 FAT32 ESP: an MBR partition of type 0x2E (alpine-zfsboot's msdos layout) or
-the GPT EFI System Partition (installed disks, the ISO). For the fault-
+the GPT EFI System Partition (installed disks, the ISO). With a
+4th argument "fat" it prints the LBA of the FAT-TABLE sector holding that
+cluster's chain entry. For the fault-
 injection boots (DISK_FI_LBA=...), which must damage one exact block."""
 import struct
 import sys
@@ -79,7 +81,11 @@ def main():
                 sys.exit(f"{comp} not found")
         assert offset < size, (offset, size)
         cl = chain(cluster)[offset // (spc * 512)]
-        print(data_lba + (cl - 2) * spc + (offset % (spc * 512)) // 512)
+        if len(sys.argv) > 4 and sys.argv[4] == "fat":
+            # the FAT-table sector fat_get_next_cluster() reads to step past that cluster
+            print(fat_lba + (cl * 4) // 512)
+        else:
+            print(data_lba + (cl - 2) * spc + (offset % (spc * 512)) // 512)
 
 
 main()

@@ -651,6 +651,29 @@ case "$scenario" in
             saw "summary: blocks mism 0001 reread 0001 healed 0001 2nd 0000 bad 0000" "...the block was re-read once and healed (summary printed without diag)" &&
             case "$seen" in *"verifying kernel+initrd"*" ok"*) ok "...and the kernel in RAM matches the file (end-to-end SHA-256)" ;; *) echo "$seen" >&2; bad "end-to-end check failed after healing" ;; esac
         ;;
+    fi-fat-zero | fi-fat-wronglba | fi-fat-stale)
+        # CF=0 with wrong data (twice) in the FAT-TABLE sector that holds
+        # KERNEL's chain entry for a cluster ~2.6 MiB into the file (not in
+        # a data sector): the chain walk derails, which no block re-read
+        # repairs - load_file() must resume from the first undelivered byte
+        # with the FAT cache dropped.
+        k=${scenario#fi-fat-}
+        case "$k" in zero) m=2 ;; stale) m=3 ;; wronglba) m=4 ;; esac
+        build_disk "$W/KERNEL" "$W/CMDLINE" "$W/CHECKSUM" 0
+        FL=$(python3 "$REPO_ROOT/tests/fat_lba.py" "$W/disk.img" EFI/ALPINE/KERNEL $((5 * 512 + 40 * 65536 + 777)) fat)
+        fi_build "-DDISK_FI_MODE=$m -DDISK_FI_LBA=$FL -DDISK_FI_TIMES=2"
+        put_stages
+        fi_reset
+        boot 256
+        ALLOW_NO_DOTS=1 expect_boot "CF=0 with wrong data twice ($k) in a KERNEL FAT-table sector: boots" &&
+            case "$k" in
+            zero) saw "retrying from the failed offset" "...after a visible retry from the failed offset" ;;
+            wronglba) saw "retrying from the failed offset" "...after a visible retry from the failed offset" &&
+                saw "bad 0000" "...no block stayed wrong" ;;
+            *) ok "...(the stale walk only mis-places blocks, which the block check heals)" ;;
+            esac &&
+            case "$seen" in *"verifying kernel+initrd"*" ok"*) ok "...and kernel+initrd in RAM match the files (end-to-end SHA-256)" ;; *) echo "$seen" >&2; bad "end-to-end check failed" ;; esac
+        ;;
     fi-above-flip | fi-above-zero | fi-above-stale | fi-above-wronglba | fi-above-short)
         k=${scenario#fi-above-}
         case "$k" in flip) m=1 ;; zero) m=2 ;; stale) m=3 ;; wronglba) m=4 ;; short) m=5 ;; esac
@@ -698,6 +721,7 @@ case "$scenario" in
         expect_boot "persistent wrong data on drive 80, a mirror on drive 81: boots" &&
             saw "diag: second source drive 81 KERNEL block 0003" "...block 3 read from drive 81" &&
             saw "healed 0000 2nd 0001 bad 0000" "...and counted as served by the second source" &&
+            saw " cap 0010 now 0010" "...with the boot drive's cap intact after the second-source probe" &&
             case "$seen" in *"verifying kernel+initrd"*" ok"*) ok "...and the kernel in RAM matches the file" ;; *) echo "$seen" >&2; bad "end-to-end check failed" ;; esac
         rm -f "$W/disk2.img"
         ;;

@@ -349,7 +349,8 @@ The mode is stored in CHECKSUM (`--integrity=off|warn|enforce` on
 `alpine-zfsboot integrity <mode>`, which rewrites the file atomically;
 `status` shows it). `alpine-zfsboot.integrity=off|warn|enforce` in
 `EFI/ALPINE/CMDLINE` overrides it for a boot: command line, then
-CHECKSUM, then `warn`. No CHECKSUM (an install from before it existed):
+CHECKSUM, then `warn`; `verify` and `status` judge a mismatch by this
+effective mode, not by CHECKSUM's alone. No CHECKSUM (an install from before it existed):
 one notice line, the boot is unchanged; `status`/`verify` show it as
 INFO and do not fail, `update` or `verify --repair` adds it.
 
@@ -451,6 +452,14 @@ disk and ISO stage2 handle both:
   healed, the rest of that file is only checked and counted (no more
   re-reads, no report per block, one line with the count): a file whose
   every block is wrong must not turn the boot into hours of re-reads.
+- **The FAT table is read through the same BIOS call.** A FAT-table
+  sector delivered wrong (CF=0) derails the chain walk, which no block
+  re-read repairs. When the walk fails, stage2 prints the usual `fat:`
+  line plus `retrying from the failed offset`, resets the controller,
+  drops its FAT cache and resumes from the first byte not yet delivered
+  (up to 10 attempts). If the chain still ends early after that, the
+  `fat:` line says a FAT read may have been wrong, not only that the
+  filesystem is damaged: check the disk or controller before `fsck`.
 - **A second source.** A block still wrong after that is read from
   another BIOS hard disk (0x80.. as many as the BIOS reports) whose ESP
   has a CHECKSUM describing exactly the same KERNEL and INITRD (a
@@ -717,6 +726,14 @@ alpine-zfsboot esp add /dev/sdb2         # copies the installed boot chain, conf
                                          # keys and host key - no download
 ```
 
+On a host whose set is named by an `alpine-zfsboot.esp-uuids=` list
+(config, BIOS `CMDLINE`), `esp add` (and `update --add-esp`, `esp adopt`)
+also appends the new ESP's UUID to that list on every member, as
+`esp remove` drops it - otherwise the next run would ignore the new ESP.
+An ESP taken in with `esp adopt` gets a generation one below the members
+that were already there, so a stale hand-copied ESP can never become the
+source its siblings are updated from; `update` then brings it in line.
+
 **Two ESPs copied by hand before 0.5.0** (both carry alpine-zfsboot
 files, no markers - init refuses to choose between them and applies
 neither's config):
@@ -754,7 +771,11 @@ ESP of the set without any option:
   rolled-back writes as a single ESP. A failure on one ESP leaves that
   ESP on its previous build (it still boots) and the run goes on to the
   others; the summary names the ESP that failed and the run exits 1. An
-  ESP that is already up to date is left alone. `config`,
+  ESP that is already up to date is left alone - unless it carries the
+  same build as the best ESP but different content (a setting written
+  while it was absent, bit rot in `KERNEL`): `update` then rewrites it from
+  the best ESP, payload first and its generation last (it refuses to copy
+  from a best ESP that itself fails its `CHECKSUM`). `config`,
   `authorized_keys` and the host key are copied from the newest ESP to
   the others.
 - `verify` checks every ESP as it checks a single one, then **compares
@@ -827,15 +848,35 @@ config, `authorized_keys` and host key it applies, strongest rule first:
    `alpine-zfsboot.esp-uuids=`, step 1 applies with that list - taken only
    from this installation's own ESP, never from an arbitrary one.
 4. No marker anywhere (every install before 0.5.0): exactly the old
-   rule - one qualifying `LABEL=EFI` ESP is used; several are refused,
+   rule - one qualifying `LABEL=EFI` ESP is used (a `MEMBER` that cannot
+   be read does not disqualify the only such ESP); several are refused,
    now with a message that names their UUIDs and the two ways out
    (`esp adopt ... --yes`, or `alpine-zfsboot.esp-uuids=`). Two unmarked
    ESPs whose configs carry the same `alpine-zfsboot.esp-uuids=` list are
    used as that list.
 
+If an unmarked `LABEL=EFI` ESP with alpine-zfsboot files exists and the
+only marker group present has no `LABEL=EFI` ESP (a rescue stick, a disk
+moved in from another machine), the unmarked host ESP is used as before
+0.5.0 (rule 4) and the foreign group is reported as ignored; two or more
+marker groups are still refused.
+
 In steps 1 and 3 the chosen ESP must also carry a boot binary or `KERNEL`
 and config/keys, and - when it has a `CHECKSUM` - its `KERNEL`/`INITRD`
-must match it; otherwise the next best ESP is used, with a warning.
+must have the sizes it records (sizes only: `init` does not hash the
+whole payload on every boot; the content hash is checked by the BIOS
+loader and by `alpine-zfsboot verify`); otherwise the next best ESP is
+used, with a warning. When no candidate passes, the best-ranked one is
+used anyway, with a warning that names it: `CHECKSUM` does not cover
+the config and keys, and a host with a damaged payload is the one that
+needs rescue SSH. An unmountable ESP that is `LABEL=EFI` or named by a
+list or a `MEMBERS=` line is reported in a message. When the only marker
+group present has no `LABEL=EFI` ESP but an unmarked `LABEL=EFI` ESP with
+alpine-zfsboot files exists (the host's own, next to a foreign rescue
+stick), the unmarked host ESP wins and the foreign group is reported as
+ignored; two marker groups are still refused. An unreadable `MEMBER`
+marker on the only `LABEL=EFI` alpine-zfsboot ESP is treated as a legacy
+ESP (used, with a warning).
 Members that are expected (`MEMBERS=`, or the list) but not present are
 named in a warning; stale ones too.
 
@@ -1137,7 +1178,8 @@ alpine-zfsboot.net.mac=52:54:00:ab:cd:02
 ```
 
 When rescue SSH is brought up, the card with that address is found in
-`/sys/class/net/*/address` (any case, `:` or `-` separators; the
+`/sys/class/net/*/address` (any case, `:` or `-` separators; spaces or
+tabs around the value are ignored; the
 loopback device and virtual interfaces - bridges, bonds, VLANs, which
 copy a card's MAC - are ignored). A card whose driver is still loading
 is waited for, up to 15 seconds, with a message. A MAC that no card has

@@ -337,6 +337,7 @@ static void report_fat_failure(void)
 	if (g_fat_error.reason == FAT_ERR_CHAIN_END) {
 		console_puts(" entry=");
 		console_puts_hex32(g_fat_error.value);
+		console_puts(" (a FAT read may have been wrong)");
 	}
 	console_puts(" bytes-left=");
 	console_puts_hex32(g_fat_error.remaining);
@@ -711,6 +712,7 @@ struct load_ctx {
 	const struct fat_volume *vol;
 	const struct fat_file *file;
 	uint32_t file_off; /* where the RAM range starts in the file */
+	uint32_t done;     /* bytes of the range delivered so far */
 	uint8_t which;     /* 0 KERNEL, 1 INITRD */
 	uint8_t checking;
 };
@@ -722,6 +724,7 @@ static void load_progress(void *ctx, uint32_t bytes_done)
 	struct load_ctx *lc = (struct load_ctx *)ctx;
 
 	progress_dot(&lc->st, bytes_done);
+	lc->done += bytes_done;
 	if (lc->checking)
 		blkv_landed(&lc->bv, bytes_done);
 }
@@ -827,10 +830,15 @@ static struct {
 static uint8_t g_boot_drive;
 
 /* Back to the boot drive after using another one. */
-SMALL static void alt_leave(uint16_t chunk)
+SMALL static void alt_leave(uint16_t chunk, uint16_t cap)
 {
-	disk_select(g_boot_drive);
+	if (disk_select(g_boot_drive) != 0) {
+		disk_reset();
+		if (disk_select(g_boot_drive) != 0)
+			console_puts("\nalpine-zfsboot-bios: boot drive not re-selected\n");
+	}
 	disk_set_chunk(chunk);
+	g_disk_stats.cap = cap; /* the summary's cap is the boot drive's, as in hook_set_cap */
 	fat_cache_invalidate();
 }
 
@@ -868,6 +876,7 @@ SMALL static int hook_second(struct blkv *b, uint32_t off, uint32_t len)
 {
 	struct load_ctx *lc = (struct load_ctx *)b->ctx;
 	uint16_t chunk = disk_get_chunk();
+	uint16_t cap = g_disk_stats.cap;
 	int r = -1;
 
 	if (!g_alt.probed) {
@@ -883,7 +892,7 @@ SMALL static int hook_second(struct blkv *b, uint32_t off, uint32_t len)
 				break;
 			}
 		}
-		alt_leave(chunk);
+		alt_leave(chunk, cap);
 	}
 	if (!g_alt.drive)
 		return -1;
@@ -892,7 +901,7 @@ SMALL static int hook_second(struct blkv *b, uint32_t off, uint32_t len)
 		disk_set_chunk(chunk);
 		r = fat_read_range(&g_alt.vol, &g_alt.f[lc->which], lc->file_off + off, len, b->base + off, 0, 0);
 	}
-	alt_leave(chunk);
+	alt_leave(chunk, cap);
 	if (g_diag) {
 		console_puts("\ndiag: second source drive ");
 		puthexn(g_alt.drive, 2);
@@ -926,6 +935,7 @@ SMALL static int load_file(uint8_t which, const struct fat_volume *vol, const st
                            uint32_t len, uint32_t dst)
 {
 	struct load_ctx *lc = &g_load[which];
+	int t;
 
 	lc->vol = vol;
 	lc->file = file;
@@ -936,8 +946,19 @@ SMALL static int load_file(uint8_t which, const struct fat_volume *vol, const st
 	lc->checking = g_blk_loaded && g_sum_loaded;
 	if (lc->checking)
 		blkv_start(&lc->bv, &g_blkv_hooks, lc, dst, len, g_blk.f[which].nblocks, g_fat_io_buf_ptr, g_fat_io_buf_size);
-	if (fat_read_range(vol, file, file_off, len, dst, load_progress, lc) != 0)
-		return -1;
+	/* A FAT-table sector delivered wrong (CF=0) derails the chain walk,
+	 * which no block re-read repairs: resume from the first byte not yet
+	 * delivered (the progress callback runs only after the bytes are in
+	 * RAM), with the FAT cache dropped. */
+	lc->done = 0;
+	for (t = 0; fat_read_range(vol, file, file_off + lc->done, len - lc->done, dst + lc->done, load_progress, lc) != 0; t++) {
+		if (t + 1 >= GPT_RETRY_ATTEMPTS)
+			return -1;
+		report_fat_failure();
+		console_puts("alpine-zfsboot-bios: retrying from the failed offset\n");
+		disk_reset();
+		fat_cache_invalidate();
+	}
 	if (lc->checking && lc->bv.unreported) {
 		console_puts("\n");
 		say("integrity: ");

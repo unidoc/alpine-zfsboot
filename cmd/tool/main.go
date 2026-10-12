@@ -846,7 +846,7 @@ func inspectPayloadSum(mountpoint string) (present bool, mode string, err error)
 			continue // reported as missing by inspect() itself
 		}
 		if uint64(st.Size()) != uint64(f.want) {
-			return true, m.Mode, fmt.Errorf("%s is %d bytes but %s records %d - stale manifest or a changed file (the BIOS loader %s)", f.rel, st.Size(), layout.PayloadSumFile, f.want, mismatchAction(m.Mode))
+			return true, m.Mode, fmt.Errorf("%s is %d bytes but %s records %d - stale manifest or a changed file (the BIOS loader %s)", f.rel, st.Size(), layout.PayloadSumFile, f.want, mismatchAction(effectiveIntegrity(mountpoint, m.Mode)))
 		}
 	}
 	return true, m.Mode, nil
@@ -861,6 +861,17 @@ func cmdlineIntegrity(cmd string) string {
 		}
 	}
 	return ""
+}
+
+// effectiveIntegrity is the mode stage2 applies: a valid
+// alpine-zfsboot.integrity= in CMDLINE wins over CHECKSUM's MODE.
+func effectiveIntegrity(mountpoint, checksumMode string) string {
+	if raw, err := os.ReadFile(filepath.Join(mountpoint, layout.CmdlineFile)); err == nil {
+		if v := cmdlineIntegrity(string(raw)); v != "" {
+			return v
+		}
+	}
+	return checksumMode
 }
 
 // integrityModeHelp/mismatchAction: what the BIOS loader does per mode.
@@ -1015,12 +1026,13 @@ func verifyPayloadSum(t *target, r *report, repair bool) []error {
 	}
 	r.payloadSumVerified = len(errs) == 0
 	r.payloadSumMode = m.Mode
-	if len(errs) > 0 && m.Mode != payloadsum.ModeEnforce {
-		// MODE warn: the BIOS loader prints the mismatch and boots anyway,
-		// so this is a warning, not a verify failure (the metadata check
-		// above already fails verify when the payload itself changed).
+	if eff := effectiveIntegrity(t.mountpoint, m.Mode); len(errs) > 0 && eff != payloadsum.ModeEnforce {
+		// Effective mode warn/off: the BIOS loader prints the mismatch and
+		// boots anyway, so this is a warning, not a verify failure (the
+		// metadata check above already fails verify when the payload
+		// itself changed).
 		for _, e := range errs {
-			fmt.Fprintf(os.Stderr, "alpine-zfsboot: WARNING: %v (integrity mode %s: the BIOS loader does not refuse it)\n", e, m.Mode)
+			fmt.Fprintf(os.Stderr, "alpine-zfsboot: WARNING: %v (integrity mode %s: the BIOS loader does not refuse it)\n", e, eff)
 		}
 		r.payloadSumWarn = true
 		return nil
@@ -1623,6 +1635,10 @@ var (
 // variable only so a test can make one member's manifest write fail.
 var writeManifestFile = espconfig.WriteFile
 
+// removeManifestFile removes the old CHECKSUM/BLKSUM before a new payload
+// is written; a variable so tests can fail one of the two removals.
+var removeManifestFile = os.Remove
+
 // checkStagePair refuses, before anything is written, a stage2 that the
 // stage1 being installed (or any stage1 since v0.2.0) would not jump into:
 // no magic word, or a length/checksum that does not add up. stage1 and
@@ -1850,7 +1866,10 @@ func writePayloadWithRollback(mountpoint, arch, version, buildStamp string, kern
 	// CHECKSUM first, then BLKSUM: from here on there is no manifest at all
 	// (stage2 boots unverified, with a notice) until both are written again.
 	for _, rel := range []string{layout.PayloadSumFile, layout.BlkSumFile} {
-		if err := os.Remove(filepath.Join(mountpoint, rel)); err != nil && !os.IsNotExist(err) {
+		if err := removeManifestFile(filepath.Join(mountpoint, rel)); err != nil && !os.IsNotExist(err) {
+			// CHECKSUM may already be gone: put the old payload and its
+			// manifests back, so enforce does not silently become "unverified".
+			rollbackPayload(mountpoint, backup)
 			return fmt.Errorf("removing the previous %s before writing a new payload: %w", rel, err)
 		}
 	}

@@ -11,5 +11,5 @@
 set -eu
 HDD_TEST_SCENARIOS="fi-transient-flip fi-transient-zero fi-transient-stale fi-transient-wronglba fi-transient-short \
 fi-above-flip fi-above-zero fi-above-stale fi-above-wronglba fi-above-short \
-fi-persistent fi-persistent-enforce fi-allbad fi-second fi-noext fi-4k" \
+fi-persistent fi-persistent-enforce fi-allbad fi-second fi-fat-zero fi-fat-wronglba fi-fat-stale fi-noext fi-4k" \
     exec "$(dirname "$0")/bios-hdd-entry-test.sh"

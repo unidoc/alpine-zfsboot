@@ -9557,8 +9557,13 @@ for x in vda1 vdb1; do
       echo "INITRD 4096 0 $(sha256sum < "$E/esps/$x/EFI/ALPINE/INITRD" | cut -d' ' -f1)"; } > "$E/esps/$x/EFI/ALPINE/CHECKSUM"
 done
 expect_esp "CHECKSUM present and matching: the best member" "$E" "rc=0 dev=/dev/vda1"
+# /init checks sizes only (no 40+ MiB hashing on every boot): a same-size
+# byte flip is left to stage2 and 'alpine-zfsboot verify'; a truncated
+# KERNEL is caught here.
 printf 'X' | dd of="$E/esps/vda1/EFI/ALPINE/KERNEL" bs=1 seek=1000 conv=notrunc 2>/dev/null
-expect_esp "best member fails its CHECKSUM: the next member" "$E" "rc=0 dev=/dev/vdb1" "" "" "KERNEL on /dev/vda1 does not match its CHECKSUM"
+expect_esp "same-size byte change: not hashed in /init, best member still used" "$E" "rc=0 dev=/dev/vda1" "" "" ""
+head -c 1500 "$E/esps/vda1/EFI/ALPINE/KERNEL" > "$E/KERNEL.cut"; cp "$E/KERNEL.cut" "$E/esps/vda1/EFI/ALPINE/KERNEL"
+expect_esp "best member fails its CHECKSUM (size): the next member" "$E" "rc=0 dev=/dev/vdb1" "" "" "KERNEL on /dev/vda1 is missing or does not have the size its CHECKSUM records"
 sed -i '1s/.*/alpine-zfsboot payload-sum 2/' "$E/esps/vda1/EFI/ALPINE/CHECKSUM"
 expect_esp "a CHECKSUM of an unknown format is never a mismatch" "$E" "rc=0 dev=/dev/vda1"
 rm -rf "$E"
@@ -9567,6 +9572,65 @@ E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
 mk_member "$E" vda1 "$ID_A" 7 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 6 AAAA-0001,BBBB-0002 BBBB-0002
 cp -a "$E/esps/vda1" "$E/esps/vda1.real"; : > "$E/esps/vda1/.mountfail"
 expect_esp "best member does not mount (corrupt FAT): the next member" "$E" "rc=0 dev=/dev/vdb1"
+rm -rf "$E"
+
+# mk_sum E DEV - KERNEL/INITRD and a matching CHECKSUM (review of PR #25, F3).
+mk_sum() {
+    head -c 2048 /dev/urandom > "$1/esps/$2/EFI/ALPINE/KERNEL"; head -c 4096 /dev/urandom > "$1/esps/$2/EFI/ALPINE/INITRD"
+    { echo "alpine-zfsboot payload-sum 1"; echo "MODE warn"
+      echo "KERNEL 2048 512 $(tail -c +513 "$1/esps/$2/EFI/ALPINE/KERNEL" | sha256sum | cut -d' ' -f1)"
+      echo "INITRD 4096 0 $(sha256sum < "$1/esps/$2/EFI/ALPINE/INITRD" | cut -d' ' -f1)"; } > "$1/esps/$2/EFI/ALPINE/CHECKSUM"
+}
+
+# F3: a single marked ESP whose payload fails its CHECKSUM still gives its config.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_member "$E" vda1 "$ID_A" 5 AAAA-0001 AAAA-0001; mk_sum "$E" vda1
+expect_esp "single marked ESP, payload intact" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001 id=$ID_A"
+head -c 1000 "$E/esps/vda1/EFI/ALPINE/KERNEL" > "$E/cut"; cp "$E/cut" "$E/esps/vda1/EFI/ALPINE/KERNEL"
+expect_esp "single marked ESP, damaged KERNEL: config still applied, with a warning naming it" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001 id=$ID_A" "" "" "using the best-ranked ESP AAAA-0001 (/dev/vda1) anyway"
+expect_esp "single marked ESP, damaged KERNEL (cmdline list): config still applied, with a warning" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001" "AAAA-0001" "" "no candidate passed its payload check"
+rm -rf "$E"
+
+# F3: both members of a mirror fail the check: the best-ranked (highest generation) one is used.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 7 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 6 AAAA-0001,BBBB-0002 BBBB-0002
+mk_sum "$E" vda1; mk_sum "$E" vdb1
+: > "$E/esps/vda1/EFI/ALPINE/KERNEL"; : > "$E/esps/vdb1/EFI/ALPINE/INITRD"
+expect_esp "mirror, every member fails its payload check: best-ranked member, with a warning" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001" "" "" "no candidate passed its payload check"
+rm -rf "$E"
+
+# F3: a damaged MEMBER on the only LABEL=EFI ESP: legacy use, as before markers.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001
+printf 'alpine-zfsboot esp-member 1\nGARBAGE\n' > "$E/esps/vda1/EFI/ALPINE/MEMBER"
+expect_esp "damaged MEMBER on the only LABEL=EFI ESP: used as a legacy ESP" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001 id=" "" "" "MEMBER marker is unreadable - using it as a legacy ESP"
+mk_esp "$E" vdb1 BBBB-0002
+printf 'alpine-zfsboot esp-member 1\nGARBAGE\n' > "$E/esps/vdb1/EFI/ALPINE/MEMBER"
+expect_esp "two damaged-MEMBER LABEL=EFI ESPs: still refused (no legacy guess)" "$E" "rc=1 dev= "
+rm -rf "$E"
+
+# F4: unmarked LABEL=EFI host ESP + a marked foreign stick without LABEL=EFI: the host ESP wins.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" sdc1 CCCC-0003 RESCUE; mk_member "$E" sdc1 "$ID_B" 2 CCCC-0003 CCCC-0003
+printf 'ssh-ed25519 AAAAFOREIGN other-host\n' > "$E/esps/sdc1/EFI/ALPINE/authorized_keys"
+expect_esp "unmarked LABEL=EFI host ESP + marked foreign stick: the host ESP wins" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001 id=" "" "" "ignoring ESP CCCC-0003 (/dev/sdc1): it belongs to installation $ID_B, which has no LABEL=EFI ESP here"
+rm -rf "$E"
+# ... a marked group that does have a LABEL=EFI ESP still beats the unmarked one (unchanged).
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002; mk_member "$E" vdb1 "$ID_A" 2 BBBB-0002 BBBB-0002
+expect_esp "marked LABEL=EFI member still beats an unmarked LABEL=EFI ESP" "$E" "rc=0 dev=/dev/vdb1 uuid=BBBB-0002"
+rm -rf "$E"
+# ... two marker groups still refuse, even with an unmarked host ESP.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" sdc1 CCCC-0003 RESCUE; mk_member "$E" sdc1 "$ID_B" 2 CCCC-0003 CCCC-0003
+mk_esp "$E" sdd1 DDDD-0004 STICK; mk_member "$E" sdd1 "$ID_A" 2 DDDD-0004 DDDD-0004
+expect_esp "two marker groups: still refused" "$E" "rc=1 dev= " "" "" "more than one alpine-zfsboot installation"
+rm -rf "$E"
+
+# F8: an unmountable newest member is named, not skipped silently.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002
+mk_member "$E" vda1 "$ID_A" 3 AAAA-0001,BBBB-0002 AAAA-0001; mk_member "$E" vdb1 "$ID_A" 9 AAAA-0001,BBBB-0002 BBBB-0002
+: > "$E/esps/vdb1/.mountfail"
+expect_esp "unmountable newest member (cmdline list): named in a message, the other member used" "$E" "rc=0 dev=/dev/vda1" "AAAA-0001,BBBB-0002" "" "ESP BBBB-0002 (/dev/vdb1, label EFI) could not be mounted"
+expect_esp "unmountable newest member (MEMBERS marker): named in a message" "$E" "rc=0 dev=/dev/vda1" "" "" "ESP BBBB-0002 (/dev/vdb1, label EFI) could not be mounted"
+rm -rf "$E"
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" sdc1 JUNK-0001 STICK; : > "$E/esps/sdc1/.mountfail"
+if run_esp_select "$E" | grep -q "JUNK-0001"; then bad "esp-select: an unrelated unmountable stick must not be reported"; else ok "esp-select: an unrelated unmountable stick is not reported"; fi
 rm -rf "$E"
 
 # =============================================================================
@@ -9674,6 +9738,12 @@ for badmac in "52:54:00:00:01" "zz:54:00:00:00:01" "52:54-00:00:00:01" "ff:ff:ff
     out="$(run_resolve "$d" "$badmac")"
     if printf '%s' "$out" | grep -q "RESOLVED rc=1 iface=$"; then ok "malformed/unusable net.mac '$badmac' refused"; else echo "$out"; bad "malformed net.mac '$badmac' accepted"; fi
 done
+for spacy in "52:54:00:aa:bb:02 " " 52:54:00:aa:bb:02" "$(printf '\t52:54:00:aa:bb:02 \t')"; do
+    out="$(run_resolve "$d" "$spacy")"
+    case "$out" in *"RESOLVED rc=0 iface=eth1"*) ok "net.mac with surrounding spaces/tabs is trimmed (shell)" ;; *) echo "$out"; bad "net.mac with surrounding whitespace not trimmed" ;; esac
+done
+out="$(run_resolve "$d" "   ")"
+case "$out" in *"RESOLVED rc=0 iface=eth0"*) ok "net.mac of only blanks counts as unset" ;; *) echo "$out"; bad "blank net.mac" ;; esac
 rm -rf "$d"
 
 d="$(mktemp -d)"
@@ -9746,7 +9816,7 @@ rm -rf "$d"
 echo "== menu.py: rescue_iface() follows alpine-zfsboot.net.mac= with the same rules =="
 d="$(mktemp -d)"
 fake_sysnet "$d" 'eth0|pci0000:00/0000:00:03.0|52:54:00:00:00:01' 'eth1|pci0000:00/0000:00:04.0|52:54:00:aa:bb:02' 'br0|virtual/net|52:54:00:aa:bb:02'
-for c in "|eth0|" "52:54:00:AA:BB:02|eth1|" "52-54-00-00-00-01|eth0|" "52:54:00:00:00:09||no network card has MAC 52:54:00:00:00:09" "bogus||is not a network card"; do
+for c in "|eth0|" "52:54:00:AA:BB:02|eth1|" "52-54-00-00-00-01|eth0|" "52:54:00:aa:bb:02 |eth1|" "52:54:00:00:00:09||no network card has MAC 52:54:00:00:00:09" "bogus||is not a network card"; do
     mac="${c%%|*}"; rest="${c#*|}"; want_if="${rest%%|*}"; want_err="${rest#*|}"
     out="$(STUB_ROOT="$d" ALPINE_ZFSBOOT_NET_MAC="$mac" python3 - "$REPO_ROOT/init" <<'PYEOF' 2>&1
 import sys

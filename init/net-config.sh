@@ -128,6 +128,14 @@ wait_for_global_ipv6() {
 # internal/netmac (Go, `alpine-zfsboot status`) applies the same rules.
 net_resolve_iface() {
     mac="${ALPINE_ZFSBOOT_NET_MAC:-}"
+    # one rule everywhere (menu.py, Go): surrounding spaces/tabs are trimmed
+    while :; do
+        case "$mac" in
+            ' '*|"$(printf '\t')"*) mac="${mac#?}" ;;
+            *' '|*"$(printf '\t')") mac="${mac%?}" ;;
+            *) break ;;
+        esac
+    done
     if [ -z "$mac" ]; then
         echo eth0
         return 0

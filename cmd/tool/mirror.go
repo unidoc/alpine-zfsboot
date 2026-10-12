@@ -42,6 +42,7 @@ import (
 	"github.com/unidoc/alpine-zfsboot/internal/espmember"
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
 	"github.com/unidoc/alpine-zfsboot/internal/netmac"
+	"github.com/unidoc/alpine-zfsboot/internal/payloadsum"
 	"github.com/unidoc/alpine-zfsboot/internal/release"
 	"github.com/unidoc/alpine-zfsboot/internal/uefiboot"
 )
@@ -891,8 +892,9 @@ func rescueNIC(t *target) (mac, source string) {
 		}
 	}
 	if raw, err := os.ReadFile(filepath.Join(t.mountpoint, layout.ConfigFile)); err == nil {
-		if v, ok := espconfig.ConfigValue(raw, layout.NetMACKey); ok && v != "" {
-			return v, layout.ConfigFile
+		// Surrounding spaces/tabs are trimmed, as in netmac.Normalize.
+		if v, ok := espconfig.ConfigValue(raw, layout.NetMACKey); ok && strings.Trim(v, " \t") != "" {
+			return strings.Trim(v, " \t"), layout.ConfigFile
 		}
 	}
 	return "", ""
@@ -1181,8 +1183,34 @@ func runUpdate(root, firmware string, o hostOpts, yes bool, efiSrc release.Sourc
 			}
 			r.wrote, r.err = updateBIOSTarget(m.target, biosA, memberYes, opts, mo)
 		}
+		// Same build, different content (a setting written while this
+		// member was absent, bit rot): rewrite it from the best member -
+		// payload first, MEMBER (the generation) last, as for any member.
+		if !r.wrote && r.err == nil && !seed && src != nil && src != m && src.mountErr == nil {
+			r.wrote, r.err = h.repairMember(src, m)
+		}
 		if r.wrote {
 			anyWrite = true
+		}
+	}
+
+	// An ESP added now joins the esp-uuids list the set records.
+	var added []string
+	var addedOn []*member
+	for _, m := range h.members {
+		if res[m].err == nil && m.target != nil {
+			addedOn = append(addedOn, m)
+			if m.added {
+				added = append(added, m.info.UUID)
+			}
+		}
+	}
+	if len(added) > 0 {
+		if err := h.addToLists(addedOn, added); err != nil {
+			printErr(err)
+			if src != nil {
+				res[src].err = err
+			}
 		}
 	}
 
@@ -1236,6 +1264,44 @@ func runUpdate(root, firmware string, o hostOpts, yes bool, efiSrc release.Sourc
 	}
 	h.warnMissing()
 	return h.exitCode(failed)
+}
+
+// repairMember rewrites m from src when it carries the same build but
+// differs in content (compareMembers' "DIFFERS" case). A member of another
+// build is left to the normal update/STALE logic.
+func (h *host) repairMember(src, m *member) (wrote bool, err error) {
+	ds, dm := digestMember(src), digestMember(m)
+	if ds.buildStamp == "" || ds.buildStamp != dm.buildStamp {
+		return false, nil
+	}
+	var diff []string
+	for name, sum := range ds.files {
+		// config, keys and host key are syncConfig's, after the loop.
+		if dm.files[name] != sum && name != layout.ConfigFile && name != layout.AuthorizedKeysFile && name != layout.SSHHostEd25519KeyFile {
+			diff = append(diff, name)
+		}
+	}
+	if len(diff) == 0 {
+		return false, nil
+	}
+	sort.Strings(diff)
+	if !h.uefi {
+		// Never spread a damaged copy: the source must pass its own CHECKSUM.
+		if raw, rerr := os.ReadFile(filepath.Join(src.mountpoint, layout.PayloadSumFile)); rerr == nil {
+			if man, derr := payloadsum.Decode(raw); derr == nil {
+				if k, i, _, kerr := readInstalledKernelInitrd(src.target); kerr == nil {
+					if errs := payloadsum.Verify(man, k, i); len(errs) > 0 {
+						return false, fmt.Errorf("%s differs from %s (%s), but %s itself fails its %s (%v) - not copying a damaged payload; run 'alpine-zfsboot verify' and repair by hand ('esp remove' and 'esp add' the damaged one)", m.label(), src.label(), strings.Join(diff, ", "), src.label(), layout.PayloadSumFile, errs[0])
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("%s differs from %s at the same build (%s) - rewriting it from %s\n", m.label(), src.label(), strings.Join(diff, ", "), src.label())
+	if err := copyBootChain(h, src, m); err != nil {
+		return false, fmt.Errorf("repairing from %s: %w", src.label(), err)
+	}
+	return true, nil
 }
 
 func srcTarget(m *member) *target {

@@ -25,9 +25,11 @@ var macRE = regexp.MustCompile(`^[0-9A-Fa-f]{2}([:-])[0-9A-Fa-f]{2}(?:[:-][0-9A-
 
 // Normalize returns mac in the canonical form init compares against
 // (lowercase, colon-separated) or an error for anything that is not a
-// usable unicast hardware address. The empty string means "not set" and
-// is returned unchanged.
+// usable unicast hardware address. Surrounding spaces and tabs are
+// trimmed (the one rule shared with init and menu.py); an empty result
+// means "not set" and is returned as "".
 func Normalize(mac string) (string, error) {
+	mac = strings.Trim(mac, " \t")
 	if mac == "" {
 		return "", nil
 	}

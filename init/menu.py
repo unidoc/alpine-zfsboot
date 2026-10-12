@@ -105,7 +105,7 @@ RESCUE_IFACE = "eth0"
 # when set, the rescue network is the physical card with this MAC, never
 # eth0 - see rescue_iface() and net-config.sh's net_resolve_iface (the
 # same rules: case-insensitive, loopback and virtual interfaces ignored).
-RESCUE_NET_MAC = os.environ.get("ALPINE_ZFSBOOT_NET_MAC", "").strip()
+RESCUE_NET_MAC = os.environ.get("ALPINE_ZFSBOOT_NET_MAC", "").strip(" \t")
 SYS_CLASS_NET = os.environ.get("STUB_ROOT", "") + "/sys/class/net"
 _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 

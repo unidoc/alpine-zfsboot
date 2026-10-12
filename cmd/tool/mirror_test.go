@@ -225,7 +225,7 @@ func installBIOSMirror(t *testing.T, f *fakeHost, root string, ho hostOpts) (int
 	var code int
 	out := captureOutput(t, func() {
 		code = runInstall(installRun{
-			disk: f.esps[0].disk, arch: "x86_64", mountpoint: filepath.Join(root, "boot/efi"), yes: true,
+			disk: f.esps[0].disk, arch: detectArch(), mountpoint: filepath.Join(root, "boot/efi"), yes: true,
 			bios: biosBuild(t, "20261001T000000Z", 1), sshKey: testSSHKey,
 			opts: biosOpts{integrity: "warn"}, ho: ho,
 		})
@@ -530,7 +530,7 @@ func TestMirror_LegacySingleESP_UnchangedThenMarked(t *testing.T) {
 	// A pre-0.5.0 install: payload + config + stage1/stage2, no MEMBER.
 	root := f.mountAsRoot(a)
 	captureOutput(t, func() {
-		runInstall(installRun{disk: a.disk, arch: "x86_64", mountpoint: filepath.Join(root, "boot/efi"), yes: true,
+		runInstall(installRun{disk: a.disk, arch: detectArch(), mountpoint: filepath.Join(root, "boot/efi"), yes: true,
 			bios: biosBuild(t, "20261001T000000Z", 1), sshKey: testSSHKey, opts: biosOpts{integrity: "warn"}})
 	})
 	f.mounts = map[string]string{}
@@ -754,13 +754,13 @@ func TestMirror_UEFI_InstallUpdateVerifyAdd(t *testing.T) {
 	root := f.mountAsRoot(a)
 	var code int
 	out := captureOutput(t, func() {
-		code = runInstall(installRun{arch: "x86_64", uefi: true, mountpoint: filepath.Join(root, "boot/efi"), yes: true,
+		code = runInstall(installRun{arch: detectArch(), uefi: true, mountpoint: filepath.Join(root, "boot/efi"), yes: true,
 			efi: uefiBuild(t, "20261001T000000Z"), sshKey: testSSHKey, ho: hostOpts{addESP: "/dev/vdb1"}})
 	})
 	if code != 0 {
 		t.Fatalf("uefi install: %d\n%s", code, out)
 	}
-	rel, _ := uefiboot.LoaderPath("x86_64")
+	rel, _ := uefiboot.LoaderPath(detectArch())
 	for _, e := range []*fakeESP{a, b} {
 		if readESP(t, e, rel) == "<absent>" || memberOf(t, e).Generation != 1 {
 			t.Fatalf("%s not installed", e.uuid)
@@ -840,7 +840,7 @@ func TestMirror_OddDiskHintNeverFailsAMember(t *testing.T) {
 	os.WriteFile(src.Cmdline.File, []byte("root=ZFS=x alpine-zfsboot.pool="+strings.Repeat("p#", 120)+" alpine-zfsboot.version=0.5.0 alpine-zfsboot.buildstamp=20261001T000000Z\n"), 0o644)
 	var code int
 	out := captureOutput(t, func() {
-		code = runInstall(installRun{disk: a.disk, arch: "x86_64", mountpoint: filepath.Join(root, "boot/efi"), yes: true,
+		code = runInstall(installRun{disk: a.disk, arch: detectArch(), mountpoint: filepath.Join(root, "boot/efi"), yes: true,
 			bios: src, opts: biosOpts{integrity: "warn"}, ho: hostOpts{addESP: "BBBB-0002"}})
 	})
 	if code != 0 || len(memberOf(t, a).Pool) != 128 {

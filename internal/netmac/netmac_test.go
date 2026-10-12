@@ -16,17 +16,20 @@ func TestNormalize(t *testing.T) {
 		{"aa:bb:cc:dd:ee:f0", "aa:bb:cc:dd:ee:f0", true},
 		{"AA:BB:CC:DD:EE:F0", "aa:bb:cc:dd:ee:f0", true},
 		{"52-54-00-12-34-56", "52:54:00:12:34:56", true},
-		{"52:54:00:12:34", "", false},       // five groups
-		{"52:54:00:12:34:56:78", "", false}, // seven groups
-		{"52:54:00:12:34:5g", "", false},    // not hex
-		{"52:54-00:12:34:56", "", false},    // mixed separators
-		{"5254.0012.3456", "", false},       // Cisco dotted form not accepted
-		{"525400123456", "", false},         // no separators
-		{"00:00:00:00:00:00", "", false},    // all zero
-		{"ff:ff:ff:ff:ff:ff", "", false},    // broadcast
-		{"01:00:5e:00:00:01", "", false},    // multicast
-		{" 52:54:00:12:34:56", "", false},   // stray whitespace
-		{"52:54:00:12:34:56\r", "", false},  // CR
+		{"52:54:00:12:34", "", false},                       // five groups
+		{"52:54:00:12:34:56:78", "", false},                 // seven groups
+		{"52:54:00:12:34:5g", "", false},                    // not hex
+		{"52:54-00:12:34:56", "", false},                    // mixed separators
+		{"5254.0012.3456", "", false},                       // Cisco dotted form not accepted
+		{"525400123456", "", false},                         // no separators
+		{"00:00:00:00:00:00", "", false},                    // all zero
+		{"ff:ff:ff:ff:ff:ff", "", false},                    // broadcast
+		{"01:00:5e:00:00:01", "", false},                    // multicast
+		{" 52:54:00:12:34:56", "52:54:00:12:34:56", true},   // surrounding spaces/tabs are trimmed (one rule with init and menu.py)
+		{"52:54:00:12:34:56 \t", "52:54:00:12:34:56", true}, // trailing space and tab
+		{" \t ", "", true},                                  // only blanks: not set
+		{"52:54: 00:12:34:56", "", false},                   // inner whitespace
+		{"52:54:00:12:34:56\r", "", false},                  // CR
 	} {
 		got, err := Normalize(tc.in)
 		if tc.ok && (err != nil || got != tc.want) {
