@@ -168,6 +168,32 @@ const (
 // `status`/`verify` do, after the OS is already up.
 const MetadataFile = ESPDir + "/metadata"
 
+// PayloadSumFile holds the size and SHA-256 of exactly the bytes the BIOS
+// stage2 loader places in RAM from KernelFile/InitrdFile (see internal/
+// payloadsum). Unlike MetadataFile it IS read by stage2 itself, before it
+// jumps into the kernel - hence an uppercase, extension-less name of at
+// most 8 characters, the only kind bios/fat.c resolves. Mirrors
+// bios/payload_sum.h's PAYLOAD_SUM_PATH (checked by internal/payloadsum's
+// own test). BIOS installs only.
+const PayloadSumFile = ESPDir + "/CHECKSUM"
+
+// BlkSumFile is the per-block table that goes with PayloadSumFile (see
+// internal/payloadsum's BLKSUM doc and bios/blkverify.h's BLKSUM_PATH):
+// the BIOS stage2 checks every 64 KiB block of the payload against it as
+// it lands and re-reads a block the BIOS delivered wrong. Same naming
+// rule as PayloadSumFile (an extension-less name of at most 8 characters).
+const BlkSumFile = ESPDir + "/BLKSUM"
+
+// Int13ChunkKey is the EFI/ALPINE/CMDLINE key the BIOS stage2 reads for
+// its INT 13h transfer cap (bios/disk.h); Int13ChunkDefault mirrors
+// bios/disk.h's DISK_MAX_CHUNK_SECTORS (the cap without the key) and
+// Int13ChunkMax its DISK_CHUNK_LIMIT - layout_test.go greps both.
+const (
+	Int13ChunkKey     = "alpine-zfsboot.int13chunk"
+	Int13ChunkDefault = 16
+	Int13ChunkMax     = 127
+)
+
 // EFIBootDir and EFILoaderName are the UEFI-standard firmware
 // entrypoint location - deliberately OUTSIDE ESPDir (see this
 // project's own architecture writeup: EFI/BOOT is the UEFI standard's
@@ -190,3 +216,28 @@ func EFILoaderName(arch string) string {
 		return ""
 	}
 }
+
+// MemberFile is a mirrored boot's identity marker (internal/espmember):
+// which installation an ESP belongs to, its write generation, and its
+// sibling ESPs. Uppercase 8.3 name, like PayloadSumFile, so any FAT
+// reader can find it. Read by init/esp-select.sh at boot and by cmd/tool.
+const MemberFile = ESPDir + "/MEMBER"
+
+// CmdlineMaxBytes mirrors bios/stage2_main.c's CMDLINE_BUF_SIZE - 1: the
+// longest EFI/ALPINE/CMDLINE stage2 accepts (it refuses to boot a longer
+// one). The tool refuses to write a longer one.
+const CmdlineMaxBytes = 511
+
+// Keys of the mirrored-boot and rescue-NIC settings (README "Mirrored
+// boot", "Choosing the rescue network card").
+const (
+	// ESPUUIDsKey: the explicit, comma-separated list of the FAT volume
+	// UUIDs of this host's ESPs (cmdline, config, BIOS CMDLINE).
+	ESPUUIDsKey = "alpine-zfsboot.esp-uuids"
+	// ESPSelfKey: written by the tool into each BIOS member's own CMDLINE,
+	// naming that ESP's own FAT UUID - so init knows which ESP stage2
+	// booted from.
+	ESPSelfKey = "alpine-zfsboot.esp-self"
+	// NetMACKey: the MAC address of the rescue network card (default eth0).
+	NetMACKey = "alpine-zfsboot.net.mac"
+)

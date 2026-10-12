@@ -117,3 +117,25 @@ func TestESPTypeGUIDBytes(t *testing.T) {
 		t.Errorf("ESPTypeGUIDBytes = %x, want %x (independently derived from ESPTypeGUIDString)", ESPTypeGUIDBytes, want)
 	}
 }
+
+func TestInt13ChunkMatchesDiskH(t *testing.T) {
+	data, err := os.ReadFile("../../bios/disk.h")
+	if err != nil {
+		t.Fatalf("reading bios/disk.h: %v", err)
+	}
+	def := regexp.MustCompile(`(?m)^#define\s+DISK_MAX_CHUNK_SECTORS\s+(\d+)`).FindSubmatch(data)
+	max := regexp.MustCompile(`(?m)^#define\s+DISK_CHUNK_LIMIT\s+(\d+)`).FindSubmatch(data)
+	if def == nil || string(def[1]) != fmt.Sprint(Int13ChunkDefault) {
+		t.Errorf("bios/disk.h DISK_MAX_CHUNK_SECTORS = %q, layout.Int13ChunkDefault = %d", def, Int13ChunkDefault)
+	}
+	if max == nil || string(max[1]) != fmt.Sprint(Int13ChunkMax) {
+		t.Errorf("bios/disk.h DISK_CHUNK_LIMIT = %q, layout.Int13ChunkMax = %d", max, Int13ChunkMax)
+	}
+	src, err := os.ReadFile("../../bios/stage2_main.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), `"`+Int13ChunkKey+`="`) {
+		t.Errorf("bios/stage2_main.c does not read %s=", Int13ChunkKey)
+	}
+}

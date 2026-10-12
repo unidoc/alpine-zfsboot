@@ -371,11 +371,14 @@ func TestWritePayloadWithRollback_MidWriteFailureRestoresFullPreviousGeneration(
 		t.Fatal(err)
 	}
 
-	newKernel := []byte("NEW-kernel-bytes")
+	// A bzImage-shaped kernel: on x86_64 a kernel the BIOS loader could not
+	// boot is refused before anything is written (CHECKSUM), which would
+	// never reach the CMDLINE failure this test is about.
+	newKernel := buildFakeBzImage("6.18.53-0-lts", 0x4e)
 	newInitrd := []byte("NEW-initrd-bytes")
 	newCmdline := []byte("NEW-cmdline-bytes")
 
-	err := writePayloadWithRollback(mountpoint, "x86_64", "0.1.0", "20260101T000000Z", newKernel, newInitrd, newCmdline)
+	err := writePayloadWithRollback(mountpoint, "x86_64", "0.1.0", "20260101T000000Z", newKernel, newInitrd, newCmdline, "warn")
 	if err == nil {
 		t.Fatal("expected an error (CMDLINE's own rename should fail - it's a directory), got nil")
 	}

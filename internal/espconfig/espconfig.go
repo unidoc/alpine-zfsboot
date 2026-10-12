@@ -25,8 +25,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
+	"github.com/unidoc/alpine-zfsboot/internal/netmac"
 )
 
 // chmodFile is (*os.File).Chmod, swappable in tests to force a failure
@@ -207,6 +209,17 @@ type Config struct {
 	// field unset simply means tty0, not an ambiguous "whichever
 	// console=build.sh happened to list last" the way it once did.
 	Console string
+
+	// ESPUUIDs is alpine-zfsboot.esp-uuids= - the comma-separated FAT
+	// volume UUIDs of every ESP of a mirrored boot (see README "Mirrored
+	// boot"), already normalized by bootenv.ParseESPUUIDs. Empty: one ESP,
+	// auto-discovered, exactly as before this key existed.
+	ESPUUIDs string
+
+	// NetMAC is alpine-zfsboot.net.mac= - the MAC address of the network
+	// card the rescue network uses instead of eth0, already normalized by
+	// netmac.Normalize. Empty: eth0, exactly as before this key existed.
+	NetMAC string
 }
 
 // render produces EFI/ALPINE/config's own exact key=value line
@@ -226,6 +239,10 @@ func (c Config) render() []byte {
 		{"alpine-zfsboot.ssh.port", c.SSHPort},
 		{"alpine-zfsboot.ssh.allow", c.SSHAllow},
 		{"alpine-zfsboot.console", c.Console},
+		// New keys go last, so a config without them renders byte-for-byte
+		// as before (an older init warns about and ignores both).
+		{"alpine-zfsboot.esp-uuids", c.ESPUUIDs},
+		{"alpine-zfsboot.net.mac", c.NetMAC},
 	} {
 		if kv.value == "" {
 			continue
@@ -333,11 +350,72 @@ func encodeDropbearEd25519PrivateKey(priv ed25519.PrivateKey) []byte {
 // that this function controls the key bytes directly, unlike the old
 // dropbearkey-must-write-its-own-file constraint.
 func GenerateHostKey(mountpoint string) error {
+	key, err := NewHostKey()
+	if err != nil {
+		return err
+	}
+	return WriteHostKey(mountpoint, key)
+}
+
+// NewHostKey returns a fresh dropbear-format ed25519 host key, for a
+// caller that writes the SAME key to several ESPs (a mirrored boot: the
+// rescue SSH host identity must not depend on which disk booted).
+func NewHostKey() ([]byte, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return fmt.Errorf("generating an ed25519 key: %w", err)
+		return nil, fmt.Errorf("generating an ed25519 key: %w", err)
 	}
-	return WriteFile(mountpoint, layout.SSHHostEd25519KeyFile, encodeDropbearEd25519PrivateKey(priv), 0o600)
+	return encodeDropbearEd25519PrivateKey(priv), nil
+}
+
+// WriteHostKey writes key (from NewHostKey, or copied from another ESP)
+// as EFI/ALPINE/ssh_host_ed25519_key via WriteFile.
+func WriteHostKey(mountpoint string, key []byte) error {
+	return WriteFile(mountpoint, layout.SSHHostEd25519KeyFile, key, 0o600)
+}
+
+// ConfigValue returns the value of the LAST "key=value" line for key in
+// an EFI/ALPINE/config file's content (last one wins, as in init/init's
+// own config loop), with a trailing CR stripped, and whether it was found.
+func ConfigValue(content []byte, key string) (string, bool) {
+	prefix := key + "="
+	val, found := "", false
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if v, ok := strings.CutPrefix(line, prefix); ok {
+			val, found = v, true
+		}
+	}
+	return val, found
+}
+
+// SetConfigKey rewrites EFI/ALPINE/config with every key= line removed
+// and, when value is not empty, one key=value line appended - every other
+// line kept as it is. Atomic via WriteFile. A missing config file is
+// created.
+func SetConfigKey(mountpoint, key, value string) error {
+	raw, err := os.ReadFile(filepath.Join(mountpoint, layout.ConfigFile))
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("reading %s: %w", layout.ConfigFile, err)
+	}
+	var out bytes.Buffer
+	prefix := key + "="
+	for _, line := range strings.SplitAfter(string(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, prefix) {
+			continue
+		}
+		out.WriteString(line)
+		if !strings.HasSuffix(line, "\n") {
+			out.WriteString("\n")
+		}
+	}
+	if value != "" {
+		fmt.Fprintf(&out, "%s%s\n", prefix, value)
+	}
+	return WriteFile(mountpoint, layout.ConfigFile, out.Bytes(), 0o644)
 }
 
 // consoleRE is the set init/init's select_console() can actually select:
@@ -353,4 +431,16 @@ func ValidateConsole(v string) error {
 		return nil
 	}
 	return fmt.Errorf("--console %q is not a console alpine-zfsboot can select: use tty0, ttyS0, ttyS1, ttyS2 or ttyAMA0, optionally followed by ,<baud>[n|e|o][5-8][r] (e.g. ttyS0,115200n8)", v)
+}
+
+// ValidateNetMAC normalizes an alpine-zfsboot.net.mac= value (see
+// internal/netmac): "" stays "" (not set - the rescue network uses eth0),
+// anything else must be a unicast MAC address and comes back lowercase,
+// colon-separated - the form init compares against.
+func ValidateNetMAC(v string) (string, error) {
+	norm, err := netmac.Normalize(v)
+	if err != nil {
+		return "", fmt.Errorf("--net-mac: %w", err)
+	}
+	return norm, nil
 }

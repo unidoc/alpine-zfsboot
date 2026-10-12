@@ -51,6 +51,21 @@ stage2_entry:
 	 */
 	jmp past_stage2_magic
 	.word 0x325a
+	/*
+	 * Offset 4: 0x5331, announcing the two words after it - offset 6,
+	 * the image length in 16-bit words, and offset 8, a checksum word,
+	 * both 0 here and filled in by bios/Makefile's stage2.bin recipe
+	 * (stage2-sum.sh) so that the 16-bit sum of the first `length` words
+	 * of stage2.bin is zero. stage1.S checks length and sum only when
+	 * this marker is present; a stage2 from before it existed (code at
+	 * offset 4, never 0x5331 - v0.4.x has 0xea there) is accepted on the
+	 * magic word alone, exactly as the old stage1 did, so a new stage1
+	 * still boots an old stage2. The ISO build never fills the words in:
+	 * El Torito loads that image and nothing reads them there.
+	 */
+	.word 0x5331              /* marker: length + checksum follow */
+	.word 0                   /* length in words, set by the build */
+	.word 0                   /* checksum adjust, set by the build */
 past_stage2_magic:
 	/*
 	 * Explicit far jump to reload %cs = SEG, BEFORE anything else -

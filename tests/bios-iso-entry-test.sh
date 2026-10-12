@@ -110,11 +110,32 @@ echo "== building bios/stage-iso.bin =="
 # VGA device model, no monitor round-trip - so a QEMU/SeaBIOS default
 # this project doesn't control has nothing left to interfere with. VGA
 # polling stays in place below too, diagnostic-only now (poll.log).
-make -C "$REPO_ROOT/bios" stage-iso.bin ZFSBOOT_VERSION=test TEST_SERIAL=1 ${FORCE_ATAPI:+FORCE_ATAPI=$FORCE_ATAPI} >&2
+# ISO_EXTRA_CFLAGS (e.g. the DISK_FI_* fault injection, see cdrom_disk.c)
+# builds in a temporary COPY of bios/, so no test-only object lands in
+# the tree.
+ISO_BIOS="$REPO_ROOT/bios"
+if [ -n "${ISO_EXTRA_CFLAGS:-}" ]; then
+    mkdir -p "$W/isobios"
+    cp -r "$REPO_ROOT/bios" "$W/isobios/bios"
+    rm -f "$W"/isobios/bios/*.o "$W"/isobios/bios/*.elf "$W"/isobios/bios/*.bin
+    ISO_BIOS="$W/isobios/bios"
+fi
+make -C "$ISO_BIOS" stage-iso.bin ZFSBOOT_VERSION=test TEST_SERIAL=1 ${FORCE_ATAPI:+FORCE_ATAPI=$FORCE_ATAPI} EXTRA_CFLAGS="${ISO_EXTRA_CFLAGS:-}" >&2
+
+# The ISO's FAT image gets EFI/ALPINE/CHECKSUM and BLKSUM (iso.sh's
+# PAYLOAD_MANIFEST_CMD) unless ISO_TEST_NO_MANIFEST=1 - the old ISO.
+# bios/tests/mkmanifest is the C twin of `alpine-zfsboot payload-manifest`
+# (same bytes; both checked against internal/payloadsum/testdata).
+MANIFEST_CMD=
+if [ -z "${ISO_TEST_NO_MANIFEST:-}" ]; then
+    gcc -O2 -I "$REPO_ROOT/bios" -o "$W/mkmanifest" "$REPO_ROOT/bios/tests/mkmanifest.c" \
+        "$REPO_ROOT/bios/payload_sum.c" "$REPO_ROOT/bios/blkverify.c"
+    MANIFEST_CMD="$W/mkmanifest ${ISO_TEST_INTEGRITY:+--integrity $ISO_TEST_INTEGRITY}"
+fi
 
 echo "== building a synthetic (but boot-protocol-valid) kernel+initrd+cmdline =="
 python3 - "$W" <<'PYEOF'
-import struct, sys
+import os, struct, sys
 w = sys.argv[1]
 
 SETUP_HEADER_FILE_OFFSET = 0x1f1
@@ -154,8 +175,8 @@ buf += bytes(real_mode_bytes - len(buf))
 # the >=1 progress-dot check below (PROGRESS_DOT_BYTES=1MiB in
 # stage2_main.c) with real margin, and enough to force several dozen
 # separate NATIVE_BATCH-sized ATAPI READ(10) commands under
-# FORCE_ATAPI=1 (NATIVE_BATCH=9 sectors=18432 bytes/command in
-# cdrom_disk.c - 2MiB/18432 is ~114 commands), not just one.
+# FORCE_ATAPI=1 (NATIVE_BATCH=4 sectors=8192 bytes/command in
+# cdrom_disk.c - 2MiB/8192 is 256 commands), not just one.
 KERNEL_PAYLOAD_BYTES = 2 * 1024 * 1024
 buf += bytes([(i * 37 + 11) & 0xff for i in range(KERNEL_PAYLOAD_BYTES)])
 with open(f"{w}/KERNEL", "wb") as f:
@@ -170,7 +191,10 @@ chunk = bytes([(i * 13 + 3) & 0xff for i in range(INITRD_BYTES)])
 with open(f"{w}/INITRD", "wb") as f:
     f.write(chunk)
 
-cmdline_bytes = b"console=ttyS0 alpine-zfsboot.iso-entry-test=1\n"
+# ISO_TEST_CMDLINE_EXTRA: more words for the cmdline, e.g.
+# alpine-zfsboot.int13chunk=8 (the ISO stage reads that key too).
+extra = os.environ.get("ISO_TEST_CMDLINE_EXTRA", "")
+cmdline_bytes = ("console=ttyS0 alpine-zfsboot.iso-entry-test=1" + (" " + extra if extra else "") + "\n").encode()
 with open(f"{w}/CMDLINE", "wb") as f:
     f.write(cmdline_bytes)
 
@@ -220,9 +244,31 @@ with open(f"{w}/dummy.EFI", "wb") as f:
 PYEOF
 
 echo "== building the test ISO via this project's own iso.sh =="
-sh "$REPO_ROOT/iso.sh" "$W/dummy.EFI" x86_64 "$REPO_ROOT/bios/stage-iso.bin" \
+PAYLOAD_MANIFEST_CMD="$MANIFEST_CMD" sh "$REPO_ROOT/iso.sh" "$W/dummy.EFI" x86_64 "$ISO_BIOS/stage-iso.bin" \
     "$W/KERNEL" "$W/INITRD" "$W/CMDLINE" >&2
 mv "$W/dummy.iso" "$W/test.iso"
+
+# ISO_FI_KERNEL_OFFSET=N: build stage-iso.bin again with fault injection
+# (ISO_EXTRA_CFLAGS plus DISK_FI_LBA = the ISO LBA of byte N of
+# EFI/ALPINE/KERNEL, found with tests/fat_lba.py) and the ISO again with
+# it - the payload's place on the ISO must not move, which is checked.
+if [ -n "${ISO_FI_KERNEL_OFFSET:-}" ]; then
+    fi_lba=$(python3 "$REPO_ROOT/tests/fat_lba.py" "$W/test.iso" EFI/ALPINE/KERNEL "$ISO_FI_KERNEL_OFFSET")
+    if [ "$ISO_BIOS" = "$REPO_ROOT/bios" ]; then
+        mkdir -p "$W/isobios"
+        cp -r "$REPO_ROOT/bios" "$W/isobios/bios"
+        ISO_BIOS="$W/isobios/bios"
+    fi
+    rm -f "$ISO_BIOS"/*.o "$ISO_BIOS"/*.elf "$ISO_BIOS"/*.bin
+    make -C "$ISO_BIOS" stage-iso.bin ZFSBOOT_VERSION=test TEST_SERIAL=1 ${FORCE_ATAPI:+FORCE_ATAPI=$FORCE_ATAPI} \
+        EXTRA_CFLAGS="${ISO_EXTRA_CFLAGS:-} -DDISK_FI_LBA=$fi_lba" >&2
+    PAYLOAD_MANIFEST_CMD="$MANIFEST_CMD" sh "$REPO_ROOT/iso.sh" "$W/dummy.EFI" x86_64 "$ISO_BIOS/stage-iso.bin" \
+        "$W/KERNEL" "$W/INITRD" "$W/CMDLINE" >&2
+    mv "$W/dummy.iso" "$W/test.iso"
+    fi_lba2=$(python3 "$REPO_ROOT/tests/fat_lba.py" "$W/test.iso" EFI/ALPINE/KERNEL "$ISO_FI_KERNEL_OFFSET")
+    [ "$fi_lba" = "$fi_lba2" ] || { echo "the kernel moved on the ISO ($fi_lba -> $fi_lba2)" >&2; exit 1; }
+    echo "== fault injection at ISO LBA $fi_lba (kernel byte $ISO_FI_KERNEL_OFFSET)" >&2
+fi
 
 MONITOR_PORT=45678
 
@@ -553,7 +599,17 @@ print_diagnostics() {
     cat "$W/qemu.log" >&2 2>/dev/null || echo "(no qemu.log)" >&2
 }
 
+# ISO_TEST_EXPECT_HALT=1: the boot must stop (FATAL) instead.
+if [ -n "${ISO_TEST_EXPECT_HALT:-}" ]; then
+    case "$status_line" in
+        FATAL) ok "the ISO boot stopped, as this scenario requires" ;;
+        *) print_diagnostics; bad "expected the boot to stop (FATAL), got $status_line" ;;
+    esac
+    status_line=CHECKED
+fi
+
 case "$status_line" in
+    CHECKED) ;;
     PASS)
         ok "ISO El-Torito boot loaded kernel+initrd through a non-NULL progress callback and reached 'starting kernel'"
         ;;
@@ -578,6 +634,30 @@ case "$status_line" in
         bad "unexpected test harness output"
         ;;
 esac
+
+# ISO_TEST_EXPECT: '|'-separated texts the serial log must contain;
+# ISO_TEST_REJECT: texts it must not contain.
+serial_text="$(cat "$W/serial.log" 2>/dev/null || true)"
+if [ -n "${ISO_TEST_EXPECT:-}" ]; then
+    IFS='|'
+    for want in $ISO_TEST_EXPECT; do
+        case "$serial_text" in
+            *"$want"*) ok "serial output contains '$want'" ;;
+            *) print_diagnostics; bad "serial output lacks '$want'" ;;
+        esac
+    done
+    unset IFS
+fi
+if [ -n "${ISO_TEST_REJECT:-}" ]; then
+    IFS='|'
+    for nope in $ISO_TEST_REJECT; do
+        case "$serial_text" in
+            *"$nope"*) print_diagnostics; bad "serial output contains '$nope'" ;;
+            *) ok "serial output does not contain '$nope'" ;;
+        esac
+    done
+    unset IFS
+fi
 
 echo
 echo "$pass passed, $fail failed"

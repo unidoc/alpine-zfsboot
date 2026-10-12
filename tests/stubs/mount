@@ -6,6 +6,25 @@ echo "mount $*" >> "${STUB_LOG:-/dev/null}"
 # in run-tests.sh for why a real sleep here (not a simulated one) is
 # what makes SIGKILLing that process a real, not simulated, test.
 [ -n "${STUB_MOUNT_SLEEP:-}" ] && sleep "$STUB_MOUNT_SLEEP"
+# Fake ESPs (init/esp-select.sh tests): with STUB_ESP_DIR set, a vfat
+# mount of /dev/X copies $STUB_ESP_DIR/X into the target (replacing what
+# was there), or fails (exit 32, like real mount) when that directory is
+# missing or holds a .mountfail file - a corrupt or absent filesystem.
+is_vfat=0
+for a in "$@"; do
+    [ "$a" = "vfat" ] && is_vfat=1
+done
+if [ "$is_vfat" = 1 ] && [ -n "${STUB_ESP_DIR:-}" ]; then
+    n=$#
+    eval "dev=\${$((n-1))}"
+    eval "target=\${$n}"
+    src="$STUB_ESP_DIR/${dev##*/}"
+    [ -d "$src" ] && [ ! -e "$src/.mountfail" ] || exit 32
+    mkdir -p "$target"
+    find "$target" -mindepth 1 -delete 2>/dev/null
+    cp -a "$src"/. "$target"/
+    exit 0
+fi
 is_zfs=0
 for a in "$@"; do
     [ "$a" = "zfs" ] && is_zfs=1

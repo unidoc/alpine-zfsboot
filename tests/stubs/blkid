@@ -1,0 +1,7 @@
+#!/bin/sh
+# blkid stub: prints STUB_BLKID (a file holding lines in the exact format
+# Alpine's busybox blkid prints - checked against busybox 1.37 on a real
+# mkfs.vfat image:  /dev/vda1: LABEL="EFI" UUID="6AC5-0B94" TYPE="vfat").
+echo "blkid $*" >> "${STUB_LOG:-/dev/null}"
+[ -n "${STUB_BLKID:-}" ] && cat "$STUB_BLKID"
+exit 0

@@ -434,6 +434,10 @@ ALPINE_ZFSBOOT_IPV6_GATEWAY=""
 ALPINE_ZFSBOOT_SSH_LISTEN=""
 ALPINE_ZFSBOOT_SSH_PORT=""
 ALPINE_ZFSBOOT_SSH_ALLOW=""
+# alpine-zfsboot.net.mac= - the MAC address of the network card the rescue
+# network uses instead of eth0 (net-config.sh's net_resolve_iface). Empty:
+# eth0, exactly as before this key existed.
+ALPINE_ZFSBOOT_NET_MAC=""
 # bootcheck (failed-boot detection - see boot-dataset.sh's own
 # "content-derived arming" comment for the full design) and
 # panic_timeout (general boot policy, deliberately independent of
@@ -458,6 +462,10 @@ ALPINE_ZFSBOOT_PANIC_TIMEOUT=""
 # not set" abort under this file's own `set -u` instead, on every
 # select_console() call on such a machine.
 ALPINE_ZFSBOOT_ESP_DEV=""
+# FAT UUID and MEMBER install id of that ESP (esp-select.sh), for the
+# post-import pool identity cross-check and for rescue diagnostics.
+ALPINE_ZFSBOOT_ESP_UUID=""
+ALPINE_ZFSBOOT_ESP_INSTALL_ID=""
 # Last successfully read persisted console (see read_fat_console_pref()).
 _CONSOLE_PREF_CACHE=/tmp/alpine-zfsboot-console-pref.cache
 # Persisted console choice (see select_console()'s own comment for the
@@ -505,6 +513,15 @@ apply_zfsboot_kv() {
         alpine-zfsboot.ipv6.address=*) ALPINE_ZFSBOOT_IPV6_ADDRESS="${kv#alpine-zfsboot.ipv6.address=}" ;;
         alpine-zfsboot.ipv6.gateway=*) ALPINE_ZFSBOOT_IPV6_GATEWAY="${kv#alpine-zfsboot.ipv6.gateway=}" ;;
         alpine-zfsboot.ipv6=*) ALPINE_ZFSBOOT_IPV6="${kv#alpine-zfsboot.ipv6=}" ;;
+        # Validated and resolved only when the rescue network is actually
+        # brought up (net-config.sh's net_resolve_iface) - a healthy boot
+        # never waits for it, and a bad value cannot stop the pool boot.
+        alpine-zfsboot.net.mac=*) ALPINE_ZFSBOOT_NET_MAC="${kv#alpine-zfsboot.net.mac=}" ;;
+        # Mirrored boot (esp-select.sh): read from /proc/cmdline BEFORE the
+        # ESP is chosen, and from the chosen ESP's own config by
+        # esp-select.sh itself - nothing left to do here.
+        alpine-zfsboot.esp-uuids=*) : ;;
+        alpine-zfsboot.esp-self=*) : ;;
         alpine-zfsboot.ssh.listen=*) ALPINE_ZFSBOOT_SSH_LISTEN="${kv#alpine-zfsboot.ssh.listen=}" ;;
         alpine-zfsboot.ssh.port=*) ALPINE_ZFSBOOT_SSH_PORT="${kv#alpine-zfsboot.ssh.port=}" ;;
         alpine-zfsboot.ssh.allow=*) ALPINE_ZFSBOOT_SSH_ALLOW="${kv#alpine-zfsboot.ssh.allow=}" ;;
@@ -567,6 +584,15 @@ apply_zfsboot_kv() {
         # this function, there is no other place to special-case them.
         alpine-zfsboot.version=*) : ;;
         alpine-zfsboot.buildstamp=*) : ;;
+        # Read by the BIOS stage2 loader only (bios/stage2_main.c: prints
+        # its E820/load-range/disk-read diagnostics when an operator adds
+        # it to EFI/ALPINE/CMDLINE); nothing to do here, and no warning.
+        alpine-zfsboot.diag=*) : ;;
+        # Also stage2's own: the loaded-payload check's mode for this boot
+        # (off|warn|enforce, see bios/payload_sum.h).
+        alpine-zfsboot.integrity=*) : ;;
+        # And stage2's INT 13h transfer cap (bios/disk.h).
+        alpine-zfsboot.int13chunk=*) : ;;
         # Catches anything starting with the alpine-zfsboot. prefix that
         # didn't match one of the specific keys above (a typo, a
         # removed/renamed key, ipv6.gw instead of ipv6.gateway, ...) -
@@ -669,37 +695,45 @@ apply_zfsboot_kv() {
 # the three applied instead - defaults/cmdline-only that boot, rescue
 # SSH unconfigured, same as if none of this had ever existed, rather
 # than a guess nobody asked for.
-if [ -z "$ROOTFS" ]; then
-    mkdir -p /tmp/esp-config /tmp/alpine-zfsboot
-    esp_candidate=""
-    esp_candidate_count=0
-    for esp_dev in $(blkid 2>/dev/null | grep 'LABEL="EFI"' | cut -d: -f1); do
-        mount -t vfat -o ro "$esp_dev" /tmp/esp-config 2>/dev/null || continue
-        esp_marker=0
-        [ -r "/tmp/esp-config/EFI/ALPINE/config" ] && esp_marker=1
-        [ -r "/tmp/esp-config/EFI/ALPINE/authorized_keys" ] && esp_marker=1
-        [ -r "/tmp/esp-config/EFI/ALPINE/ssh_host_ed25519_key" ] && esp_marker=1
-        if [ "$esp_marker" = 1 ] && \
-           { [ -f "/tmp/esp-config/EFI/BOOT/BOOTX64.EFI" ] || [ -f "/tmp/esp-config/EFI/BOOT/BOOTAA64.EFI" ] || \
-             [ -f "/tmp/esp-config/EFI/ALPINE/KERNEL" ]; }; then
-            esp_candidate_count=$((esp_candidate_count + 1))
-            esp_candidate="$esp_dev"
-        fi
-        umount /tmp/esp-config 2>/dev/null
+#
+# Which ESP (mirrored boot, issue #24): init/esp-select.sh decides - an
+# explicit alpine-zfsboot.esp-uuids= list, the ESP this boot came from
+# (alpine-zfsboot.esp-self=, BIOS), the EFI/ALPINE/MEMBER identity
+# markers, or - with no marker anywhere, every install before 0.5.0 -
+# exactly the single-ESP rule described above. See that file's header.
+# When it cannot decide safely it says why and selects nothing: this boot
+# then uses defaults/cmdline only, rescue SSH unconfigured, as before.
+#
+# Real boot only, or a test run that provides fake ESPs (STUB_ESP_DIR,
+# tests/run-tests.sh) - every path below is $ROOTFS-prefixed for that.
+. "$RESCUE_LIB_DIR/esp-select.sh"
+if [ -z "$ROOTFS" ] || [ -n "${STUB_ESP_DIR:-}" ]; then
+    mkdir -p "$ROOTFS/tmp/esp-config" "$ROOTFS/tmp/alpine-zfsboot"
+    # The two keys esp-select.sh needs before any ESP is read (last
+    # occurrence wins, as everywhere on the cmdline).
+    ESP_SELECT_CMDLINE_LIST="" ESP_SELECT_SELF=""
+    for arg in $(cat "$ROOTFS/proc/cmdline" 2>/dev/null); do
+        case "$arg" in
+            alpine-zfsboot.esp-uuids=*) ESP_SELECT_CMDLINE_LIST="${arg#alpine-zfsboot.esp-uuids=}" ;;
+            alpine-zfsboot.esp-self=*) ESP_SELECT_SELF="${arg#alpine-zfsboot.esp-self=}" ;;
+        esac
     done
-    if [ "$esp_candidate_count" -eq 1 ]; then
-        msg "alpine-zfsboot ESP found on $esp_candidate"
+    if esp_select; then
+        esp_candidate="$ESP_SELECTED_DEV"
+        msg "alpine-zfsboot ESP found on $esp_candidate (UUID $ESP_SELECTED_UUID: $ESP_SELECTED_REASON)"
         # Exported so read_fat_console_pref() (and any subshell that
         # calls it) sees this value without independently re-running
         # this whole disambiguation scan itself - one discovery pass,
         # one place that decides "this is genuinely the alpine-zfsboot
         # ESP", reused.
         export ALPINE_ZFSBOOT_ESP_DEV="$esp_candidate"
-        if mount -t vfat -o ro "$esp_candidate" /tmp/esp-config 2>/dev/null; then
+        export ALPINE_ZFSBOOT_ESP_UUID="$ESP_SELECTED_UUID"
+        export ALPINE_ZFSBOOT_ESP_INSTALL_ID="$ESP_SELECTED_INSTALL_ID"
+        if mount -t vfat -o ro "$esp_candidate" "$ROOTFS/tmp/esp-config" 2>/dev/null; then
             # Seed the console-pref cache (see read_fat_console_pref).
-            sed -n 's/^alpine-zfsboot\.console=//p' /tmp/esp-config/EFI/ALPINE/config 2>/dev/null |
-                tail -n 1 | tr -d '\r' > "$_CONSOLE_PREF_CACHE"
-            if [ -r "/tmp/esp-config/EFI/ALPINE/config" ]; then
+            sed -n 's/^alpine-zfsboot\.console=//p' "$ROOTFS/tmp/esp-config/EFI/ALPINE/config" 2>/dev/null |
+                tail -n 1 | tr -d '\r' > "$ROOTFS$_CONSOLE_PREF_CACHE"
+            if [ -r "$ROOTFS/tmp/esp-config/EFI/ALPINE/config" ]; then
                 msg "applying persisted config (cmdline still overrides)"
                 ZFSBOOT_KV_SOURCE=config
                 while IFS= read -r line || [ -n "$line" ]; do
@@ -707,7 +741,7 @@ if [ -z "$ROOTFS" ]; then
                         ''|'#'*) : ;;
                         alpine-zfsboot.*) apply_zfsboot_kv "$line" ;;
                     esac
-                done < "/tmp/esp-config/EFI/ALPINE/config"
+                done < "$ROOTFS/tmp/esp-config/EFI/ALPINE/config"
                 ZFSBOOT_KV_SOURCE=""
             fi
 
@@ -719,7 +753,7 @@ if [ -z "$ROOTFS" ]; then
             # "find and validate what's on the ESP" here, "how dropbear
             # actually gets invoked" in rescue-ssh.sh, the same split
             # already used for config vs net_config/start_rescue_ssh.
-            if [ -r "/tmp/esp-config/EFI/ALPINE/authorized_keys" ]; then
+            if [ -r "$ROOTFS/tmp/esp-config/EFI/ALPINE/authorized_keys" ]; then
                 zfsboot_keys_found=0
                 while IFS= read -r ak_line || [ -n "$ak_line" ]; do
                     # Strip a trailing CR - identical hazard/fix as
@@ -733,14 +767,14 @@ if [ -z "$ROOTFS" ]; then
                     esac
                     case "$ak_line" in
                         ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ecdsa-sha2-*\ *|sk-ssh-ed25519\ *)
-                            printf '%s\n' "$ak_line" >> /tmp/alpine-zfsboot/authorized_keys
+                            printf '%s\n' "$ak_line" >> "$ROOTFS/tmp/alpine-zfsboot/authorized_keys"
                             zfsboot_keys_found=$((zfsboot_keys_found + 1))
                             ;;
                         *)
                             msg "WARNING: ignoring authorized_keys line that doesn't look like a public key: $ak_line"
                             ;;
                     esac
-                done < "/tmp/esp-config/EFI/ALPINE/authorized_keys"
+                done < "$ROOTFS/tmp/esp-config/EFI/ALPINE/authorized_keys"
                 msg "authorized_keys: $zfsboot_keys_found usable key(s) found"
             fi
 
@@ -750,30 +784,21 @@ if [ -z "$ROOTFS" ]; then
             # authorized_keys have. Validity is rescue-ssh.sh's own job
             # (dropbearkey -y), matching where the old ssh_key='s own
             # decode/validity check used to live.
-            if [ -r "/tmp/esp-config/EFI/ALPINE/ssh_host_ed25519_key" ]; then
-                cp "/tmp/esp-config/EFI/ALPINE/ssh_host_ed25519_key" /tmp/alpine-zfsboot/ssh_host_ed25519_key
-                chmod 600 /tmp/alpine-zfsboot/ssh_host_ed25519_key
+            if [ -r "$ROOTFS/tmp/esp-config/EFI/ALPINE/ssh_host_ed25519_key" ]; then
+                cp "$ROOTFS/tmp/esp-config/EFI/ALPINE/ssh_host_ed25519_key" "$ROOTFS/tmp/alpine-zfsboot/ssh_host_ed25519_key"
+                chmod 600 "$ROOTFS/tmp/alpine-zfsboot/ssh_host_ed25519_key"
                 msg "persistent ssh_host_ed25519_key found"
             else
                 msg "no persistent ssh_host_ed25519_key found on the ESP"
             fi
 
-            umount /tmp/esp-config 2>/dev/null
+            umount "$ROOTFS/tmp/esp-config" 2>/dev/null
         else
             msg "WARNING: found an alpine-zfsboot ESP candidate ($esp_candidate) but failed to re-mount it - defaults/cmdline only, rescue SSH unconfigured"
         fi
-    elif [ "$esp_candidate_count" -gt 1 ]; then
-        msg "WARNING: $esp_candidate_count devices carry both an alpine-zfsboot boot binary and config/authorized_keys/host-key material - ambiguous, applying NONE of it. This boot uses defaults/cmdline only, rescue SSH unconfigured."
-    else
-        # Deliberately logged even in the ordinary "nothing found" case,
-        # not just the ambiguous one above - this whole mechanism has
-        # never run on real hardware (see this block's own header
-        # comment), so "zero candidates found" and "material found and
-        # applied cleanly" must be distinguishable from the console
-        # alone the first time this is actually tested, rather than
-        # both being silent and indistinguishable from each other.
-        msg "no alpine-zfsboot ESP found (checked every LABEL=EFI device) - defaults/cmdline only, rescue SSH unconfigured"
     fi
+    # esp_select already said why when it selected nothing (none found,
+    # ambiguous, every listed/member ESP unusable).
 fi
 
 ZFSBOOT_KV_SOURCE=cmdline
@@ -782,7 +807,7 @@ for arg in $(cat "$ROOTFS/proc/cmdline" 2>/dev/null); do
 done
 ZFSBOOT_KV_SOURCE=""
 export ALPINE_ZFSBOOT_POOL="$POOL"
-export ALPINE_ZFSBOOT_NET \
+export ALPINE_ZFSBOOT_NET ALPINE_ZFSBOOT_NET_MAC \
     ALPINE_ZFSBOOT_IPV4 ALPINE_ZFSBOOT_IPV4_ADDRESS ALPINE_ZFSBOOT_IPV4_GATEWAY \
     ALPINE_ZFSBOOT_IPV6 ALPINE_ZFSBOOT_IPV6_ADDRESS ALPINE_ZFSBOOT_IPV6_GATEWAY \
     ALPINE_ZFSBOOT_SSH_LISTEN ALPINE_ZFSBOOT_SSH_PORT ALPINE_ZFSBOOT_SSH_ALLOW \
@@ -2023,6 +2048,9 @@ if [ -z "$POOL_IMPORT_ERROR" ]; then
         msg "WARNING: $POOL_IMPORT_ERROR"
     else
         export ALPINE_ZFSBOOT_BOOTFS="$BOOTFS"
+        # Mirrored boot: does the pool belong to the installation the ESP
+        # config came from? A warning only (esp-select.sh).
+        esp_check_pool_identity "$POOL"
         # `zpool status -x POOL` prints "pool 'POOL' is healthy" when
         # everything is fine, or a real problem description (DEGRADED,
         # FAULTED, a resilver in progress, ...) otherwise. menu.py's own

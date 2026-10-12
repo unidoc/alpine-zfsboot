@@ -1,4 +1,5 @@
 #include "fat.h"
+#include "bootparams.h"
 #include "disk.h"
 #include "switch32.h"
 
@@ -173,6 +174,39 @@ _Static_assert(sizeof(struct fat_dirent) == 32,
 #endif
 static uint8_t g_fat_io_buf[FAT_IO_BATCH_SECTORS * DISK_SECTOR_SIZE];
 
+/* See fat.h: stage2 borrows this buffer once loading is over (to read the
+ * loaded payload back for its digest) and prints its range in diagnostics. */
+uint8_t *const g_fat_io_buf_ptr = g_fat_io_buf;
+/* stage2_main.c builds boot_params in this buffer once loading is over. */
+_Static_assert(sizeof(g_fat_io_buf) >= BOOT_PARAMS_SIZE, "g_fat_io_buf must hold boot_params");
+const uint32_t g_fat_io_buf_size = sizeof(g_fat_io_buf);
+
+struct fat_error g_fat_error;
+
+const char *fat_err_name(enum fat_err r)
+{
+	switch (r) {
+	case FAT_ERR_GEOMETRY:      return "bad volume geometry";
+	case FAT_ERR_RANGE:         return "range outside the file";
+	case FAT_ERR_START_CLUSTER: return "bad first cluster";
+	case FAT_ERR_CHAIN_END:     return "FAT chain ends early";
+	case FAT_ERR_CHAIN_CYCLE:   return "FAT chain loops";
+	case FAT_ERR_CHAIN_LONG:    return "FAT chain longer than the volume";
+	case FAT_ERR_FAT_READ:      return "BIOS read of the FAT failed";
+	case FAT_ERR_DATA_READ:     return "BIOS read of file data failed";
+	default:                    return "unknown";
+	}
+}
+
+static int fat_fail(enum fat_err reason, uint32_t cluster, uint32_t value, uint64_t lba)
+{
+	g_fat_error.reason = reason;
+	g_fat_error.cluster = cluster;
+	g_fat_error.value = value;
+	g_fat_error.lba = lba;
+	return -1;
+}
+
 static int fat_read_sector(const struct fat_volume *vol, uint64_t lba, uint8_t *buf)
 {
 	(void)vol;
@@ -289,7 +323,7 @@ static int fat_get_next_cluster_slot(const struct fat_volume *vol, uint32_t clus
 	uint32_t fat_offset, sector_offset, raw;
 
 	if (cluster < 2 || cluster >= vol->total_clusters + 2)
-		return -1;
+		return fat_fail(FAT_ERR_CHAIN_END, cluster, cluster, 0);
 
 	fat_offset = cluster * 4u;
 	fat_sector = vol->fat_start_lba + fat_offset / vol->bytes_per_sector;
@@ -299,7 +333,7 @@ static int fat_get_next_cluster_slot(const struct fat_volume *vol, uint32_t clus
 		if (!g_fat_table_cache2_valid || g_fat_table_cache2_lba != fat_sector) {
 			if (fat_read_sector(vol, fat_sector, g_fat_table_cache2) != 0) {
 				g_fat_table_cache2_valid = 0;
-				return -1;
+				return fat_fail(FAT_ERR_FAT_READ, cluster, 0, fat_sector);
 			}
 			g_fat_table_cache2_lba = fat_sector;
 			g_fat_table_cache2_valid = 1;
@@ -313,7 +347,7 @@ static int fat_get_next_cluster_slot(const struct fat_volume *vol, uint32_t clus
 	if (!g_fat_table_cache_valid || g_fat_table_cache_lba != fat_sector) {
 		if (fat_read_sector(vol, fat_sector, g_fat_table_cache) != 0) {
 			g_fat_table_cache_valid = 0;
-			return -1;
+			return fat_fail(FAT_ERR_FAT_READ, cluster, 0, fat_sector);
 		}
 		g_fat_table_cache_lba = fat_sector;
 		g_fat_table_cache_valid = 1;
@@ -416,11 +450,11 @@ static int fat_chain_advance(const struct fat_volume *vol, struct fat_chain_walk
 	 * struct's header comment for why this is the correct bound, not
 	 * a fixed guess about realistic file sizes. */
 	if (w->hops++ > vol->total_clusters)
-		return -1;
+		return fat_fail(FAT_ERR_CHAIN_LONG, w->cluster, 0, 0);
 	if (fat_get_next_cluster(vol, w->cluster, &next) != 0)
-		return -1;
+		return -1; /* fat_fail() already recorded why */
 	if (!fat_cluster_in_range(vol, next))
-		return -1;
+		return fat_fail(FAT_ERR_CHAIN_END, w->cluster, next, 0);
 	w->cluster = next;
 
 	w->tortoise_due = !w->tortoise_due;
@@ -430,10 +464,10 @@ static int fat_chain_advance(const struct fat_volume *vol, struct fat_chain_walk
 		if (fat_get_next_cluster_slot(vol, w->tortoise, &t_next, 1) != 0)
 			return -1;
 		if (!fat_cluster_in_range(vol, t_next))
-			return -1;
+			return fat_fail(FAT_ERR_CHAIN_END, w->tortoise, t_next, 0);
 		w->tortoise = t_next;
 		if (w->tortoise == w->cluster)
-			return -1; /* cycle detected */
+			return fat_fail(FAT_ERR_CHAIN_CYCLE, w->cluster, 0, 0); /* cycle detected */
 	}
 	return 0;
 }
@@ -761,6 +795,29 @@ int fat_open(const struct fat_volume *vol, const char *path, struct fat_file *fi
 	}
 }
 
+void fat_cache_invalidate(void)
+{
+	g_fat_table_cache_valid = 0;
+	g_fat_table_cache2_valid = 0;
+}
+
+int fat_offset_lba(const struct fat_volume *vol, const struct fat_file *file, uint32_t offset, uint64_t *lba)
+{
+	struct fat_chain_walk w;
+	uint32_t cluster_bytes, i;
+
+	if (vol->sectors_per_cluster == 0 || vol->bytes_per_sector == 0 || offset >= file->size ||
+	    !fat_cluster_in_range(vol, file->first_cluster))
+		return -1;
+	cluster_bytes = vol->bytes_per_sector * vol->sectors_per_cluster;
+	fat_chain_walk_init(&w, file->first_cluster);
+	for (i = 0; i < offset / cluster_bytes; i++)
+		if (fat_chain_advance(vol, &w) != 0)
+			return -1;
+	*lba = cluster_to_lba(vol, w.cluster) + (offset % cluster_bytes) / vol->bytes_per_sector;
+	return 0;
+}
+
 int fat_read_range(const struct fat_volume *vol, const struct fat_file *file, uint32_t offset,
                     uint32_t length, uint32_t dst_phys, fat_progress_fn progress, void *progress_ctx)
 {
@@ -768,23 +825,33 @@ int fat_read_range(const struct fat_volume *vol, const struct fat_file *file, ui
 	uint32_t cluster_bytes, skip_clusters, i;
 	uint32_t remaining, sector_off, sector_in_cluster;
 
+	g_fat_error.reason = FAT_ERR_NONE;
+	g_fat_error.cluster = g_fat_error.value = g_fat_error.remaining = 0;
+	g_fat_error.lba = 0;
+
 	if (vol->sectors_per_cluster == 0 || vol->bytes_per_sector == 0)
-		return -1;
+		return fat_fail(FAT_ERR_GEOMETRY, 0, 0, 0);
 	cluster_bytes = vol->bytes_per_sector * vol->sectors_per_cluster;
 
-	if (offset > file->size || length > file->size - offset)
-		return -1; /* out of range - checked here, not left to the caller */
+	if (offset > file->size || length > file->size - offset) {
+		g_fat_error.remaining = length;
+		return fat_fail(FAT_ERR_RANGE, 0, 0, 0); /* out of range - checked here, not left to the caller */
+	}
 	if (length == 0)
 		return 0;
 
-	if (!fat_cluster_in_range(vol, file->first_cluster))
-		return -1;
+	if (!fat_cluster_in_range(vol, file->first_cluster)) {
+		g_fat_error.remaining = length;
+		return fat_fail(FAT_ERR_START_CLUSTER, file->first_cluster, 0, 0);
+	}
 	fat_chain_walk_init(&w, file->first_cluster);
 
 	skip_clusters = offset / cluster_bytes;
 	for (i = 0; i < skip_clusters; i++) {
-		if (fat_chain_advance(vol, &w) != 0)
-			return -1; /* chain ended, corrupt, or cyclic before reaching the requested offset */
+		if (fat_chain_advance(vol, &w) != 0) {
+			g_fat_error.remaining = length; /* chain ended, corrupt, or cyclic before reaching the requested offset */
+			return -1;
+		}
 	}
 
 	sector_in_cluster = (offset % cluster_bytes) / vol->bytes_per_sector;
@@ -829,8 +896,10 @@ int fat_read_range(const struct fat_volume *vol, const struct fat_file *file, ui
 		bytes_this_run = remaining < max_bytes_this_run ? remaining : max_bytes_this_run;
 		sectors_needed = (sector_off + bytes_this_run + vol->bytes_per_sector - 1) / vol->bytes_per_sector;
 
-		if (fat_read_sectors(vol, run_lba, sectors_needed, g_fat_io_buf) != 0)
-			return -1;
+		if (fat_read_sectors(vol, run_lba, sectors_needed, g_fat_io_buf) != 0) {
+			g_fat_error.remaining = remaining;
+			return fat_fail(FAT_ERR_DATA_READ, w.cluster, 0, run_lba);
+		}
 		unreal_copy(dst_phys, g_fat_io_buf + sector_off, bytes_this_run);
 		if (progress)
 			progress(progress_ctx, bytes_this_run);
@@ -850,8 +919,10 @@ int fat_read_range(const struct fat_volume *vol, const struct fat_file *file, ui
 		sector_off = 0;
 
 		for (i = 0; i < full_clusters_consumed && remaining > 0; i++) {
-			if (fat_chain_advance(vol, &w) != 0)
-				return -1; /* chain ended, corrupt, or cyclic before delivering all of `length` */
+			if (fat_chain_advance(vol, &w) != 0) {
+				g_fat_error.remaining = remaining; /* chain ended, corrupt, or cyclic before delivering all of `length` */
+				return -1;
+			}
 		}
 	}
 

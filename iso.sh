@@ -173,6 +173,20 @@ if [ -n "$BIOS_STAGE_ISO_BIN" ]; then
     mcopy -i "$WORK/efiboot.img" "$KERNEL_FILE" ::EFI/ALPINE/KERNEL
     mcopy -i "$WORK/efiboot.img" "$INITRD_FILE" ::EFI/ALPINE/INITRD
     mcopy -i "$WORK/efiboot.img" "$CMDLINE_FILE" ::EFI/ALPINE/CMDLINE
+    # PAYLOAD_MANIFEST_CMD (optional): a command run as
+    #   $PAYLOAD_MANIFEST_CMD --kernel K --initrd I --out DIR
+    # that writes DIR/CHECKSUM and DIR/BLKSUM (build.sh passes the tool's
+    # `alpine-zfsboot payload-manifest`; the tests bios/tests/mkmanifest).
+    # With them stage-iso.bin checks every 64 KiB block of the kernel and
+    # initrd as it loads and re-reads a block the BIOS delivered wrong.
+    # Without: an ISO exactly as before (stage-iso.bin says the payload is
+    # not verified and boots).
+    if [ -n "${PAYLOAD_MANIFEST_CMD:-}" ]; then
+        mkdir -p "$WORK/manifest"
+        $PAYLOAD_MANIFEST_CMD --kernel "$KERNEL_FILE" --initrd "$INITRD_FILE" --out "$WORK/manifest" >&2
+        mcopy -i "$WORK/efiboot.img" "$WORK/manifest/BLKSUM" ::EFI/ALPINE/BLKSUM
+        mcopy -i "$WORK/efiboot.img" "$WORK/manifest/CHECKSUM" ::EFI/ALPINE/CHECKSUM
+    fi
 fi
 
 # --- optional legacy-BIOS El Torito entry (x86_64, when the caller

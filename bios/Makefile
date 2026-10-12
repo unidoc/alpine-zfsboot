@@ -35,9 +35,18 @@ OBJCOPY ?= objcopy
 
 CFLAGS := -m16 -march=i386 -mno-mmx -mno-sse -mno-sse2 \
           -ffreestanding -fno-pic -fno-stack-protector -fno-strict-aliasing \
-          -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -c
+          -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -c $(EXTRA_CFLAGS)
 
-STAGE2_C_SRCS := stage2_main.c gpt.c mbr.c fat.c disk.c bootparams.c e820.c console.c
+# Test builds only, e.g. EXTRA_CFLAGS=-DDISK_FAULT_INJECT_MAX_SECTORS=16 (a BIOS
+# that rejects larger INT 13h transfers; see disk.c and
+# tests/bios-hdd-int13-limit-test.sh). Empty for every real build.
+# EXTRA_CFLAGS=-DBIOS_DIAG builds a stage2 that always prints its
+# diagnostics (E820 map, load ranges, every failed BIOS read - see
+# stage2_main.c); a normal build prints them only when the kernel command
+# line contains alpine-zfsboot.diag=1.
+EXTRA_CFLAGS ?=
+
+STAGE2_C_SRCS := stage2_main.c gpt.c mbr.c fat.c disk.c disk_policy.c bootparams.c e820.c e820_range.c payload_sum.c blkverify.c cmdline_opt.c console.c
 STAGE2_C_OBJS := $(STAGE2_C_SRCS:.c=.o)
 
 # stage-iso.bin: an alternative to stage1.bin+stage2.bin, for booting
@@ -56,10 +65,10 @@ STAGE2_C_OBJS := $(STAGE2_C_SRCS:.c=.o)
 # "no emulation" boot image, physical address 0x7c00, the same address
 # a normal MBR loads at - vs. 0x1000 for the stage1-loaded-stage2 case).
 ISO_SEG := 0x7c0
-STAGE2_ISO_C_SRCS := stage2_main.c gpt.c mbr.c fat.c cdrom_disk.c ata_atapi.c bootparams.c e820.c console.c
+STAGE2_ISO_C_SRCS := stage2_main.c gpt.c mbr.c fat.c cdrom_disk.c ata_atapi.c bootparams.c e820.c e820_range.c payload_sum.c blkverify.c cmdline_opt.c console.c
 STAGE2_ISO_C_OBJS := $(STAGE2_ISO_C_SRCS:%.c=iso_%.o)
 
-.PHONY: all clean build_id.h
+.PHONY: all clean build_id.h size-report check-dma-bounds
 
 all: stage1.bin stage2.bin stage-iso.bin
 
@@ -109,18 +118,28 @@ stage1.bin: stage1.elf
 	if [ "$$sig" != "55aa" ]; then \
 		echo "stage1.bin boot signature is $$sig, expected 55aa" >&2; exit 1; \
 	fi
+	@tail=$$(od -An -tx1 -v -j 440 -N 70 $@ | tr -d ' \n' | tr -d 0); \
+	if [ -n "$$tail" ]; then \
+		echo "stage1.bin has non-zero bytes in 440-509 (disk ID/partition table, never written by an installer) - stage1.S outgrew its 440 bytes" >&2; exit 1; \
+	fi
 
-# fat.c's own real-disk object gets a bigger FAT_IO_BATCH_SECTORS than
-# the shared default (see that file's own header comment on this
-# constant) - real INT13h/disk.c only, no ATAPI command-batching
-# ceiling to respect here, unlike iso_fat.o below (built by the generic
-# iso_%.o rule further down, at fat.c's own unmodified default).
-# check-bss-bounds (see stage2.elf's own recipe) is what actually
-# proves 64 is safe for THIS build - not asserted here, just applied.
-fat.o: fat.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h switch32.h stdint_local.h build_id.h
-	$(CC) $(CFLAGS) -DFAT_IO_BATCH_SECTORS=64 -o $@ $<
+# fat.c's real-disk object: 32-sector FAT batches (16 KiB). It was 64;
+# INT 13h transfers are capped at 16 sectors by default (disk.h) and
+# larger caps measured no faster, and the 16 KiB this frees pays for the
+# per-block payload checks (see HEADROOM above). An int13chunk= above 32
+# therefore behaves like 32. check-bss-bounds (see stage2.elf's own
+# recipe) is what proves the layout fits.
+fat.o: fat.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h payload_sum.h blkverify.h cmdline_opt.h switch32.h stdint_local.h build_id.h
+	$(CC) $(CFLAGS) -DFAT_IO_BATCH_SECTORS=32 -o $@ $<
 
-%.o: %.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h switch32.h stdint_local.h build_id.h
+# The integrity/memory-map checks (new, run once per boot) are compiled
+# for size: stage2's code, data and stack share one 64 KiB segment (see
+# check-bss-bounds below). Everything else stays at -O2.
+SIZE_OPT_OBJS := payload_sum.o e820_range.o iso_e820_range.o cmdline_opt.o iso_cmdline_opt.o \
+                 iso_payload_sum.o blkverify.o iso_blkverify.o
+$(SIZE_OPT_OBJS): CFLAGS += -Os
+
+%.o: %.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h payload_sum.h blkverify.h cmdline_opt.h switch32.h stdint_local.h build_id.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 stage2_entry.o: stage2_entry.S
@@ -137,13 +156,18 @@ stage2.elf: stage2_entry.o $(STAGE2_C_OBJS) switch32.o link.ld
 # 32768 bytes) - checked here for real rather than trusting stage1's
 # fixed-size read to just happen to be enough; bump STAGE2_SECTORS in
 # stage1.S (and this check) together if stage2 ever genuinely outgrows it.
-stage2.bin: stage2.elf
+#
+# stage2-sum.sh then fills in the length/checksum header words stage1.S
+# checks before jumping into stage2 (see stage2_entry.S); it may pad the
+# image by one byte to a whole number of 16-bit words.
+stage2.bin: stage2.elf stage2-sum.sh
 	$(OBJCOPY) -O binary $< $@
 	@size=$$(wc -c < $@); \
 	max=32768; \
 	if [ "$$size" -gt "$$max" ]; then \
 		echo "stage2.bin is $$size bytes, exceeds stage1.S's STAGE2_SECTORS budget ($$max bytes) - bump STAGE2_SECTORS in stage1.S to match" >&2; exit 1; \
 	fi
+	sh stage2-sum.sh $@
 
 # FORCE_ATAPI=1 make stage-iso.bin - forces cdrom_disk.c's ATAPI backend
 # even under QEMU/SeaBIOS, where INT13h normally succeeds and this whole
@@ -156,8 +180,14 @@ stage2.bin: stage2.elf
 # second, VGA-independent capture path for tests/bios-iso-entry-test.sh
 # to poll, after `pmemsave 0xb8000` proved unreliable in real CI. Empty
 # by default, so a normal build is unaffected here too.
-iso_%.o: %.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h switch32.h ata_atapi.h stdint_local.h build_id.h
-	$(CC) $(CFLAGS) -DSTAGE2_SEGMENT=$(ISO_SEG) $(if $(FORCE_ATAPI),-DZFSBOOT_FORCE_ATAPI) $(if $(TEST_SERIAL),-DZFSBOOT_TEST_SERIAL) -o $@ $<
+iso_%.o: %.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h payload_sum.h blkverify.h cmdline_opt.h switch32.h ata_atapi.h stdint_local.h build_id.h
+	$(CC) $(CFLAGS) -DSTAGE2_SEGMENT=$(ISO_SEG) -DZFSBOOT_ISO_BUILD $(if $(FORCE_ATAPI),-DZFSBOOT_FORCE_ATAPI) $(if $(TEST_SERIAL),-DZFSBOOT_TEST_SERIAL) -o $@ $<
+
+# The ISO stage's FAT batch: NATIVE_BATCH (cdrom_disk.c, 4 CD sectors =
+# 8 KiB) x 4 = 16 512-byte sectors, the same 8 KiB, so one FAT batch is one
+# CD read (see cdrom_disk.c).
+iso_fat.o: fat.c bootparams.h console.h disk.h e820.h fat.h gpt.h mbr.h payload_sum.h blkverify.h cmdline_opt.h switch32.h ata_atapi.h stdint_local.h build_id.h
+	$(CC) $(CFLAGS) -DSTAGE2_SEGMENT=$(ISO_SEG) -DZFSBOOT_ISO_BUILD $(if $(FORCE_ATAPI),-DZFSBOOT_FORCE_ATAPI) $(if $(TEST_SERIAL),-DZFSBOOT_TEST_SERIAL) -DFAT_IO_BATCH_SECTORS=16 -o $@ $<
 
 stage2_entry_iso.o: stage2_entry.S
 	$(AS) --32 --defsym SEG=$(ISO_SEG) -o $@ $<
@@ -172,6 +202,22 @@ switch32_iso.o: switch32.S
 stage-iso.elf: stage2_entry_iso.o $(STAGE2_ISO_C_OBJS) switch32_iso.o link.ld
 	$(LD) -m elf_i386 -T link.ld -o $@ stage2_entry_iso.o $(STAGE2_ISO_C_OBJS) switch32_iso.o
 	@$(MAKE) --no-print-directory check-bss-bounds ELF=$@
+	@$(MAKE) --no-print-directory check-dma-bounds
+
+# check-dma-bounds - the ISO stage's INT 13h transfer buffer
+# (cdrom_disk.c's g_native_buf) must not straddle a 64 KiB physical
+# boundary (a BIOS may reject or mishandle such a DMA transfer). Its
+# physical address is ISO_SEG*16 + its offset, and the segment 0x7c0 is
+# not 64 KiB-aligned, so where the linker puts it matters - see
+# cdrom_disk.c's comment above NATIVE_BATCH. (The disk build's buffers
+# live in segment 0x1000, physical 0x10000-0x1ffff: one aligned block.)
+check-dma-bounds:
+	@line=$$(nm -S stage-iso.elf | awk '$$4 == "g_native_buf"'); \
+	start=$$(( $(ISO_SEG) * 16 + 0x$$(echo "$$line" | cut -d' ' -f1) )); \
+	size=$$(( 0x$$(echo "$$line" | cut -d' ' -f2) )); \
+	if [ -z "$$line" ] || [ $$(( start >> 16 )) -ne $$(( (start + size - 1) >> 16 )) ]; then \
+		echo "check-dma-bounds: g_native_buf ($$line) straddles a 64 KiB physical boundary" >&2; exit 1; \
+	fi
 
 # check-bss-bounds ELF=<path> - real-mode segment-boundary invariant,
 # not just a comment: every stage2 symbol (link.ld's own ORIGIN 0,
@@ -239,8 +285,55 @@ stage-iso.elf: stage2_entry_iso.o $(STAGE2_ISO_C_OBJS) switch32_iso.o link.ld
 # below 0xfff0 today) - if a future change to either build ever erodes
 # that margin below STAGE2_STACK_MARGIN, this check is what is
 # supposed to catch it, not a real-hardware stack-corruption bug report.
+#
+# HEADROOM - _bss_end is the end of the WHOLE stage (code, data and .bss
+# share the one segment), so code size counts against this limit exactly
+# like buffers do, and it varies by compiler. There is a second limit: the
+# image itself (code + data, stage2.bin / stage-iso.bin) must fit the
+# 32768 bytes stage1 reads (and this Makefile allows the ISO stage).
+# Measured for this tree (`make size-report`; headroom = 0xfff0 -
+# STAGE2_STACK_MARGIN - _bss_end, i.e. room left beyond the guard), bytes:
+#
+#   compiler                        _bss_end headroom   image (of 32768)
+#                                     disk     ISO       disk     ISO
+#   gcc 15.2.0 (Alpine 3.24, CI)      8560   10448      31286   29414
+#   gcc 15.3.0 (Debian)               8560   10448      31286   29414
+#   gcc 14.2.0 (Debian)               9712   11600      30134   28262
+#   gcc 13.3.0 (Debian)               9808   11728      30038   28134
+#   gcc 12.4.0 (Debian)               9872   11760      29974   28102
+#   gcc 11.5.0 (Debian)               9712   11600      30134   28262
+#
+# The image is now the tighter limit (1482 bytes left on the release
+# compiler). What the self-verifying reads cost there (Alpine gcc 15.2,
+# .text bytes): blkverify.o 2046; disk.c's AH=41h/48h/08h probe and CHS
+# reads +928 (disk_select 534, CHS inlined into disk_int13_read_lba);
+# disk_policy.c +212; fat.c +324; in stage2_main.c the second source
+# 1100 (alt_try 584, hook_second 462, alt_leave 54), BLKSUM loading and
+# table reads 628, re-read/report hooks and load_file 1276, the boot
+# summary 1056. ISO stage: SHA-256 and CHECKSUM parsing 2965 (new there),
+# blkverify 2046 and its share of the glue. The .bss room came from the
+# disk I/O buffers: the disk FAT batch went from 64 to 32 sectors (16
+# KiB; INT 13h transfers are capped at 16 by default anyway, README "INT
+# 13h transfer size") and the ISO stage's CD batch from 9 to 4 CD sectors
+# with a 16-sector FAT batch (8 KiB each).
+#   clang 19: not a supported compiler here - the ISO stage does not
+#             build (ata_atapi.c inline asm; v0.4.1 neither).
+#   whole stage at -Os: does not build with gcc (disk.c's "ebp" asm
+#             clobber; v0.4.1 neither) - only the new, rarely-run code
+#             is compiled for size (SIZE_OPT_OBJS, SMALL in stage2_main.c).
+#
+# STAGE2_STACK_MARGIN, re-measured with -fstack-usage (Alpine gcc 15.2)
+# after the per-block checks made the call chain deeper: the deepest path
+# is now a heal that reaches the second source - stage2_main 400 ->
+# load_file 80 -> fat_read_range 112 -> load_progress 32 -> blkv_landed
+# (check_block inlined) 272 -> hook_second 80 -> alt_try 256 -> fat_open 96
+# -> fat_find_in_dir 608 -> disk_read_lba 64 -> disk_int13_read 8 ->
+# disk_int13_read_lba 128 = 2136 bytes, plus return addresses (~50) and
+# whatever the BIOS's own INT 13h handler pushes on this stack. 2048 no
+# longer covered that, so the margin is 3072: ~2.2 KiB measured + ~0.8 KiB
+# for the BIOS. Both builds pass with ~7 KiB to spare beyond it.
 STAGE2_STACK_TOP := 65520
-STAGE2_STACK_MARGIN := 2048
+STAGE2_STACK_MARGIN := 3072
 check-bss-bounds:
 	@bss_end_hex=$$(nm "$(ELF)" | awk '$$3 == "_bss_end" {print $$1}'); \
 	if [ -z "$$bss_end_hex" ]; then \
@@ -254,6 +347,19 @@ check-bss-bounds:
 	if [ "$$bss_end" -gt "$$limit" ]; then \
 		echo "check-bss-bounds: $(ELF) _bss_end is $$bss_end (0x$$bss_end_hex), within $(STAGE2_STACK_MARGIN) bytes of the stack's own start (sp=0x$$(printf '%x' $(STAGE2_STACK_TOP)), set once in stage2_entry.S and never moved) - .bss and the downward-growing real-mode stack are no longer guaranteed not to collide; shrink a .bss buffer or raise STAGE2_STACK_MARGIN only after re-checking the worst-case call depth this comment describes" >&2; exit 1; \
 	fi
+
+# make size-report - prints each stage's _bss_end and its headroom under the
+# check-bss-bounds limit (CI prints it on every run, see ci.yml).
+size-report: stage2.bin stage-iso.bin
+	@limit=$$(($(STAGE2_STACK_TOP) - $(STAGE2_STACK_MARGIN))); \
+	for e in stage2.elf stage-iso.elf; do \
+		end=$$((0x$$(nm "$$e" | awk '$$3 == "_bss_end" {print $$1}'))); \
+		printf '%-14s _bss_end=0x%04x limit=0x%04x headroom=%d bytes (%s)\n' "$$e" "$$end" "$$limit" "$$((limit - end))" "$$($(CC) --version | head -n1)"; \
+	done; \
+	for b in stage2.bin stage-iso.bin; do \
+		[ -f "$$b" ] || continue; \
+		printf '%-14s image %d of 32768 bytes, %d left\n' "$$b" "$$(wc -c < $$b)" "$$((32768 - $$(wc -c < $$b)))"; \
+	done
 
 # Budget matches stage2.bin's own (32768 bytes) - not tied to anything
 # El Torito itself imposes (its own -boot-load-size cap is far larger,

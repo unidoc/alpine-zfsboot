@@ -146,11 +146,28 @@ test-iso-atapi:
 # STAGE2_MAGIC/retry logic (which has no ISO equivalent at all - the
 # ISO build enters directly at stage2_entry.S, no stage1 of its own).
 # Also exercises stage2_main.c's GPT-then-MBR fallback for real (this
-# disk has no GPT header at all). Needs dosfstools (mkfs.vfat), mtools
+# disk has no GPT header at all). Boots it in several scenarios (see the
+# script's header): payload verified against EFI/ALPINE/CHECKSUM, no
+# CHECKSUM, a stale CHECKSUM in each integrity mode (warn boots, enforce
+# refuses, cmdline overrides), a corrupted stage2 tail, too little RAM, an
+# init_size overlapping the initrd, diagnostics on, and every pairing of
+# v0.4.1's stage1/stage2 (built from its git tag, or OLD_STAGE_DIR) with
+# this one; HDD_TEST_SCENARIOS="boot diag" picks some. Needs dosfstools (mkfs.vfat), mtools
 # (mmd/mcopy), qemu-system-x86_64, python3, on top of what
 # bios/Makefile already needs.
 test-hdd-entry:
     ./tests/bios-hdd-entry-test.sh
+
+# just test-mirror-boot  - mirrored boot (issue #24) and the rescue NIC by
+# MAC (issue #22) for real: two virtio disks with stage1/stage2 and an ESP
+# each, BIOS boot order "disk 2 only", the real kernel + initramfs from
+# a build (ARTIFACT_DIR, default ./out - run `just build x86_64` first)
+# with this tree's init scripts appended. Checks from /init's serial log
+# which ESP config/keys came from (first disk absent, wrecked, stale,
+# foreign ESP present, explicit list, legacy) and that the rescue network
+# comes up on the NIC alpine-zfsboot.net.mac= names. See the script header.
+test-mirror-boot:
+    ./tests/bios-mirror-boot-test.sh
 
 # just test-vga-console  - boots the built ISO in QEMU with VGA only (no
 # serial) and requires "press TAB to interrupt" on the VGA text screen;
@@ -175,6 +192,54 @@ test-ata-atapi-host:
 # gcc + python3, no Docker/Alpine container.
 test-fat-host:
     ./bios/tests/run-fat-host-test.sh
+
+# just test-disk-policy-host - host-native run of bios/disk_policy.c (the
+# INT 13h chunking/retry policy) against a fake BIOS that rejects large
+# transfers, fails one sector, or reports short transfers.
+test-disk-policy-host:
+    ./bios/tests/run-disk-policy-host-test.sh
+
+# just test-e820-range-host - host-native run of bios/e820_range.c: are the
+# kernel/initrd destinations E820 RAM, and where does the kernel live once
+# it runs (init_size).
+test-e820-range-host:
+    ./bios/tests/run-e820-range-host-test.sh
+
+# just test-payload-sum-host - host-native run of bios/payload_sum.c (the
+# EFI/ALPINE/CHECKSUM parser and SHA-256 stage2 verifies the loaded
+# kernel/initrd with) against sha256sum and the Go writer's golden file.
+test-payload-sum-host:
+    ./bios/tests/run-payload-sum-host-test.sh
+
+# just test-cmdline-opt-host - host-native run of bios/cmdline_opt.c: how
+# stage2 finds alpine-zfsboot.* keys in EFI/ALPINE/CMDLINE and parses
+# alpine-zfsboot.int13chunk=.
+test-cmdline-opt-host:
+    ./bios/tests/run-cmdline-opt-host-test.sh
+
+# just test-blkverify-host - host-native run of bios/blkverify.c (stage2's
+# per-block verify-and-heal) against a simulated BIOS that returns wrong
+# data in every fault-injection mode, plus the BLKSUM format vs the Go
+# writer's golden file.
+test-blkverify-host:
+    ./bios/tests/run-blkverify-host-test.sh
+
+# just test-hdd-fault / test-iso-fault - the QEMU boots with fault-injection
+# builds (CF=0 with wrong data, CHS, 4096-byte sectors, a mirror disk).
+test-hdd-fault:
+    ./tests/bios-hdd-fault-test.sh
+
+test-iso-fault:
+    ./tests/bios-iso-fault-test.sh
+
+# just test-fat-random-chains - fat.c against random valid FAT32 cluster chains.
+test-fat-random-chains:
+    ./bios/tests/run-fat-random-chains-test.sh
+
+# just test-bios-int13-limit - QEMU boot of a build whose INT 13h rejects
+# transfers above 16 sectors (see tests/bios-hdd-int13-limit-test.sh).
+test-bios-int13-limit:
+    ./tests/bios-hdd-int13-limit-test.sh
 
 # ── Release ──────────────────────────────────────────────────────────────────
 #

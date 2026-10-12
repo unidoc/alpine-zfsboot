@@ -209,7 +209,13 @@ start_rescue_ssh() {
     # starting rescue SSH (no point listening on an interface that
     # never came up), but net-config.sh itself has no idea dropbear
     # exists, and never will.
-    if ! net_config eth0; then
+    # eth0, or the card alpine-zfsboot.net.mac= names (net_resolve_iface:
+    # a configured MAC that matches no card fails here - never eth0).
+    if ! rescue_iface="$(net_resolve_iface)"; then
+        msg "rescue network card not found (alpine-zfsboot.net.mac=${ALPINE_ZFSBOOT_NET_MAC:-}) - rescue SSH cannot be reached, not starting dropbear"
+        return 1
+    fi
+    if ! net_config "$rescue_iface"; then
         msg "network bring-up failed - rescue SSH cannot be reached, not starting dropbear"
         return 1
     fi

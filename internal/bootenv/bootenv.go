@@ -54,8 +54,9 @@ func IsUEFI(root string) bool {
 // filesystem at all.
 type espCandidate struct {
 	dev              string
-	hasConfigMarker  bool // config, authorized_keys, or ssh_host_ed25519_key present
-	hasPayloadMarker bool // EFI/BOOT/BOOTX64.EFI, BOOTAA64.EFI, or EFI/ALPINE/KERNEL present
+	uuid             string // FAT volume UUID, for the refusal message
+	hasConfigMarker  bool   // config, authorized_keys, or ssh_host_ed25519_key present
+	hasPayloadMarker bool   // EFI/BOOT/BOOTX64.EFI, BOOTAA64.EFI, or EFI/ALPINE/KERNEL present
 }
 
 func (c espCandidate) qualifies() bool {
@@ -80,10 +81,18 @@ func selectESP(candidates []espCandidate) (string, error) {
 		return qualifying[0].dev, nil
 	default:
 		devs := make([]string, len(qualifying))
+		uuids := make([]string, len(qualifying))
 		for i, c := range qualifying {
 			devs[i] = c.dev
+			uuids[i] = c.uuid
+			if c.uuid != "" {
+				devs[i] = fmt.Sprintf("%s (UUID %s)", c.dev, c.uuid)
+			}
 		}
-		return "", fmt.Errorf("more than one alpine-zfsboot ESP found (%s) - refusing to guess", strings.Join(devs, ", "))
+		// Names the UUIDs and the exact way out (issue #24): a mirrored
+		// boot is a supported setup now, but still never a guess.
+		return "", fmt.Errorf("more than one alpine-zfsboot ESP found (%s) - refusing to guess. If they are this host's mirrored ESPs, adopt them: 'alpine-zfsboot esp adopt %s --yes', or list them: %s=%s (--esp-uuids, ALPINE_ZFSBOOT_ESP_UUIDS, or in EFI/ALPINE/config)",
+			strings.Join(devs, ", "), strings.Join(uuids, " "), layout.ESPUUIDsKey, strings.Join(uuids, ","))
 	}
 }
 
@@ -534,7 +543,14 @@ func probeESPCandidate(dev string) (espCandidate, error) {
 		return c, err
 	}
 	defer cleanup()
+	m, err := probeMarkers(mountpoint)
+	m.dev = dev
+	return m, err
+}
 
+// probeMarkers checks an already-mounted ESP for init's marker files.
+func probeMarkers(mountpoint string) (espCandidate, error) {
+	var c espCandidate
 	for _, marker := range []string{layout.ConfigFile, layout.AuthorizedKeysFile, layout.SSHHostEd25519KeyFile} {
 		if _, err := os.Stat(filepath.Join(mountpoint, marker)); err == nil {
 			c.hasConfigMarker = true
@@ -574,6 +590,9 @@ func FindESP() (string, error) {
 	candidates := make([]espCandidate, 0, len(devs))
 	for _, dev := range devs {
 		c, err := probeESPCandidate(dev)
+		if u, uerr := VolumeUUID(dev); uerr == nil {
+			c.uuid = u
+		}
 		if err != nil {
 			// A device that fails to mount/probe is not a fatal
 			// error for the whole search - e.g. a stale/foreign

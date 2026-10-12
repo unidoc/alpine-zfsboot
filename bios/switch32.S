@@ -33,6 +33,7 @@
 	.section .text
 
 	.global unreal_copy
+	.global unreal_read
 	.global jump_to_kernel
 	.global enable_a20
 
@@ -220,6 +221,56 @@ unreal_copy:
 	popw %es
 	pushl %eax
 	popfl
+	popl %edi
+	popl %esi
+	popl %ecx
+	movl %ebp, %esp
+	popl %ebp
+	ret
+
+/*
+ * unreal_read(dst, src_phys, len) - the reverse of unreal_copy(): copies
+ * len bytes FROM an arbitrary 32-bit physical address (e.g. the kernel
+ * already loaded at 1 MiB) TO a near pointer in this stage's own segment.
+ * Same brief protected-mode toggle and the same GDT entry as unreal_copy,
+ * but the flat descriptor goes into %ds (the source of rep movsb) while
+ * %es keeps this stage's own segment for the destination; %ds is reloaded
+ * with its real-mode value before returning. Used to read the loaded
+ * kernel/initrd back for their SHA-256 (see stage2_main.c), so the digest
+ * covers the bytes really in RAM at handoff, not the staging buffer.
+ */
+unreal_read:
+	pushl %ebp
+	movl %esp, %ebp
+	pushl %ecx
+	pushl %esi
+	pushl %edi
+	pushw %ds
+
+	movl 8(%ebp), %edi   /* dst: near pointer, ES-relative (ES = this stage's segment) */
+	movl 12(%ebp), %esi  /* src: arbitrary 32-bit physical address */
+	movl 16(%ebp), %ecx  /* len, bytes */
+
+	pushfl
+	cli
+	lgdt unreal_gdt_ptr  /* DS still has its real-mode value here */
+	movl %cr0, %eax
+	orl $1, %eax
+	movl %eax, %cr0
+	movw $0x08, %ax      /* flat 4 GiB data descriptor, base 0 */
+	movw %ax, %ds
+	movl %cr0, %eax
+	andl $0xfffffffe, %eax
+	movl %eax, %cr0
+
+	cld
+	addr32 rep movsb
+
+	popl %eax            /* saved EFLAGS */
+	popw %ds             /* real-mode reload: base back to this segment */
+	pushl %eax
+	popfl
+
 	popl %edi
 	popl %esi
 	popl %ecx
