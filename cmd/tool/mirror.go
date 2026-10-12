@@ -568,6 +568,13 @@ func diskHint(m *member) string {
 // that does not already carry exactly this record. gen is the generation
 // to record. A failure is that member's failure.
 func (h *host) finalizeMembers(ok []*member, gen uint64, pool string) map[*member]error {
+	return h.finalizeMembersAt(ok, func(*member) uint64 { return gen }, pool)
+}
+
+// finalizeMembersAt is finalizeMembers with a generation per member: a caller that only refreshes the member
+// list (esp add, esp remove) must not raise a member that is behind to the newest generation, because the
+// generation is what says which copy is newest.
+func (h *host) finalizeMembersAt(ok []*member, genOf func(*member) uint64, pool string) map[*member]error {
 	errs := map[*member]error{}
 	id, err := h.ensureInstallID()
 	if err != nil {
@@ -580,6 +587,7 @@ func (h *host) finalizeMembers(ok []*member, gen uint64, pool string) map[*membe
 	for _, m := range ok {
 		// POOL/DISK are informational: sanitized, so an odd by-id name or
 		// pool name can never fail a member whose payload was written.
+		gen := genOf(m)
 		want := espmember.Member{InstallID: id, Generation: gen, ESPUUID: m.info.UUID, Members: exp,
 			Pool: espmember.SanitizeInfo(pool), Disk: espmember.SanitizeInfo(diskHint(m)), Written: nowUTC()}
 		if cur, present, err := espmember.Read(m.mountpoint); present && err == nil &&
@@ -767,6 +775,21 @@ func forEachMember(root, firmware string, o hostOpts, fn func(*target) error) in
 		return exitFailure
 	}
 	defer withCleanup(h.cleanup)()
+	// A setting is a few words in CMDLINE and CHECKSUM's MODE line; it may be written while members differ only in
+	// such settings (that is how the operator brings them back in line). It must not be written while the payload
+	// itself (stages, KERNEL, INITRD, METADATA, BLKSUM) differs: a member that is behind must not look current.
+	if h.mirrored() {
+		if what := h.payloadDifference(); what != "" {
+			printErr(fmt.Errorf("the ESPs of this host's set differ in their boot payload already (%s) - run 'alpine-zfsboot update' first", what))
+			return exitFailure
+		}
+	}
+	before := map[*member]string{}
+	for _, m := range h.members {
+		if m.target != nil && !m.foreign {
+			before[m] = digestKey(digestMember(m))
+		}
+	}
 	failed := false
 	var reached []*member
 	for _, m := range h.members {
@@ -788,27 +811,45 @@ func forEachMember(root, firmware string, o hostOpts, fn func(*target) error) in
 		}
 		reached = append(reached, m)
 	}
-	h.recordSettingGeneration(reached, failed)
+	changed := false
+	for _, m := range reached {
+		if k, ok := before[m]; ok && k != digestKey(digestMember(m)) {
+			changed = true
+		}
+	}
+	h.recordSettingGeneration(reached, failed, changed)
 	h.warnMissing()
 	return h.exitCode(failed)
 }
 
-// recordSettingGeneration keeps the members honest about which copy of a setting
-// (int13chunk, integrity) is newest. When every member was reached they get the
-// same generation. When some were not (a detached disk, a failed write), the
-// members that WERE reached move to a newer generation, so the next `update`
-// treats them as the source and brings the others to the setting, instead of
-// copying an older member over it.
-func (h *host) recordSettingGeneration(reached []*member, someUnreached bool) {
-	if !h.mirrored() || len(reached) == 0 || h.installID == "" {
+// digestKey is a comparable form of a member's digest.
+func digestKey(d memberDigest) string {
+	names := make([]string, 0, len(d.files))
+	for n := range d.files {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, n := range names {
+		b.WriteString(n + "=" + d.files[n] + "\n")
+	}
+	return b.String()
+}
+
+// recordSettingGeneration keeps the members honest about which copy of a setting (int13chunk, integrity) is
+// newest. The members agreed before the setting was applied (forEachMember refuses otherwise). When it reached
+// all of them they still agree and nothing is recorded. When some were not reached (a detached disk, a failed
+// write) and something changed, the members that WERE reached move to a newer generation, so the next `update`
+// treats them as the source and brings the others to the setting instead of copying an older member over it.
+// A member that is behind is never raised: the generation says which copy is newest.
+func (h *host) recordSettingGeneration(reached []*member, someUnreached, changed bool) {
+	if !h.mirrored() || len(reached) == 0 || h.installID == "" || !changed {
 		return
 	}
-	gen := h.maxGeneration()
-	if someUnreached || len(h.set.Missing) > 0 {
-		gen++
-	} else if gen == 0 {
+	if !someUnreached && len(h.set.Missing) == 0 {
 		return
 	}
+	gen := h.maxGeneration() + 1
 	pool := ""
 	if src := h.bestSource(); src != nil {
 		pool = poolOf(src.target)
@@ -1302,6 +1343,70 @@ func runUpdate(root, firmware string, o hostOpts, yes bool, efiSrc release.Sourc
 	return h.exitCode(failed)
 }
 
+// payloadDifference names the first boot-payload file in which the present members of the set differ ("" = none).
+// CMDLINE, CHECKSUM (its MODE line), config, keys and the host key are settings/per-host files and are not payload.
+func (h *host) payloadDifference() string {
+	var ds []memberDigest
+	for _, m := range h.members {
+		if m.target != nil && !m.added && !m.foreign {
+			ds = append(ds, digestMember(m))
+		}
+	}
+	if len(ds) < 2 {
+		return ""
+	}
+	skip := func(name string) bool {
+		return strings.HasPrefix(name, layout.CmdlineFile) || name == layout.PayloadSumFile || name == layout.ConfigFile ||
+			name == layout.AuthorizedKeysFile || name == layout.SSHHostEd25519KeyFile
+	}
+	for _, d := range ds[1:] {
+		var names []string
+		for name, sum := range ds[0].files {
+			if !skip(name) && d.files[name] != sum {
+				names = append(names, name)
+			}
+		}
+		if len(names) > 0 {
+			sort.Strings(names)
+			return fmt.Sprintf("%s differs from %s in %s", d.m.label(), ds[0].m.label(), strings.Join(names, ", "))
+		}
+	}
+	return ""
+}
+
+// memberSettings are the operator-written settings a member carries: int13chunk and integrity words in CMDLINE and
+// CHECKSUM's MODE line. A setting that is absent (or CHECKSUM's default mode, warn) is "not set".
+type memberSettings struct {
+	int13chunk, integrityWord, mode string
+}
+
+func readMemberSettings(m *member) memberSettings {
+	var s memberSettings
+	if c, err := os.ReadFile(filepath.Join(m.mountpoint, layout.CmdlineFile)); err == nil {
+		s.int13chunk = cmdlineValue(string(c), layout.Int13ChunkKey)
+		s.integrityWord = cmdlineValue(string(c), "alpine-zfsboot.integrity")
+	}
+	if raw, err := os.ReadFile(filepath.Join(m.mountpoint, layout.PayloadSumFile)); err == nil {
+		if man, err := payloadsum.Decode(raw); err == nil && man.Mode != payloadsum.ModeWarn {
+			s.mode = man.Mode
+		}
+	}
+	return s
+}
+
+// lostBy names a setting that m has and src lacks or has differently: copying src over m would remove it.
+func (m memberSettings) lostBy(src memberSettings) string {
+	switch {
+	case m.int13chunk != "" && m.int13chunk != src.int13chunk:
+		return fmt.Sprintf("%s=%s (the other has %s)", layout.Int13ChunkKey, m.int13chunk, orNone(src.int13chunk))
+	case m.integrityWord != "" && m.integrityWord != src.integrityWord:
+		return fmt.Sprintf("alpine-zfsboot.integrity=%s in CMDLINE (the other has %s)", m.integrityWord, orNone(src.integrityWord))
+	case m.mode != "" && m.mode != src.mode:
+		return fmt.Sprintf("CHECKSUM MODE %s (the other has %s)", m.mode, orNone(src.mode))
+	}
+	return ""
+}
+
 // repairMember rewrites m from src when it carries the same build but
 // differs in content (compareMembers' "DIFFERS" case). A member of another
 // build is left to the normal update/STALE logic.
@@ -1342,6 +1447,12 @@ func (h *host) repairMember(src, m *member) (wrote bool, err error) {
 		if errs := payloadsum.Verify(man, k, i); len(errs) > 0 {
 			return false, refuse(fmt.Sprintf("itself fails its %s (%v)", layout.PayloadSumFile, errs[0]))
 		}
+	}
+	// Never remove an operator's setting: the member being rewritten must not carry one the source lacks. Two members
+	// that each carry a setting the other does not (a setting written while the other disk was away, then another
+	// while this one was) cannot be put in order by a generation: refuse and say what to do.
+	if lost := readMemberSettings(m).lostBy(readMemberSettings(src)); lost != "" {
+		return false, fmt.Errorf("%s differs from %s (%s), and rewriting it would remove a setting it carries: %s - not choosing between them. Set the values you want on every member with 'alpine-zfsboot int13chunk' / 'alpine-zfsboot integrity' (they work while the members differ only in settings), then run 'alpine-zfsboot update' again", m.label(), src.label(), strings.Join(diff, ", "), lost)
 	}
 	fmt.Printf("%s differs from %s at the same build (%s) - rewriting it from %s\n", m.label(), src.label(), strings.Join(diff, ", "), src.label())
 	if err := copyBootChain(h, src, m); err != nil {

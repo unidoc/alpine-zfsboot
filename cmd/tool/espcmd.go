@@ -305,7 +305,18 @@ func runESPAdd(root, firmware string, o hostOpts, arg string, yes bool) int {
 		printErr(err)
 		failed = true
 	}
-	for x, err := range h.finalizeMembers(ok, gen, poolOf(src.target)) {
+	// Only the new ESP takes the source's generation; the others keep their own (the list is refreshed, nothing
+	// about their content changed, so a member that is behind must not look newer).
+	ownGen := func(x *member) uint64 {
+		if x == m {
+			return gen
+		}
+		if g := x.info.Generation(); g > 0 {
+			return g
+		}
+		return gen
+	}
+	for x, err := range h.finalizeMembersAt(ok, ownGen, poolOf(src.target)) {
 		printErr(fmt.Errorf("%s: %w", x.label(), err))
 		failed = true
 	}
@@ -438,7 +449,14 @@ func runESPRemove(root, firmware string, o hostOpts, arg string, yes bool) int {
 			ok = append(ok, m)
 		}
 	}
-	for m, err := range h.finalizeMembers(ok, h.maxGeneration(), poolOf(srcTarget(h.bestSource()))) {
+	maxGen := h.maxGeneration()
+	keepGen := func(x *member) uint64 {
+		if g := x.info.Generation(); g > 0 {
+			return g
+		}
+		return maxGen
+	}
+	for m, err := range h.finalizeMembersAt(ok, keepGen, poolOf(srcTarget(h.bestSource()))) {
 		printErr(fmt.Errorf("%s: %w", m.label(), err))
 		failed = true
 	}

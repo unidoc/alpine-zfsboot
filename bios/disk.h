@@ -125,6 +125,7 @@ void disk_reset(void);
 
 /* ISO stage only: 1 when the ATAPI driver (not INT 13h) serves the reads. */
 int disk_cd_atapi(void);
+extern uint16_t g_cd_retries; /* ISO build: CD read attempts that failed and were retried */
 
 /* LBA -> CHS for AH=02h (pure, host-tested): 0 and cylinder, head and sector plus how
  * many sectors are left in that track, or -1 when the LBA lies beyond

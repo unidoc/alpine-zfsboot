@@ -40,6 +40,7 @@ func verifyOut(t *testing.T) (int, string) {
 // F5: int13chunk set while member B is missing; B returns: same
 // generation, different CMDLINE. 'update' (as verify advises) must rewrite B.
 func TestUpdate_HealsSettingWrittenWhileMemberWasMissing(t *testing.T) {
+	needX86BIOS(t)
 	_, a, b := markedMirror(t)
 	b.present = false
 	captureOutput(t, func() {
@@ -66,6 +67,7 @@ func TestUpdate_HealsSettingWrittenWhileMemberWasMissing(t *testing.T) {
 
 // F5: B's KERNEL corrupted (bit rot), same build: update rewrites it from A.
 func TestUpdate_RepairsCorruptMemberAtSameBuild(t *testing.T) {
+	needX86BIOS(t)
 	_, a, b := markedMirror(t)
 	p := filepath.Join(b.dir, layout.KernelFile)
 	k, _ := os.ReadFile(p)
@@ -328,6 +330,7 @@ func TestWritePayload_BlkSumRemovalFailureRestoresChecksum(t *testing.T) {
 // F15: the setting reached B only (A was away). A is first in host order, but B is the newer copy: update
 // must bring A to the setting, never revert B to A's old CMDLINE.
 func TestUpdate_KeepsSettingWrittenWhileFirstMemberWasMissing(t *testing.T) {
+	needX86BIOS(t)
 	_, a, b := markedMirror(t)
 	a.present = false
 	captureOutput(t, func() {
@@ -391,5 +394,168 @@ func TestUpdate_RefusesToRepairFromAnUnverifiableSource(t *testing.T) {
 				t.Errorf("update must not report success when it refused to repair (exit 0)\n%s", lastLines(uout, 8))
 			}
 		})
+	}
+}
+
+// A setting may be written while the members differ only in settings (that is how the operator brings them back in
+// line), and `update` then keeps every setting: a member is only rewritten from one that carries all of its settings.
+func TestSetting_TwoStepKeepsBothSettings(t *testing.T) {
+	needX86BIOS(t)
+	_, a, b := markedMirror(t)
+	a.present = false
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+	})
+	a.present = true
+	if code := forEachMember("/", "", hostOpts{}, func(t *target) error { return setIntegrityMode(t, payloadsum.ModeEnforce) }); code != 0 {
+		t.Fatalf("the second setting while only settings differ: exit %d", code)
+	}
+	if ucode, uout := runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261001T000000Z", 1), biosOpts{integrity: "warn"}); ucode != 0 {
+		t.Fatalf("update: exit %d\n%s", ucode, uout)
+	}
+	for _, e := range []*fakeESP{a, b} {
+		if !strings.Contains(readESP(t, e, layout.CmdlineFile), "int13chunk=8") || !strings.Contains(readESP(t, e, layout.PayloadSumFile), "MODE enforce") {
+			t.Errorf("a member lacks one of the two settings after update")
+		}
+	}
+}
+
+// The reverse order: integrity reached only B, then int13chunk on both.
+func TestSetting_TwoStepReverseKeepsBothSettings(t *testing.T) {
+	needX86BIOS(t)
+	_, a, b := markedMirror(t)
+	a.present = false
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setIntegrityMode(t, payloadsum.ModeEnforce) })
+	})
+	a.present = true
+	if code := forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "16") }); code != 0 {
+		t.Fatalf("the second setting: exit %d", code)
+	}
+	if ucode, uout := runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261001T000000Z", 1), biosOpts{integrity: "warn"}); ucode != 0 {
+		t.Fatalf("update: exit %d\n%s", ucode, uout)
+	}
+	for _, e := range []*fakeESP{a, b} {
+		if !strings.Contains(readESP(t, e, layout.CmdlineFile), "int13chunk=16") || !strings.Contains(readESP(t, e, layout.PayloadSumFile), "MODE enforce") {
+			t.Errorf("a member lacks one of the two settings after update")
+		}
+	}
+}
+
+// Split brain: each member got a different setting while the other was away. No generation can order them, so update
+// refuses (non-zero, names the setting, changes nothing); setting both on every member resolves it.
+func TestSetting_SplitBrainIsRefusedNotResolvedByChoosing(t *testing.T) {
+	needX86BIOS(t)
+	_, a, b := markedMirror(t)
+	b.present = false
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+	})
+	b.present = true
+	a.present = false
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setIntegrityMode(t, payloadsum.ModeEnforce) })
+	})
+	a.present = true
+	ucode, uout := runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261001T000000Z", 1), biosOpts{integrity: "warn"})
+	if ucode == 0 {
+		t.Errorf("update must not exit 0 while it cannot keep both settings\n%s", lastLines(uout, 8))
+	}
+	if !strings.Contains(uout, "remove a setting") {
+		t.Errorf("update must name the setting it will not remove\n%s", lastLines(uout, 8))
+	}
+	chunk := strings.Contains(readESP(t, a, layout.CmdlineFile), "int13chunk=8") || strings.Contains(readESP(t, b, layout.CmdlineFile), "int13chunk=8")
+	enf := strings.Contains(readESP(t, a, layout.PayloadSumFile), "MODE enforce") || strings.Contains(readESP(t, b, layout.PayloadSumFile), "MODE enforce")
+	if !chunk || !enf {
+		t.Errorf("a setting was removed from every member: int13chunk=8 %v, enforce %v", chunk, enf)
+	}
+	// the way out the message names: set both on every member, then update.
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setIntegrityMode(t, payloadsum.ModeEnforce) })
+	})
+	if ucode, uout := runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261001T000000Z", 1), biosOpts{integrity: "warn"}); ucode != 0 {
+		t.Errorf("update after setting both everywhere: exit %d\n%s", ucode, lastLines(uout, 8))
+	}
+}
+
+// Audit: a member that is behind (a failed update) is never raised to the newest generation by a setting.
+func TestSetting_NeverPromotesAStaleMember(t *testing.T) {
+	needX86BIOS(t)
+	_, a, _ := markedMirror(t)
+	orig := writeManifestFile
+	t.Cleanup(func() { writeManifestFile = orig })
+	writeManifestFile = func(mp, rel string, c []byte, m os.FileMode) error {
+		if mp == a.dir && rel == layout.BlkSumFile {
+			return errors.New("injected")
+		}
+		return orig(mp, rel, c, m)
+	}
+	runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261005T000000Z", 2), biosOpts{integrity: "warn"})
+	writeManifestFile = orig
+	genA := memberOf(t, a).Generation
+	code := forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+	if code == 0 {
+		t.Errorf("a setting on a stale member must be refused (run update first)")
+	}
+	if memberOf(t, a).Generation != genA {
+		t.Errorf("the stale member was promoted: generation %d -> %d", genA, memberOf(t, a).Generation)
+	}
+}
+
+// Audit: no-op setting runs with a member away do not push the generation up.
+func TestSetting_NoChangeDoesNotBumpTheGeneration(t *testing.T) {
+	_, a, b := markedMirror(t)
+	a.present = false
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+	})
+	g := memberOf(t, b).Generation
+	for i := 0; i < 4; i++ {
+		captureOutput(t, func() {
+			forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+		})
+	}
+	if memberOf(t, b).Generation != g {
+		t.Errorf("generation grew with no change: %d -> %d", g, memberOf(t, b).Generation)
+	}
+}
+
+// Audit: `esp add` refreshes the member list but never raises an existing member that is behind.
+func TestESPAdd_DoesNotPromoteAStaleMember(t *testing.T) {
+	needX86BIOS(t)
+	f, a, b := markedMirror(t)
+	f.addESP("CCCC-0003", "/dev/sdc1")
+	orig := writeManifestFile
+	t.Cleanup(func() { writeManifestFile = orig })
+	writeManifestFile = func(mp, rel string, c []byte, m os.FileMode) error {
+		if mp == a.dir && rel == layout.BlkSumFile {
+			return errors.New("injected")
+		}
+		return orig(mp, rel, c, m)
+	}
+	runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261005T000000Z", 2), biosOpts{integrity: "warn"})
+	writeManifestFile = orig
+	genA := memberOf(t, a).Generation
+	if genA >= memberOf(t, b).Generation {
+		t.Fatalf("setup: A should be behind B (A %d, B %d)", genA, memberOf(t, b).Generation)
+	}
+	captureOutput(t, func() { runESPAdd("/", "", hostOpts{}, "CCCC-0003", true) })
+	if memberOf(t, a).Generation != genA {
+		t.Errorf("esp add raised the stale member A: %d -> %d", genA, memberOf(t, a).Generation)
+	}
+}
+
+// Audit: with two integrity= words, stage2 reads the first and ignores the setting if that one is invalid.
+func TestCmdlineIntegrityTakesTheFirstWordOnly(t *testing.T) {
+	for in, want := range map[string]string{
+		"a alpine-zfsboot.integrity=enforce b":                           "enforce",
+		"alpine-zfsboot.integrity=warm alpine-zfsboot.integrity=enforce": "",
+		"alpine-zfsboot.integrity=off alpine-zfsboot.integrity=enforce":  "off",
+		"nothing here": "",
+	} {
+		if got := cmdlineIntegrity(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
 	}
 }

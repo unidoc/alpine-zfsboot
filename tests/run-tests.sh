@@ -9612,6 +9612,13 @@ E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" sdc1 CCCC-0003 RESCUE; m
 printf 'ssh-ed25519 AAAAFOREIGN other-host\n' > "$E/esps/sdc1/EFI/ALPINE/authorized_keys"
 expect_esp "unmarked LABEL=EFI host ESP + marked foreign stick: the host ESP wins" "$E" "rc=0 dev=/dev/vda1 uuid=AAAA-0001 id=" "" "" "ignoring ESP CCCC-0003 (/dev/sdc1): it belongs to installation $ID_B, which has no LABEL=EFI ESP here"
 rm -rf "$E"
+# ... a marked MIRROR (two or more ESPs) whose volumes are not labelled EFI is this host's own: a leftover unmarked
+# LABEL=EFI ESP (a removed member, an old disk) must not outrank it.
+E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001
+mk_esp "$E" vdb1 BBBB-0002 BOOTA; mk_member "$E" vdb1 "$ID_A" 3 BBBB-0002,CCCC-0003 BBBB-0002
+mk_esp "$E" vdc1 CCCC-0003 BOOTB; mk_member "$E" vdc1 "$ID_A" 9 BBBB-0002,CCCC-0003 CCCC-0003
+expect_esp "marked mirror without LABEL=EFI beats a leftover unmarked LABEL=EFI ESP" "$E" "rc=0 dev=/dev/vdc1 uuid=CCCC-0003"
+rm -rf "$E"
 # ... a marked group that does have a LABEL=EFI ESP still beats the unmarked one (unchanged).
 E="$(esp_env)"; mk_esp "$E" vda1 AAAA-0001; mk_esp "$E" vdb1 BBBB-0002; mk_member "$E" vdb1 "$ID_A" 2 BBBB-0002 BBBB-0002
 expect_esp "marked LABEL=EFI member still beats an unmarked LABEL=EFI ESP" "$E" "rc=0 dev=/dev/vdb1 uuid=BBBB-0002"

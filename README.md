@@ -775,13 +775,23 @@ ESP of the set without any option:
   same build as the best ESP but different content (a setting written
   while it was absent, bit rot in `KERNEL`): `update` then rewrites it from
   the best ESP, payload first and its generation last. The best ESP is
-  the one with the highest generation (the first in disk order among equals);
+  the one with the highest generation (among equals the primary ESP, then
+  the list position, then the UUID - never device names);
   `update` refuses to copy from a best ESP whose `CHECKSUM` is missing,
   unreadable or fails its own `KERNEL`/`INITRD`, and exits 1 naming it.
-  `int13chunk` and `integrity` keep that honest: when they reach only some
-  ESPs (a detached disk), the ones they did write move to a newer generation,
-  so the next `update` brings the others to the setting instead of copying an
-  older ESP over it. `config`, `authorized_keys` and the host key are copied
+  `int13chunk` and `integrity` keep that honest: they refuse to run while the
+  boot payload of the ESPs differs (run `update` first); when they reach only
+  some ESPs (a detached disk) and change something, the ones they did write
+  move to a newer generation. `update` never removes a setting: it rewrites a
+  member only from one that carries every setting the member carries (the
+  `int13chunk` and `integrity` words in `CMDLINE`, a `CHECKSUM` mode other than
+  `warn`). Two members that each carry a setting the other lacks - one written
+  while the other disk was away, another while this one was - cannot be put in
+  order by a generation: `update` refuses (exit 1) and names the setting; set
+  the values you want on every member with `int13chunk` and `integrity` (they
+  work while the members differ only in settings), then run `update` again. A
+  member that is behind is never raised to the newest generation by a setting or
+  by `esp add` and `esp remove`, and generations are not levelled. `config`, `authorized_keys` and the host key are copied
   from the newest ESP to the others.
 - `verify` checks every ESP as it checks a single one, then **compares
   them**: stage1, stage2, `KERNEL`, `INITRD`, `CMDLINE` (without the
@@ -861,10 +871,11 @@ config, `authorized_keys` and host key it applies, strongest rule first:
    used as that list.
 
 If an unmarked `LABEL=EFI` ESP with alpine-zfsboot files exists and the
-only marker group present has no `LABEL=EFI` ESP (a rescue stick, a disk
-moved in from another machine), the unmarked host ESP is used as before
-0.5.0 (rule 4) and the foreign group is reported as ignored; two or more
-marker groups are still refused.
+only marker group present is a **single** ESP without the `LABEL=EFI` label
+(a rescue stick, a disk moved in from another machine), the unmarked host ESP
+is used as before 0.5.0 (rule 4) and the foreign ESP is reported as ignored.
+A marker group of two or more ESPs is a mirror and is this host's own whatever
+its labels say; two or more marker groups are still refused.
 
 In steps 1 and 3 the chosen ESP must also carry a boot binary or `KERNEL`
 and config/keys, and - when it has a `CHECKSUM` - its `KERNEL`/`INITRD`

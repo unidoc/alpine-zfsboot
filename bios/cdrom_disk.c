@@ -237,6 +237,7 @@ void disk_set_chunk(uint16_t sectors)
 }
 
 static uint8_t g_drive_number;
+uint16_t g_cd_retries; /* failed CD read attempts (INT 13h and ATAPI): the boot summary appears when nonzero */
 static int g_use_int13;
 static int g_atapi_probed;
 static int g_atapi_ready;
@@ -527,6 +528,7 @@ static int native_read_batch_raw(uint32_t native_lba, uint32_t native_count)
 					console_puts("alpine-zfsboot-bios: CD-ROM read retry succeeded (INT13h)\n");
 				return 0;
 			}
+			g_cd_retries++;
 		}
 		console_puts("alpine-zfsboot-bios: CD-ROM read failed after retries (INT13h), falling back to ATAPI\n");
 		g_use_int13 = 0;
@@ -546,6 +548,7 @@ static int native_read_batch_raw(uint32_t native_lba, uint32_t native_count)
 			return 0;
 		}
 		console_puts("alpine-zfsboot-bios: CD-ROM read failed (ATAPI), retrying\n");
+		g_cd_retries++;
 	}
 
 	console_puts("alpine-zfsboot-bios: CD-ROM read failed after retries (ATAPI)\n");

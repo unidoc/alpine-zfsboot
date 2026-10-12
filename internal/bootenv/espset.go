@@ -355,7 +355,9 @@ func SelectHost(infos []ESPInfo, opts SelectOpts) (HostSet, error) {
 		for _, i := range infos {
 			unmarked = unmarked || (i.Label == layout.FATVolumeLabel && i.Qualifies && i.Member == nil && i.MemberErr == nil)
 		}
-		if !primaryMarked && !hasEFI && unmarked {
+		// A group of two or more ESPs is a mirror - this host's own, whatever its volume labels say; only a lone
+		// ESP (a stick, a moved disk) gives way to an unmarked LABEL=EFI host ESP.
+		if !primaryMarked && !hasEFI && unmarked && len(foreign) == 1 {
 			for _, i := range foreign {
 				ignored = append(ignored, Ignored{i, fmt.Sprintf("ignored: belongs to another installation (install id %s) and no ESP of that group is labeled %q, while an unmarked %q ESP with alpine-zfsboot files exists", i.Member.InstallID, layout.FATVolumeLabel, layout.FATVolumeLabel)})
 			}

@@ -231,6 +231,20 @@ jobs:
       - name: Run tests/bios-hdd-fault-test.sh
         run: ./tests/ci-alpine.sh ./tests/bios-hdd-fault-test.sh
 
+  fat-random-chains-host-test:
+    # bios/tests/run-fat-random-chains-test.sh: fat.c (the loader's FAT reader) against many random valid
+    # FAT32 cluster chains, built at both batch sizes the loader ships with. Host-only, no QEMU.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run bios/tests/run-fat-random-chains-test.sh
+        run: ./tests/ci-alpine.sh ./bios/tests/run-fat-random-chains-test.sh
+
   ata-atapi-host-test:
     # bios/tests/ata_atapi_host_test.c - regression guard for the same
     # multi-phase-transfer double-advance bug bios-iso-atapi-test above

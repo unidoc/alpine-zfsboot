@@ -7,7 +7,9 @@
 # a Debian/Ubuntu gcc once passed where Alpine's failed.
 set -eu
 cd "$(dirname "$0")/.."
-exec docker run --rm -v "$PWD:/work" -w /work \
+# x86_64 on purpose: the BIOS loader is x86 real mode and its size budget is measured with the x86_64
+# toolchain; on an arm64 Docker host an arm64 Alpine would fail (`as --32`).
+exec docker run --rm --platform linux/amd64 -v "$PWD:/work" -w /work \
     -e FORCE_ATAPI -e HDD_TEST_SCENARIOS -e OLD_STAGE_REF \
     "alpine:$(cat alpine-version.txt)" sh -c '
         set -e

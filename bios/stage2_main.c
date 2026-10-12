@@ -1026,7 +1026,7 @@ SMALL static void boot_summary(void)
 		console_puts("\n");
 	}
 #else
-	event = mism || g_blk_table_bad;
+	event = mism || g_blk_table_bad || g_cd_retries;
 	if (!event)
 		return;
 	console_puts(disk_cd_atapi() ? "summary: cd atapi cap " : "summary: cd int13 cap ");

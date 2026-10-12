@@ -856,8 +856,12 @@ func inspectPayloadSum(mountpoint string) (present bool, mode string, err error)
 // kernel command line when it is one stage2 accepts (it ignores others).
 func cmdlineIntegrity(cmd string) string {
 	for _, w := range strings.Fields(cmd) {
-		if v, ok := strings.CutPrefix(w, "alpine-zfsboot.integrity="); ok && payloadsum.ValidMode(v) {
-			return v
+		if v, ok := strings.CutPrefix(w, "alpine-zfsboot.integrity="); ok {
+			// stage2 reads the FIRST such word and ignores the setting if it is invalid.
+			if payloadsum.ValidMode(v) {
+				return v
+			}
+			return ""
 		}
 	}
 	return ""

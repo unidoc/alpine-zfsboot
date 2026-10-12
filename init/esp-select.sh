@@ -396,8 +396,13 @@ esp_select() {
         # unmarked LABEL=EFI ESP holds alpine-zfsboot files: that is the
         # host's own (legacy, or an update interrupted before MEMBER was
         # written), the group a foreign disk or rescue stick. The host
-        # ESP wins (rule 4), as before markers existed.
+        # ESP wins (rule 4), as before markers existed. Only for a group
+        # of ONE ESP (a stick): a marked group of two or more is a mirror,
+        # this host's own whatever its volume labels say, and a leftover
+        # unmarked LABEL=EFI ESP (a removed member, an old disk) must not
+        # outrank it.
         if [ -z "$(awk -v id="$_gid" '$6=="valid" && $7==id && $3=="EFI" {print $2}' "$ESP_SCAN")" ] && \
+           [ "$(awk -v id="$_gid" '$6=="valid" && $7==id' "$ESP_SCAN" | wc -l)" -eq 1 ] && \
            [ -n "$(awk '$3=="EFI" && $5=="1" && $6=="none" {print $2}' "$ESP_SCAN")" ]; then
             for _u in $(awk -v id="$_gid" '$6=="valid" && $7==id {print $2}' "$ESP_SCAN"); do
                 msg "ignoring ESP $_u ($(_esp_field "$_u" 1)): it belongs to installation $_gid, which has no LABEL=EFI ESP here, while an unmarked LABEL=EFI ESP with alpine-zfsboot files is present - that one is this host's"
