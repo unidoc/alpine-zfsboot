@@ -851,6 +851,7 @@ func TestMirror_OddDiskHintNeverFailsAMember(t *testing.T) {
 // BLKSUM on a mirrored boot: written on every member (before MEMBER),
 // verified on every member, and part of the mirror consistency check.
 func TestMirror_BlkSumOnEveryMember(t *testing.T) {
+	needX86BIOS(t)
 	_, a, b := markedMirror(t)
 	for _, e := range []*fakeESP{a, b} {
 		raw := readESP(t, e, layout.BlkSumFile)
@@ -890,6 +891,7 @@ func TestMirror_BlkSumOnEveryMember(t *testing.T) {
 // generation not bumped), the other member is still updated, and verify
 // names the stale one.
 func TestMirror_BlkSumWriteFailureRollsBackThatMemberOnly(t *testing.T) {
+	needX86BIOS(t)
 	_, a, b := markedMirror(t)
 	oldA := map[string]string{}
 	for _, rel := range []string{layout.KernelFile, layout.InitrdFile, layout.CmdlineFile, layout.PayloadSumFile, layout.BlkSumFile} {

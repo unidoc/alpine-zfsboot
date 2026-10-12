@@ -480,16 +480,23 @@ func (h *host) checkDistinctDisks() error {
 }
 
 // bestSource is the member config/keys and seed settings are taken from:
-// the best present member that is already installed (not one being added)
-// and never one marked for another installation - a foreign ESP's keys
-// must never reach this host's ESPs, whatever its generation.
+// the present member that is already installed (not one being added) with the
+// HIGHEST generation - the newest copy of what the operator wrote - and, among
+// equals, the first in host order. Never one marked for another installation:
+// a foreign ESP's keys must never reach this host's ESPs, whatever its
+// generation. (Choosing by position alone let `update` copy an older member
+// over the one that carried a setting written while the first disk was away.)
 func (h *host) bestSource() *member {
+	var best *member
 	for _, m := range h.members {
-		if m.target != nil && !m.added && !m.foreign {
-			return m
+		if m.target == nil || m.added || m.foreign {
+			continue
+		}
+		if best == nil || m.info.Generation() > best.info.Generation() {
+			best = m
 		}
 	}
-	return nil
+	return best
 }
 
 func (h *host) ensureInstallID() (string, error) {
@@ -761,6 +768,7 @@ func forEachMember(root, firmware string, o hostOpts, fn func(*target) error) in
 	}
 	defer withCleanup(h.cleanup)()
 	failed := false
+	var reached []*member
 	for _, m := range h.members {
 		if h.mirrored() {
 			fmt.Printf("== %s ==\n", m.label())
@@ -776,10 +784,38 @@ func forEachMember(root, firmware string, o hostOpts, fn func(*target) error) in
 			} else {
 				printErr(err)
 			}
+			continue
 		}
+		reached = append(reached, m)
 	}
+	h.recordSettingGeneration(reached, failed)
 	h.warnMissing()
 	return h.exitCode(failed)
+}
+
+// recordSettingGeneration keeps the members honest about which copy of a setting
+// (int13chunk, integrity) is newest. When every member was reached they get the
+// same generation. When some were not (a detached disk, a failed write), the
+// members that WERE reached move to a newer generation, so the next `update`
+// treats them as the source and brings the others to the setting, instead of
+// copying an older member over it.
+func (h *host) recordSettingGeneration(reached []*member, someUnreached bool) {
+	if !h.mirrored() || len(reached) == 0 || h.installID == "" {
+		return
+	}
+	gen := h.maxGeneration()
+	if someUnreached || len(h.set.Missing) > 0 {
+		gen++
+	} else if gen == 0 {
+		return
+	}
+	pool := ""
+	if src := h.bestSource(); src != nil {
+		pool = poolOf(src.target)
+	}
+	for m, err := range h.finalizeMembers(reached, gen, pool) {
+		printErr(fmt.Errorf("%s: recording generation %d: %w", m.label(), gen, err))
+	}
 }
 
 func (h *host) warnMissing() {
@@ -1286,15 +1322,25 @@ func (h *host) repairMember(src, m *member) (wrote bool, err error) {
 	}
 	sort.Strings(diff)
 	if !h.uefi {
-		// Never spread a damaged copy: the source must pass its own CHECKSUM.
-		if raw, rerr := os.ReadFile(filepath.Join(src.mountpoint, layout.PayloadSumFile)); rerr == nil {
-			if man, derr := payloadsum.Decode(raw); derr == nil {
-				if k, i, _, kerr := readInstalledKernelInitrd(src.target); kerr == nil {
-					if errs := payloadsum.Verify(man, k, i); len(errs) > 0 {
-						return false, fmt.Errorf("%s differs from %s (%s), but %s itself fails its %s (%v) - not copying a damaged payload; run 'alpine-zfsboot verify' and repair by hand ('esp remove' and 'esp add' the damaged one)", m.label(), src.label(), strings.Join(diff, ", "), src.label(), layout.PayloadSumFile, errs[0])
-					}
-				}
-			}
+		// Never spread a damaged copy: the source must have a CHECKSUM that decodes AND that its own KERNEL and
+		// INITRD pass. A source whose CHECKSUM is missing or unreadable is not a repair source: fail closed.
+		refuse := func(why string) error {
+			return fmt.Errorf("%s differs from %s (%s), but %s %s - not copying a payload that cannot be verified; run 'alpine-zfsboot verify' and repair by hand ('esp remove' and 'esp add' the damaged one)", m.label(), src.label(), strings.Join(diff, ", "), src.label(), why)
+		}
+		raw, rerr := os.ReadFile(filepath.Join(src.mountpoint, layout.PayloadSumFile))
+		if rerr != nil {
+			return false, refuse(fmt.Sprintf("has no readable %s (%v)", layout.PayloadSumFile, rerr))
+		}
+		man, derr := payloadsum.Decode(raw)
+		if derr != nil {
+			return false, refuse(fmt.Sprintf("has a %s that does not decode (%v)", layout.PayloadSumFile, derr))
+		}
+		k, i, _, kerr := readInstalledKernelInitrd(src.target)
+		if kerr != nil {
+			return false, refuse(fmt.Sprintf("has a kernel/initrd that cannot be read (%v)", kerr))
+		}
+		if errs := payloadsum.Verify(man, k, i); len(errs) > 0 {
+			return false, refuse(fmt.Sprintf("itself fails its %s (%v)", layout.PayloadSumFile, errs[0]))
 		}
 	}
 	fmt.Printf("%s differs from %s at the same build (%s) - rewriting it from %s\n", m.label(), src.label(), strings.Join(diff, ", "), src.label())

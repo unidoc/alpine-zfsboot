@@ -1,6 +1,6 @@
 package main
 
-// Regression tests for the PR #25 review findings (F1, F5, F6, F9, F14).
+// Regression tests for the PR #25 review findings (F1, F5, F6, F9, F14, F15, F16).
 
 import (
 	"errors"
@@ -12,6 +12,15 @@ import (
 	"github.com/unidoc/alpine-zfsboot/internal/layout"
 	"github.com/unidoc/alpine-zfsboot/internal/payloadsum"
 )
+
+// needX86BIOS skips a test that builds the x86_64 BIOS payload (stage1/stage2, CHECKSUM, BLKSUM): the
+// fixtures assume it, so on another architecture the test would fail for the wrong reason.
+func needX86BIOS(t *testing.T) {
+	t.Helper()
+	if detectArch() != "x86_64" {
+		t.Skipf("the BIOS payload fixtures are x86_64 (this is %s)", detectArch())
+	}
+}
 
 func lastLines(s string, n int) string {
 	l := strings.Split(strings.TrimRight(s, "\n"), "\n")
@@ -80,6 +89,7 @@ func TestUpdate_RepairsCorruptMemberAtSameBuild(t *testing.T) {
 // F5: the damaged copy is never spread - when the best member itself fails
 // its CHECKSUM, update refuses to copy it over the other one.
 func TestUpdate_DoesNotCopyFromDamagedSource(t *testing.T) {
+	needX86BIOS(t)
 	_, a, b := markedMirror(t)
 	p := filepath.Join(a.dir, layout.KernelFile)
 	k, _ := os.ReadFile(p)
@@ -87,7 +97,7 @@ func TestUpdate_DoesNotCopyFromDamagedSource(t *testing.T) {
 	os.WriteFile(p, k, 0o644)
 	good := readESP(t, b, layout.KernelFile)
 	ucode, uout := runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261001T000000Z", 1), biosOpts{integrity: "warn"})
-	if ucode == 0 || !strings.Contains(uout, "not copying a damaged payload") {
+	if ucode == 0 || !strings.Contains(uout, "not copying a payload that cannot be verified") {
 		t.Errorf("want a refusal, got exit %d\n%s", ucode, uout)
 	}
 	if readESP(t, b, layout.KernelFile) != good {
@@ -98,6 +108,7 @@ func TestUpdate_DoesNotCopyFromDamagedSource(t *testing.T) {
 // F6: CMDLINE alpine-zfsboot.integrity= wins over CHECKSUM's MODE at boot;
 // verify judges a CHECKSUM mismatch by that effective mode, both ways.
 func TestVerify_JudgesChecksumMismatchByEffectiveIntegrityMode(t *testing.T) {
+	needX86BIOS(t)
 	for _, c := range []struct {
 		name, cmdlineMode, sumMode string
 		refuses                    bool
@@ -311,5 +322,74 @@ func TestWritePayload_BlkSumRemovalFailureRestoresChecksum(t *testing.T) {
 		if got := readESP(t, a, rel); got != want {
 			t.Errorf("%s was not restored", rel)
 		}
+	}
+}
+
+// F15: the setting reached B only (A was away). A is first in host order, but B is the newer copy: update
+// must bring A to the setting, never revert B to A's old CMDLINE.
+func TestUpdate_KeepsSettingWrittenWhileFirstMemberWasMissing(t *testing.T) {
+	_, a, b := markedMirror(t)
+	a.present = false
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+	})
+	a.present = true
+	if !strings.Contains(readESP(t, b, layout.CmdlineFile), "int13chunk=8") || strings.Contains(readESP(t, a, layout.CmdlineFile), "int13chunk=8") {
+		t.Fatal("setup: B should carry int13chunk=8 and A not")
+	}
+	if memberOf(t, b).Generation <= memberOf(t, a).Generation {
+		t.Errorf("the member that was written must be the newer one: A generation %d, B generation %d", memberOf(t, a).Generation, memberOf(t, b).Generation)
+	}
+	ucode, uout := runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261001T000000Z", 1), biosOpts{integrity: "warn"})
+	if ucode != 0 {
+		t.Fatalf("update: exit %d\n%s", ucode, uout)
+	}
+	for _, e := range []*fakeESP{a, b} {
+		if !strings.Contains(readESP(t, e, layout.CmdlineFile), "int13chunk=8") {
+			t.Errorf("a member lacks int13chunk=8 after update\n%s", lastLines(uout, 8))
+		}
+	}
+	if memberOf(t, a).Generation != memberOf(t, b).Generation {
+		t.Errorf("generations differ after update: A %d, B %d", memberOf(t, a).Generation, memberOf(t, b).Generation)
+	}
+}
+
+// The same setting written on every member leaves them at one generation.
+func TestSettingOnEveryMemberKeepsOneGeneration(t *testing.T) {
+	_, a, b := markedMirror(t)
+	captureOutput(t, func() {
+		forEachMember("/", "", hostOpts{}, func(t *target) error { return setInt13Chunk(t.mountpoint, "8") })
+	})
+	if memberOf(t, a).Generation != memberOf(t, b).Generation {
+		t.Errorf("generations differ: A %d, B %d", memberOf(t, a).Generation, memberOf(t, b).Generation)
+	}
+}
+
+// F16: a source whose CHECKSUM is missing or unreadable is not a repair source (the guard fails closed).
+func TestUpdate_RefusesToRepairFromAnUnverifiableSource(t *testing.T) {
+	needX86BIOS(t)
+	for _, tc := range []struct {
+		name string
+		mod  func(p string)
+	}{
+		{"CHECKSUM removed", func(p string) { os.Remove(p) }},
+		{"CHECKSUM garbage", func(p string) { os.WriteFile(p, []byte("garbage\n"), 0o644) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, a, b := markedMirror(t)
+			p := filepath.Join(a.dir, layout.KernelFile)
+			k, _ := os.ReadFile(p)
+			k[len(k)-1] ^= 0xff
+			os.WriteFile(p, k, 0o644)
+			tc.mod(filepath.Join(a.dir, layout.PayloadSumFile))
+			good := readESP(t, b, layout.KernelFile)
+			ucode, uout := runUpdateCapture(t, hostOpts{}, biosBuild(t, "20261001T000000Z", 1), biosOpts{integrity: "warn"})
+			if readESP(t, b, layout.KernelFile) != good {
+				t.Errorf("B's good KERNEL was overwritten from an unverifiable A (update exit %d)\n%s", ucode, lastLines(uout, 8))
+			}
+			if ucode == 0 {
+				t.Errorf("update must not report success when it refused to repair (exit 0)\n%s", lastLines(uout, 8))
+			}
+		})
 	}
 }

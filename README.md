@@ -774,10 +774,15 @@ ESP of the set without any option:
   ESP that is already up to date is left alone - unless it carries the
   same build as the best ESP but different content (a setting written
   while it was absent, bit rot in `KERNEL`): `update` then rewrites it from
-  the best ESP, payload first and its generation last (it refuses to copy
-  from a best ESP that itself fails its `CHECKSUM`). `config`,
-  `authorized_keys` and the host key are copied from the newest ESP to
-  the others.
+  the best ESP, payload first and its generation last. The best ESP is
+  the one with the highest generation (the first in disk order among equals);
+  `update` refuses to copy from a best ESP whose `CHECKSUM` is missing,
+  unreadable or fails its own `KERNEL`/`INITRD`, and exits 1 naming it.
+  `int13chunk` and `integrity` keep that honest: when they reach only some
+  ESPs (a detached disk), the ones they did write move to a newer generation,
+  so the next `update` brings the others to the setting instead of copying an
+  older ESP over it. `config`, `authorized_keys` and the host key are copied
+  from the newest ESP to the others.
 - `verify` checks every ESP as it checks a single one, then **compares
   them**: stage1, stage2, `KERNEL`, `INITRD`, `CMDLINE` (without the
   per-ESP words below), `metadata`, `CHECKSUM`, config, keys, host key.
